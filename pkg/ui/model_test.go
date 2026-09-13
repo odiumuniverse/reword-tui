@@ -458,6 +458,29 @@ func TestEmptyStatesNoPanic(t *testing.T) {
 	}
 }
 
+func TestStageRamp(t *testing.T) {
+	if len(stageRamp) != 8 {
+		t.Fatalf("ramp must cover S0-S7, got %d", len(stageRamp))
+	}
+	for i, s := range stageRamp {
+		if s.glyph == "" {
+			t.Fatalf("step %d has no glyph", i)
+		}
+	}
+	if stageRamp[0].glyph != "○" || stageRamp[7].glyph != "✦" {
+		t.Fatal("ramp must run ○ to ✦")
+	}
+	if got := stageMark(-3); got != stageMark(0) {
+		t.Fatal("negative step must clamp to S0")
+	}
+	if got := stageMark(99); got != stageMark(7) {
+		t.Fatal("large step must clamp to S7")
+	}
+	if wordStage(2, 5) != stageMark(5) || wordStage(6, 1) != stageMark(6) {
+		t.Fatal("word stage must follow the stronger side")
+	}
+}
+
 func TestWordListCursorIsolated(t *testing.T) {
 	m := testModel(t)
 	m.screen = sVocab
