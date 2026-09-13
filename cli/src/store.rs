@@ -62,6 +62,36 @@ pub fn settings(conn: &Connection) -> Result<Settings> {
         ui_language: map.remove("ui_language"),
     })
 }
+/// Column holding category titles. Apps store them per interface language
+/// (NAME_ENG, NAME_RUS, ...) and the target language never gets its own
+/// column, so take English, then the native language, then any.
+pub(crate) fn cat_name_col(conn: &Connection) -> Result<String> {
+    let mut st = conn.prepare("PRAGMA table_info(CATEGORY)")?;
+    let names: Vec<String> = st
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("decode PRAGMA row")?
+        .into_iter()
+        .filter(|c| {
+            c.len() == 8
+                && c.starts_with("NAME_")
+                && c[5..].chars().all(|ch| ch.is_ascii_uppercase())
+        })
+        .collect();
+    if names.iter().any(|c| c == "NAME_ENG") {
+        return Ok("NAME_ENG".to_string());
+    }
+    if let Some(native) = settings(conn).ok().and_then(|s| s.native_language) {
+        let col = format!("NAME_{native}");
+        if names.contains(&col) {
+            return Ok(col);
+        }
+    }
+    names
+        .into_iter()
+        .next()
+        .context("CATEGORY has no NAME_* title column")
+}
 pub fn lang_cols(conn: &Connection) -> Result<Vec<Lang>> {
     let mut st = conn.prepare("PRAGMA table_info(WORD)")?;
     let cols = st.query_map([], |r| r.get::<_, String>(1))?;
@@ -223,10 +253,10 @@ pub fn list_words(conn: &Connection, f: &WordFilter) -> Result<Vec<Word>> {
     }
     let mut conds = Vec::new();
     if f.search.is_some() {
-        conds.push("WORD.WORD LIKE '%' || REPLACE(REPLACE(REPLACE(?, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%' ESCAPE '\\'");
+        conds.push("WORD.WORD LIKE '%' || REPLACE(REPLACE(REPLACE(?, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%' ESCAPE '\\'".to_string());
     }
     if f.category.is_some() {
-        conds.push("(c.ID = ? OR c.NAME_ENG = ?)");
+        conds.push(format!("(c.ID = ? OR c.{} = ?)", cat_name_col(conn)?));
     }
     if !conds.is_empty() {
         sql.push_str(" WHERE ");
@@ -267,11 +297,12 @@ pub fn get_word(conn: &Connection, query: &str) -> Result<Option<Word>> {
     Ok(rows.next().transpose()?)
 }
 pub fn categories(conn: &Connection) -> Result<Vec<Category>> {
-    let mut st = conn.prepare(
-        "SELECT c.ID, c.IS_CUSTOM, c.IS_SELECTED, c.NAME_ENG, COUNT(wc.WORD_ID)
+    let name = cat_name_col(conn)?;
+    let mut st = conn.prepare(&format!(
+        "SELECT c.ID, c.IS_CUSTOM, c.IS_SELECTED, c.{name}, COUNT(DISTINCT wc.WORD_ID)
          FROM CATEGORY c LEFT JOIN WORD_CATEGORY wc ON wc.CATEGORY_ID = c.ID
-         GROUP BY c.ID ORDER BY c.IS_CUSTOM DESC, c.ID",
-    )?;
+         GROUP BY c.ID ORDER BY c.IS_CUSTOM DESC, c.ID"
+    ))?;
     let rows = st.query_map([], |r| {
         Ok(Category {
             id: r.get(0)?,
@@ -304,7 +335,10 @@ pub fn category_stats(conn: &Connection) -> Result<Vec<crate::model::CategorySta
 pub fn set_selected(conn: &Connection, category: &str, selected: bool) -> Result<String> {
     let id: Option<String> = conn
         .query_row(
-            "SELECT c.ID FROM CATEGORY c WHERE c.ID = ? OR c.NAME_ENG = ? ORDER BY c.ID LIMIT 1",
+            &format!(
+                "SELECT c.ID FROM CATEGORY c WHERE c.ID = ? OR c.{} = ? ORDER BY c.ID LIMIT 1",
+                cat_name_col(conn)?
+            ),
             rusqlite::params![category, category],
             |r| r.get(0),
         )
@@ -476,9 +510,10 @@ pub fn add_category(conn: &Connection, id: &str, name: &str) -> Result<()> {
     if id.is_empty() || name.is_empty() {
         anyhow::bail!("category id and title are required");
     }
+    let col = cat_name_col(conn)?;
     let taken: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM CATEGORY WHERE ID = ? OR NAME_ENG = ?",
+            &format!("SELECT COUNT(*) FROM CATEGORY WHERE ID = ? OR {col} = ?"),
             rusqlite::params![id, name],
             |r| r.get(0),
         )
@@ -487,7 +522,7 @@ pub fn add_category(conn: &Connection, id: &str, name: &str) -> Result<()> {
         anyhow::bail!("Category with this title already exists");
     }
     conn.execute(
-        "INSERT INTO CATEGORY (ID, IS_CUSTOM, IS_SELECTED, NAME_ENG) VALUES (?, 1, 0, ?)",
+        &format!("INSERT INTO CATEGORY (ID, IS_CUSTOM, IS_SELECTED, {col}) VALUES (?, 1, 0, ?)"),
         rusqlite::params![id, name],
     )
     .context("insert CATEGORY")?;
@@ -501,7 +536,10 @@ pub fn import_rows(
 ) -> Result<(usize, usize)> {
     let cid: Option<String> = conn
         .query_row(
-            "SELECT c.ID FROM CATEGORY c WHERE c.ID = ? OR c.NAME_ENG = ? ORDER BY c.ID LIMIT 1",
+            &format!(
+                "SELECT c.ID FROM CATEGORY c WHERE c.ID = ? OR c.{} = ? ORDER BY c.ID LIMIT 1",
+                cat_name_col(conn)?
+            ),
             rusqlite::params![category, category],
             |r| r.get(0),
         )
@@ -674,7 +712,10 @@ pub fn postpone_word(conn: &Connection, word: WordId, now_ts: i64) -> Result<()>
 pub fn category_words(conn: &Connection, category: &str) -> Result<(String, Vec<WordId>)> {
     let cid: Option<String> = conn
         .query_row(
-            "SELECT c.ID FROM CATEGORY c WHERE c.ID = ? OR c.NAME_ENG = ? ORDER BY c.ID LIMIT 1",
+            &format!(
+                "SELECT c.ID FROM CATEGORY c WHERE c.ID = ? OR c.{} = ? ORDER BY c.ID LIMIT 1",
+                cat_name_col(conn)?
+            ),
             rusqlite::params![category, category],
             |r| r.get(0),
         )
@@ -691,7 +732,10 @@ pub fn category_words(conn: &Connection, category: &str) -> Result<(String, Vec<
 pub fn clear_category(conn: &Connection, category: &str) -> Result<usize> {
     let custom: Option<i64> = conn
         .query_row(
-            "SELECT IS_CUSTOM FROM CATEGORY WHERE ID = ? OR NAME_ENG = ?",
+            &format!(
+                "SELECT IS_CUSTOM FROM CATEGORY WHERE ID = ? OR {} = ?",
+                cat_name_col(conn)?
+            ),
             rusqlite::params![category, category],
             |r| r.get(0),
         )
@@ -1595,6 +1639,37 @@ mod tests {
         assert!(get_word(&conn, "phone").unwrap().is_some());
         assert!(get_word(&conn, "ours").unwrap().is_none());
         assert!(crate::oplog::tail(&data, 10).is_empty());
+    }
+    #[test]
+    fn categories_follow_the_title_column() {
+        let (_tmp, db) = fixture_db();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("ALTER TABLE CATEGORY RENAME COLUMN NAME_ENG TO NAME_RUS;")
+            .unwrap();
+        assert_eq!(cat_name_col(&conn).unwrap(), "NAME_RUS");
+        let cats = categories(&conn).unwrap();
+        assert!(
+            cats.iter()
+                .any(|c| c.id == "food" && c.name_en.as_deref() == Some("Food"))
+        );
+        assert_eq!(set_selected(&conn, "Food", true).unwrap(), "food");
+        let food = list_words(
+            &conn,
+            &WordFilter {
+                search: None,
+                category: Some("Food"),
+                limit: 50,
+            },
+        )
+        .unwrap();
+        assert_eq!(food.len(), 1);
+        add_category(&conn, "mine", "Мои слова").unwrap();
+        assert!(
+            categories(&conn)
+                .unwrap()
+                .iter()
+                .any(|c| c.id == "mine" && c.name_en.as_deref() == Some("Мои слова"))
+        );
     }
     #[test]
     fn cross_null_stays_null_on_review() {

@@ -98,3 +98,16 @@ func TestConsumeKeepsTailAndGarbage(t *testing.T) {
 		t.Fatal("no valid intents may remain after full consume")
 	}
 }
+
+func TestApplyBodyPrefersID(t *testing.T) {
+	it := Intent{Op: "grade", Word: "la carne", ID: 7393, Mode: "rec", Result: "ok"}
+	if got := it.ApplyBody()["word"]; got != "7393" {
+		t.Fatalf("a known id must name the word, got %v", got)
+	}
+	if got := (Intent{Op: "triage", Word: "la carne", Decision: "learn"}).ApplyBody()["word"]; got != "la carne" {
+		t.Fatalf("intents without an id must keep the text, got %v", got)
+	}
+	if lbl := it.Label(); !strings.Contains(lbl, "la carne") {
+		t.Fatalf("labels stay readable: %q", lbl)
+	}
+}

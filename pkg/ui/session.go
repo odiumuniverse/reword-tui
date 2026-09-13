@@ -23,49 +23,97 @@ const (
 	cL2
 )
 
+// Session modes. The Learn menu lists them as Learn, Review, Mixed.
+const (
+	modeReview = iota
+	modeLearn
+	modeMixed
+)
+
 type card struct {
-	kind     cardKind
-	word     string
-	wordID   int64
-	prompt   string
-	native   string
-	tr       string
-	example  string
-	choices  []string
-	answer   int
-	expected []string
-	mode     string
-	reveal   bool
-	done     bool
-	wasOk    bool
-	attempts int
+	kind      cardKind
+	word      string
+	wordID    int64
+	prompt    string
+	native    string
+	tr        string
+	example   string
+	choices   []string
+	answer    int
+	expected  []string
+	mode      string
+	reveal    bool
+	done      bool
+	wasOk     bool
+	attempts  int
+	fromLearn bool       // drawn from the learning queue, not a review unit
+	unit      reviewUnit // review unit behind the card, put back on a mode switch
+	verdict   string     // what a learning decision did, shown once resolved
 }
 
 type reviewUnit struct {
+	id      int64
 	word    string
 	mode    int64
 	overdue int64
 }
 
 type session struct {
-	mode    int
-	units   []reviewUnit
-	learn   []rwcore.Word
-	lpos    int
-	turn    bool
-	started bool
-	cur     *card
-	ok      int
-	fail    int
-	zen     bool
-	typing  bool
-	input   string
+	mode     int
+	units    []reviewUnit
+	revWords int // distinct words in the review queue when it was built
+	learn    []rwcore.Word
+	lpos     int
+	turn     bool
+	started  bool
+	cur      *card
+	seq      int // bumps on every card change so stale auto-advance ticks are ignored
+	ok       int
+	fail     int
+	zen      bool
+	typing   bool
+	input    string
+}
+
+// reviewLeft counts distinct words still to review, the current card included.
+func (s *session) reviewLeft() int {
+	seen := map[unitWord]bool{}
+	for _, u := range s.units {
+		seen[u.key()] = true
+	}
+	if c := s.cur; c != nil && !c.done && !c.fromLearn && c.unit.word != "" {
+		seen[c.unit.key()] = true
+	}
+	return len(seen)
+}
+
+// unitWord identifies the word behind a review unit: by id, since texts
+// repeat across categories, else by text.
+type unitWord struct {
+	id   int64
+	text string
+}
+
+func (u reviewUnit) key() unitWord {
+	if u.id != 0 {
+		return unitWord{id: u.id}
+	}
+	return unitWord{text: u.word}
+}
+
+// learnLeft counts learning words not finished yet, the current card included.
+func (s *session) learnLeft() int {
+	n := len(s.learn) - s.lpos
+	if c := s.cur; c != nil && !c.done && c.fromLearn {
+		n++
+	}
+	return max(n, 0)
 }
 
 // poolWord resolves a word from the already-loaded session pool,
 // avoiding a backend round-trip per card.
-func (m *Model) poolWord(text string) (rwcore.Word, bool) {
-	if i, ok := m.poolIdx[text]; ok && i >= 0 && i < len(m.pool) {
+func (m *Model) poolWord(id int64) (rwcore.Word, bool) {
+	if i, ok := m.poolIdx[id]; ok && i >= 0 && i < len(m.pool) {
 		return m.pool[i], true
 	}
 	return rwcore.Word{}, false
@@ -198,10 +246,15 @@ func (m *Model) buildReview() {
 			rand.Shuffle(len(modes), func(i, j int) { modes[i], modes[j] = modes[j], modes[i] })
 		}
 		for _, mo := range modes {
-			units = append(units, reviewUnit{word: d.Word, mode: mo, overdue: d.OverdueSecs})
+			units = append(units, reviewUnit{id: d.ID, word: d.Word, mode: mo, overdue: d.OverdueSecs})
 		}
 	}
 	m.sess.units = units
+	seen := map[unitWord]bool{}
+	for _, u := range units {
+		seen[u.key()] = true
+	}
+	m.sess.revWords = len(seen)
 }
 
 func (m *Model) pickReview() *card {
@@ -216,12 +269,20 @@ func (m *Model) pickReview() *card {
 	i := rand.Intn(n)
 	picked := u[i]
 	m.sess.units = append(u[:i], u[i+1:]...)
-	return m.reviewCard(picked.word, picked.mode)
+	c := m.reviewCard(picked.id, picked.word, picked.mode)
+	c.unit = picked
+	return c
+}
+
+func (m *Model) learnFrom(w rwcore.Word) *card {
+	c := m.learnCard(w)
+	c.fromLearn = true
+	return c
 }
 
 func (m *Model) nextCard() *card {
 	s := &m.sess
-	if s.mode == 2 {
+	if s.mode == modeMixed {
 		for len(s.units) > 0 || s.lpos < len(s.learn) {
 			s.turn = !s.turn
 			if s.turn && len(s.units) > 0 {
@@ -233,29 +294,29 @@ func (m *Model) nextCard() *card {
 			if s.lpos < len(s.learn) {
 				w := s.learn[s.lpos]
 				s.lpos++
-				return m.learnCard(w)
+				return m.learnFrom(w)
 			}
 		}
 		return nil
 	}
-	if s.mode == 0 {
+	if s.mode == modeReview {
 		return m.pickReview()
 	}
-	for s.lpos < len(s.learn) {
+	if s.lpos < len(s.learn) {
 		w := s.learn[s.lpos]
 		s.lpos++
-		return m.learnCard(w)
+		return m.learnFrom(w)
 	}
 	return nil
 }
 
-func (m *Model) reviewCard(word string, mode int64) *card {
-	w, ok := m.poolWord(word)
+func (m *Model) reviewCard(id int64, word string, mode int64) *card {
+	w, ok := m.poolWord(id)
 	if !ok {
 		var err error
-		w, err = m.cli.Show(m.appID, word)
+		w, err = m.cli.Show(m.appID, wordRef(id, word))
 		if err != nil {
-			return &card{kind: cR1, word: word, prompt: word, native: "(gone — skipped)", done: true, wasOk: true}
+			return &card{kind: cR1, word: word, wordID: id, prompt: word, native: "(gone — skipped)", done: true, wasOk: true}
 		}
 	}
 	nat := pickNative(w, m.nativeLang())
@@ -297,10 +358,10 @@ func (m *Model) learnCard(w rwcore.Word) *card {
 		prompt, shown = nat, w.Text
 	}
 	if w.Recognition.Level <= 0 && w.Reproduction.Level <= 0 {
-		return &card{kind: cL1, word: w.Text, wordID: w.ID, prompt: prompt, native: shown, tr: tr, example: ex}
+		return &card{kind: cL1, word: w.Text, wordID: w.ID, prompt: prompt, native: shown, tr: tr, example: ex, reveal: m.prefs.RevealAtOnce}
 	}
 	if w.Recognition.Level <= 1 || w.Reproduction.Level <= 1 {
-		return &card{kind: cL1b, word: w.Text, wordID: w.ID, prompt: prompt, native: shown, tr: tr, example: ex}
+		return &card{kind: cL1b, word: w.Text, wordID: w.ID, prompt: prompt, native: shown, tr: tr, example: ex, reveal: m.prefs.RevealAtOnce}
 	}
 	if prompt == nat {
 		var pool []string
@@ -426,24 +487,47 @@ func cardTitle(c *card) string {
 	return ""
 }
 
-func (c *card) hint() string {
-	if c.done {
-		return "enter next"
+// swipe names the two answers a card offers on ← and →, mirroring the
+// phone's swipes: left takes the word out of the loop, right keeps it in.
+func (c *card) swipe() (left, right string, ok bool) {
+	if c == nil || c.done {
+		return "", "", false
 	}
 	switch c.kind {
-	case cR1:
-		if !c.reveal {
-			return "space reveal"
-		}
-		return "g got it · m missed it"
-	case cR2, cL2:
-		return "1-4 pick"
-	case cR3:
-		return "type answer · enter check"
 	case cL1:
-		return "l start learning · k already know"
+		return "Already known", "Start learning", true
 	case cL1b:
-		return "l memorized · k already know · space keep showing"
+		return "I have memorized", "Keep showing", true
+	case cR1:
+		if c.reveal {
+			return "Got it", "Missed it", true
+		}
+	}
+	return "", "", false
+}
+
+// swipeKey maps ← or → to the session key of the answer on that side,
+// or "" when the card offers no two-way choice right now.
+func (c *card) swipeKey(left bool) string {
+	if _, _, ok := c.swipe(); !ok {
+		return ""
+	}
+	switch c.kind {
+	case cL1:
+		if left {
+			return "k"
+		}
+		return "l"
+	case cL1b:
+		if left {
+			return "l"
+		}
+		return "keep"
+	case cR1:
+		if left {
+			return "g"
+		}
+		return "m"
 	}
 	return ""
 }
@@ -453,7 +537,7 @@ func (m *Model) gradeCurrent(ok bool) {
 	if c == nil {
 		return
 	}
-	m.enqueue(queue.Intent{Op: "grade", Word: c.word, Mode: c.mode, Result: gradeResult(ok)})
+	m.enqueue(queue.Intent{Op: "grade", Word: c.word, ID: c.wordID, Mode: c.mode, Result: gradeResult(ok)})
 	if ok {
 		m.sess.ok++
 	} else {

@@ -58,8 +58,10 @@ type Model struct {
 	confirmT       string
 	pending        string
 	pendingWord    string
+	pendingID      int64
 	quitAfterWrite bool
 	apps           []rwcore.App
+	appsLoaded     bool
 	appIdx         int
 	appID          string
 	appMeta        map[string]appMeta
@@ -86,7 +88,7 @@ type Model struct {
 	menuIdx        int
 	sess           session
 	pool           []rwcore.Word
-	poolIdx        map[string]int
+	poolIdx        map[int64]int // pool position by word id: texts repeat across categories
 	addF           []string
 	addIdx         int
 	addEnroll      bool
@@ -130,7 +132,7 @@ func New(cfg Config) Model {
 		appMeta: map[string]appMeta{},
 		acted:   map[string]bool{},
 		q:       queue.Load(cfg.QueuePath),
-		poolIdx: map[string]int{},
+		poolIdx: map[int64]int{},
 		scrOff:  map[screen]int{},
 		scrMax:  map[screen]int{},
 		width:   80,
@@ -198,6 +200,10 @@ type pickerMetaMsg struct {
 	id    string
 	words int64
 	due   int
+}
+
+type autoNextMsg struct {
+	seq int
 }
 
 func (m Model) loadPickerMeta(id string) tea.Cmd {
@@ -344,7 +350,10 @@ func (m *Model) enqueue(it queue.Intent) {
 		m.err = err.Error()
 		return
 	}
-	m.setNotice("queued: "+it.Label(), false)
+	// A session's progress line already counts the queue.
+	if m.screen != sSession {
+		m.setNotice("queued: "+it.Label(), false)
+	}
 }
 
 func (m *Model) setNotice(s string, warn bool) {

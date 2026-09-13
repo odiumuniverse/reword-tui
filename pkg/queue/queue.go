@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 type Intent struct {
 	Op            string   `json:"op"`
 	Word          string   `json:"word,omitempty"`
+	ID            int64    `json:"id,omitzero"`
 	Mode          string   `json:"mode,omitempty"`
 	Result        string   `json:"result,omitempty"`
 	Decision      string   `json:"decision,omitempty"`
@@ -24,11 +26,11 @@ func (it Intent) ApplyBody() map[string]any {
 	m := map[string]any{"op": it.Op}
 	switch it.Op {
 	case "grade":
-		m["word"] = it.Word
+		m["word"] = it.ref()
 		m["mode"] = it.Mode
 		m["result"] = it.Result
 	case "triage", "enroll", "remove", "reset", "postpone":
-		m["word"] = it.Word
+		m["word"] = it.ref()
 		if it.Op == "triage" {
 			m["decision"] = it.Decision
 		}
@@ -43,6 +45,15 @@ func (it Intent) ApplyBody() map[string]any {
 		}
 	}
 	return m
+}
+
+// ref names the word for rwcore: its id when known, since texts repeat
+// across categories, else the text (intents queued before ids existed).
+func (it Intent) ref() string {
+	if it.ID != 0 {
+		return strconv.FormatInt(it.ID, 10)
+	}
+	return it.Word
 }
 
 func (it Intent) Label() string {

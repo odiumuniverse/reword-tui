@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"cmp"
 	"fmt"
 	"maps"
 	"slices"
@@ -33,7 +34,7 @@ func (m Model) View() string {
 	if m.screen == sSession && m.sess.cur != nil && zenOn(m) {
 		// Width first (pads and wraps strays to cw), then height:
 		// Place pads short content but never crops tall content.
-		card, _ := m.viewCard(cw, h-2)
+		card, _ := m.cardBlock(cw, h-2)
 		body := fitHeight(col.Render(strings.TrimRight(card, "\n")), h)
 		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Position(0.45), body)
 	}
@@ -48,17 +49,25 @@ func (m Model) View() string {
 	if bodyH < 1 {
 		bodyH = 1
 	}
-	var body string
-	if m.ov != oNone {
-		body = m.viewOverlay(cw, bodyH)
+	var mid string
+	if m.ov == oNone && m.screen == sSession && m.sess.cur != nil {
+		// A running session spans the full width: the card sits on the
+		// screen's center line, the mode column in its left margin.
+		body := fitHeight(m.viewSessionWide(w, cw, bodyH), bodyH)
+		mid = lipgloss.Place(w, bodyH, lipgloss.Left, lipgloss.Position(0.45), body)
 	} else {
-		body = m.viewBody(cw, bodyH)
+		var body string
+		if m.ov != oNone {
+			body = m.viewOverlay(cw, bodyH)
+		} else {
+			body = m.viewBody(cw, bodyH)
+		}
+		// Place pads but never crops: clip the body so header, status and
+		// footer hints always survive short terminals. Width-fit first, since
+		// col.Render also wraps overlong lines (which changes row count).
+		body = fitHeight(col.Render(strings.TrimRight(body, "\n")), bodyH)
+		mid = lipgloss.Place(w, bodyH, lipgloss.Center, lipgloss.Position(0.45), body)
 	}
-	// Place pads but never crops: clip the body so header, status and
-	// footer hints always survive short terminals. Width-fit first, since
-	// col.Render also wraps overlong lines (which changes row count).
-	body = fitHeight(col.Render(strings.TrimRight(body, "\n")), bodyH)
-	mid := lipgloss.Place(w, bodyH, lipgloss.Center, lipgloss.Position(0.45), body)
 	parts := []string{
 		lipgloss.PlaceHorizontal(w, lipgloss.Center, header),
 		mid,
@@ -123,13 +132,7 @@ func (m Model) viewHints(cw int) string {
 	case sLearn:
 		return hints(cw, kb{"enter", "open"}, kb{"c", "cats"}, kb{"2", "vocab"}, kb{"3", "menu"}, kb{"s", "sync"}, kb{"?", "help"}, kb{"q", "quit"})
 	case sSession:
-		if m.sess.typing {
-			return hints(cw, kb{"type", "answer"}, kb{"enter", "check"}, kb{"esc", "stop"})
-		}
-		if m.sess.cur != nil && !m.sess.cur.done {
-			return hints(cw, kb{"space", "show"}, kb{"g", "got it"}, kb{"m", "missed it"}, kb{"1-4", "pick"}, kb{"e", "card"}, kb{"z", "zen"}, kb{"esc", "back"})
-		}
-		return hints(cw, kb{"enter", "next"}, kb{"e", "card"}, kb{"esc", "back"}, kb{"q", "quit"})
+		return hints(cw, m.sessionHints()...)
 	case sVocab:
 		if m.searchOn {
 			return hints(cw, kb{"/", "filter"}, kb{"enter", "apply"}, kb{"esc", "cancel"})
@@ -159,6 +162,39 @@ func (m Model) viewHints(cw int) string {
 		return hints(cw, kb{"tab", "field"}, kb{"space", "toggle"}, kb{"enter", "submit"}, kb{"esc", "cancel"})
 	}
 	return hints(cw, kb{"q", "quit"}, kb{"?", "help"})
+}
+
+// sessionHints mirrors the keys the current card actually takes.
+func (m Model) sessionHints() []kb {
+	c := m.sess.cur
+	switch {
+	case m.sess.typing:
+		return []kb{{"type", "answer"}, {"enter", "check"}, {"esc", "stop"}, {"tab", "mode"}}
+	case c == nil:
+		return []kb{{"tab", "mode"}, {"esc", "back"}, {"q", "quit"}}
+	case c.done:
+		return []kb{{"enter", "next"}, {"e", "card"}, {"tab", "mode"}, {"esc", "back"}}
+	}
+	// The answers themselves sit under the card; the footer names the keys.
+	var bs []kb
+	switch c.kind {
+	case cR1:
+		if c.reveal {
+			bs = []kb{{"←/→", "choose"}}
+		} else {
+			bs = []kb{{"space", "show"}}
+		}
+	case cR2, cL2:
+		bs = []kb{{"1-4", "pick"}}
+	case cR3:
+		bs = []kb{{"type", "answer"}}
+	case cL1, cL1b:
+		if !c.reveal {
+			bs = append(bs, kb{"space", "show"})
+		}
+		bs = append(bs, kb{"←/→", "choose"})
+	}
+	return append(bs, kb{"tab", "mode"}, kb{"e", "card"}, kb{"z", "zen"}, kb{"esc", "back"})
 }
 
 func window(n, cur, h int) (from, to int) {
@@ -457,7 +493,11 @@ func (m Model) viewPicker(cw, h int) string {
 		contents = append(contents, fmt.Sprintf("%s %d %s\n  %s\n  %s\n%s · %s", marker, a.N, a.ID, wdLine, dueLine, size, ts))
 	}
 	if len(contents) == 0 {
-		return lipgloss.PlaceHorizontal(cw, lipgloss.Center, head+dim.Render("no ReWord apps found"))
+		msg := "no ReWord apps found"
+		if !m.appsLoaded {
+			msg = "loading…"
+		}
+		return lipgloss.PlaceHorizontal(cw, lipgloss.Center, head+dim.Render(msg))
 	}
 	bw := 0
 	for _, c := range contents {
@@ -625,12 +665,12 @@ func (m Model) viewDots() string {
 	for i := 6; i >= 0; i-- {
 		d := today.AddDate(0, 0, -i).Format("2006-01-02")
 		if slices.Contains(m.today.ActiveDates, d) {
-			dots = append(dots, prog.Render("●"))
+			dots = append(dots, attn.Render("●"))
 		} else {
 			dots = append(dots, faint.Render("○"))
 		}
 	}
-	return strings.Join(dots, " ── ") + dim.Render("   Current ") + prog.Render(fmt.Sprint(m.today.StreakCur)) + dim.Render(" · Best ") + prog.Render(fmt.Sprint(m.today.StreakBest))
+	return strings.Join(dots, " ── ") + dim.Render("   Current ") + attn.Render(fmt.Sprint(m.today.StreakCur)) + dim.Render(" · Best ") + attn.Render(fmt.Sprint(m.today.StreakBest))
 }
 
 func (m Model) viewSession(cw, h int) string {
@@ -638,73 +678,139 @@ func (m Model) viewSession(cw, h int) string {
 		return dim.Render("loading session…")
 	}
 	if m.sess.cur == nil {
-		if m.sess.mode == 1 {
+		if m.sess.mode == modeLearn {
 			return dim.Render("There are no new words in the chosen categories")
 		}
 		return dim.Render("There are no words for review in the chosen categories")
 	}
-	total := len(m.sess.units) + m.sess.ok + m.sess.fail
-	if m.sess.mode == 1 {
-		total = len(m.sess.learn)
+	return m.viewSessionWide(cw, cw, h)
+}
+
+// viewSessionWide lays out a running session across the whole width w: the
+// card sits on the screen's center line and the mode column takes the left
+// margin. When that margin is too narrow the modes stack above the card.
+func (m Model) viewSessionWide(w, cw, h int) string {
+	const minGap, maxGap = 2, 3
+	modes := m.modeColumn()
+	colW := 0
+	for _, ln := range modes {
+		colW = max(colW, lipgloss.Width(ln))
 	}
-	done := m.sess.ok + m.sess.fail
-	// One word can yield several grades (triage + quiz), so done may
-	// overshoot total: clamp for display, never panic on Repeat.
-	done = min(done, total)
+	// Prefer the full column width so the card lines up with the header and
+	// footer; tighten the gap before narrowing the card.
+	cardW, gap := cw, maxGap
+	side := (w-cw)/2-colW >= minGap
+	if side {
+		gap = min(maxGap, (w-cw)/2-colW)
+	} else if w-2*(colW+maxGap) >= 44 {
+		cardW, side = w-2*(colW+maxGap), true
+	}
+	var head []string
+	if !side {
+		head = append(head, ansi.Truncate(strings.Join(modes, "  "), cardW, "…"))
+	}
+	// The bar can wrap on narrow screens (queue suffix): measure, don't assume.
+	head = append(head, wrapLine(m.sessionBar(), cardW)...)
+	block := append(head, "")
+	card, cut := m.cardBlock(cardW, h-len(block))
+	if cut || len(block)+lipgloss.Height(card) > h {
+		// Tight screen: the card alone outranks the bar and stacked modes.
+		card, _ = m.cardBlock(cardW, h)
+		block = nil
+	}
+	top := len(block) + 1 // first row inside the card frame
+	block = append(block, strings.Split(card, "\n")...)
+	pad := (w - cardW) / 2
+	colStyle := lipgloss.NewStyle().Width(colW)
+	for i, ln := range block {
+		prefix := strings.Repeat(" ", pad)
+		if j := i - top; side && j >= 0 && j < len(modes) {
+			prefix = strings.Repeat(" ", pad-gap-colW) + colStyle.Render(modes[j]) + strings.Repeat(" ", gap)
+		}
+		block[i] = prefix + ln
+	}
+	return strings.Join(block, "\n")
+}
+
+// modeColumn lists the session modes with the words left in each; the
+// active one carries the cursor.
+func (m Model) modeColumn() []string {
+	rows := []struct {
+		mode  int
+		label string
+	}{
+		{modeReview, fmt.Sprintf("Review (%d)", m.sess.reviewLeft())},
+		{modeLearn, fmt.Sprintf("Learning (%d)", m.sess.learnLeft())},
+		{modeMixed, "Mixed"},
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.mode == m.sess.mode {
+			out = append(out, sel.Render("▸ "+r.label))
+		} else {
+			out = append(out, fg.Render("  "+r.label))
+		}
+	}
+	return out
+}
+
+// cardBlock renders the card with its two swipe answers right under the
+// bottom border: "← left answer" flush left, "right answer →" flush right.
+func (m Model) cardBlock(w, maxH int) (string, bool) {
+	left, right, ok := m.sess.cur.swipe()
+	if !ok {
+		return m.viewCard(w, maxH)
+	}
+	card, cut := m.viewCard(w, maxH-1)
+	return card + "\n" + swipeLine(left, right, w), cut
+}
+
+func swipeLine(left, right string, w int) string {
+	l := interactive.Render("←") + " " + swipeStyle(left).Render(left)
+	r := swipeStyle(right).Render(right) + " " + interactive.Render("→")
+	gap := w - 4 - lipgloss.Width(l) - lipgloss.Width(r)
+	if gap < 1 {
+		return ansi.Truncate("  "+l+"  "+r, w, "…")
+	}
+	return "  " + l + strings.Repeat(" ", gap) + r + "  "
+}
+
+// swipeStyle colors an answer by what it does to the word.
+func swipeStyle(answer string) lipgloss.Style {
+	switch answer {
+	case "Got it", "Already known", "I have memorized":
+		return okStyle
+	case "Missed it":
+		return badStyle
+	}
+	return fg
+}
+
+// sessionBar is the progress line over the card: words finished in the
+// current mode, the answer tally and the write queue.
+func (m Model) sessionBar() string {
+	s := &m.sess
+	revDone := s.revWords - s.reviewLeft()
+	lrnDone := len(s.learn) - s.learnLeft()
+	done, total := revDone, s.revWords
+	switch s.mode {
+	case modeLearn:
+		done, total = lrnDone, len(s.learn)
+	case modeMixed:
+		done, total = revDone+lrnDone, s.revWords+len(s.learn)
+	}
+	done = min(max(done, 0), total)
 	barW := 20
 	filled := 0
 	if total > 0 {
 		filled = done * barW / total
 	}
 	bar := prog.Render(strings.Repeat("━", filled)) + faint.Render(strings.Repeat("━", barW-filled))
-	barLine := fmt.Sprintf("%s %d/%d · ✓%d ✗%d", bar, done, total, m.sess.ok, m.sess.fail)
+	line := fmt.Sprintf("%s %d/%d · ✓%d ✗%d", bar, done, total, s.ok, s.fail)
 	if len(m.q.Items) > 0 {
-		barLine += dim.Render(fmt.Sprintf(" · +%d queued", len(m.q.Items)))
+		line += dim.Render(fmt.Sprintf(" · +%d queued", len(m.q.Items)))
 	}
-	// The bar can wrap on narrow screens (queue suffix): measure, don't assume.
-	barLines := wrapLine(barLine, cw)
-	ml := m.viewModeline()
-	headH := lipgloss.Height(ml) + len(barLines)
-	card, cut := m.viewCard(cw, h-headH-1)
-	if !cut && headH+1+lipgloss.Height(card) <= h {
-		return ml + "\n" + strings.Join(barLines, "\n") + "\n\n" + card
-	}
-	// Tight screen: the card alone outranks modeline and progress bar.
-	compact, _ := m.viewCard(cw, h)
-	return compact
-}
-
-func (m Model) viewModeline() string {
-	rev := dim.Render(fmt.Sprintf("Review (%d)", len(m.sess.units)))
-	lrn := dim.Render(fmt.Sprintf("Learning (%d)", len(m.sess.learn)))
-	if m.sess.mode == 0 {
-		rev = sel.Render(fmt.Sprintf("▸ Review (%d)", len(m.sess.units)))
-	} else if m.sess.mode == 1 {
-		lrn = sel.Render(fmt.Sprintf("▸ Learning (%d)", len(m.sess.learn)))
-	} else {
-		rev = sel.Render("≋ Mixed")
-	}
-	up := ""
-	seen := map[string]bool{}
-	if m.sess.cur != nil {
-		seen[m.sess.cur.word] = true
-	}
-	shown := 0
-	for _, u := range m.sess.units {
-		if shown >= 3 {
-			break
-		}
-		if seen[u.word] {
-			continue
-		}
-		seen[u.word] = true
-		up += dim.Render(fmt.Sprintf("\n· %s · %s", u.word, overdueStr(u.overdue)))
-		shown++
-	}
-	if up != "" {
-		up = dim.Render("\nnext up") + up
-	}
-	return rev + "  " + lrn + up
+	return line
 }
 
 // cardLine is one card body line: drop priority (higher drops first)
@@ -740,7 +846,7 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 	add := func(pri int, s string) { raw = append(raw, cardLine{s, pri, false}) }
 	addChoice := func(s string) { raw = append(raw, cardLine{s, 0, true}) }
 	stage := ""
-	if w, found := m.poolWord(c.word); found {
+	if w, found := m.poolWord(c.wordID); found {
 		stage = " " + wordStage(w.Recognition.Step, w.Reproduction.Step)
 	}
 	add(2, dim.Render(cardTitle(c))+stage)
@@ -769,12 +875,12 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 	case cR1:
 		add(0, bold.Render(c.prompt))
 		if c.tr != "" {
-			add(3, dim.Render(c.tr))
+			add(3, c.tr)
 		}
 		if c.reveal || c.done {
 			add(0, content.Render(c.native))
 			if c.example != "" {
-				add(3, dim.Render(c.example))
+				add(3, c.example)
 			}
 		}
 		resultBlock("✓ Got it", "✗ Missed it")
@@ -813,16 +919,18 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 	case cL1, cL1b:
 		add(0, bold.Render(c.prompt))
 		if c.tr != "" {
-			add(3, dim.Render(c.tr))
+			add(3, c.tr)
 		}
-		if c.native != "" {
-			add(0, c.native)
-		}
-		if c.example != "" {
-			add(3, dim.Render(c.example))
+		if c.reveal || c.done {
+			if c.native != "" {
+				add(0, content.Render(c.native))
+			}
+			if c.example != "" {
+				add(3, c.example)
+			}
 		}
 		if c.done {
-			add(2, okStyle.Render("✓ queued"))
+			add(2, okStyle.Render("✓ "+cmp.Or(c.verdict, "done")))
 		}
 	case cL2:
 		add(0, bold.Render(c.prompt)+" → choose translation")
@@ -835,7 +943,6 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 			}
 		}
 	}
-	add(1, faint.Render("["+c.hint()+"]"))
 	// Wrap, preserving priority and choice flags.
 	var lines []cardLine
 	for _, cl := range raw {
@@ -999,8 +1106,12 @@ func (m Model) viewWord(cw int) string {
 	w := m.word
 	var b strings.Builder
 	tr := ""
-	if w.Transcription != nil {
-		tr = "  [" + *w.Transcription + "]"
+	if w.Transcription != nil && *w.Transcription != "" {
+		t := *w.Transcription
+		if !strings.HasPrefix(t, "[") {
+			t = "[" + t + "]"
+		}
+		tr = "  " + t
 	}
 	b.WriteString(bold.Render(w.Text) + dim.Render(tr) + "\n")
 	nat := m.nativeLang()
@@ -1041,7 +1152,9 @@ func (m Model) viewWord(cw int) string {
 	if !m.wordEx && len(pairs) > 2 {
 		b.WriteString(dim.Render(fmt.Sprintf("[+ %d more — e]", len(pairs)-2)) + "\n")
 	}
-	b.WriteString(faint.Render(strings.Repeat("─", cw)) + "\n")
+	if len(pairs) > 0 {
+		b.WriteString(faint.Render(strings.Repeat("─", cw)) + "\n")
+	}
 	b.WriteString(fmt.Sprintf("%s recognition (%s→%s):  S%d · E%.2f · F%d",
 		stageMark(w.Recognition.Step), strings.ToUpper(m.appID), m.nativeLang(), w.Recognition.Step, w.Recognition.Easiness, w.Recognition.Fails) + "  [g]ot-it [m]issed\n")
 	b.WriteString(fmt.Sprintf("%s reproduction (%s→%s): S%d · E%.2f · F%d",
@@ -1057,13 +1170,29 @@ func (m Model) viewWord(cw int) string {
 		if e.Queue == 2 {
 			mark = okStyle.Render("✓")
 		}
-		b.WriteString(fmt.Sprintf(" %s  %s %s · %dth review\n", e.Date, kind, mark, e.Step+1))
+		b.WriteString(fmt.Sprintf(" %s  %s %s · %s review\n", e.Date, kind, mark, ordinal(e.Step+1)))
 	}
 	var lines []string
 	for _, ln := range strings.Split(strings.TrimRight(b.String(), "\n"), "\n") {
 		lines = append(lines, wrapStyled(ln, cw)...)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// ordinal spells 1st, 2nd, 3rd, 4th, 11th, 21st...
+func ordinal(n int64) string {
+	suffix := "th"
+	if n%100 < 11 || n%100 > 13 {
+		switch n % 10 {
+		case 1:
+			suffix = "st"
+		case 2:
+			suffix = "nd"
+		case 3:
+			suffix = "rd"
+		}
+	}
+	return fmt.Sprintf("%d%s", n, suffix)
 }
 
 func (m Model) viewStats(cw int) string {

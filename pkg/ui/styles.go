@@ -30,12 +30,12 @@ var (
 	// badStyle, red (9): wrong answer, dirty sync, errors.
 	badStyle = lipgloss.NewStyle().Foreground(lipgloss.CompleteColor{TrueColor: "#ff6e5e", ANSI256: "203", ANSI: "9"})
 
-	// attn, yellow (11): due counts, confirmations, stale, untracked, unset goal, warnings.
+	// attn, yellow (11): due counts, confirmations, stale, untracked, unset goal, warnings,
+	// week activity dots and streak.
 	attn = lipgloss.NewStyle().Foreground(lipgloss.CompleteColor{TrueColor: "#ffd479", ANSI256: "221", ANSI: "11"})
 	ybox = lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.CompleteColor{TrueColor: "#ffd479", ANSI256: "221", ANSI: "11"}).Padding(0, 2)
 
-	// prog, violet (5) to pink (13): word stages, week bars and dots,
-	// goal, streak, session progress.
+	// prog, violet (5) to pink (13): word stages, week bars, goal, session progress.
 	progLo = lipgloss.NewStyle().Foreground(lipgloss.CompleteColor{TrueColor: "#b39ddb", ANSI256: "140", ANSI: "5"})
 	prog   = lipgloss.NewStyle().Foreground(lipgloss.CompleteColor{TrueColor: "#ff7eb6", ANSI256: "212", ANSI: "13"})
 	progHi = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.CompleteColor{TrueColor: "#ff7eb6", ANSI256: "212", ANSI: "13"})

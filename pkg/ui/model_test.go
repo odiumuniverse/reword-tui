@@ -37,6 +37,22 @@ func key(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyEsc}
 	case " ":
 		return tea.KeyMsg{Type: tea.KeySpace}
+	case "tab":
+		return tea.KeyMsg{Type: tea.KeyTab}
+	case "shift+tab":
+		return tea.KeyMsg{Type: tea.KeyShiftTab}
+	case "backspace":
+		return tea.KeyMsg{Type: tea.KeyBackspace}
+	case "up":
+		return tea.KeyMsg{Type: tea.KeyUp}
+	case "down":
+		return tea.KeyMsg{Type: tea.KeyDown}
+	case "left":
+		return tea.KeyMsg{Type: tea.KeyLeft}
+	case "right":
+		return tea.KeyMsg{Type: tea.KeyRight}
+	case "ctrl+c":
+		return tea.KeyMsg{Type: tea.KeyCtrlC}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
 }
@@ -83,8 +99,11 @@ func TestR1Flow(t *testing.T) {
 	if it.Op != "grade" || it.Mode != "rec" || it.Result != "ok" {
 		t.Fatalf("bad intent: %+v", it)
 	}
-	if m.sess.ok != 1 || !m.sess.cur.done {
-		t.Fatal("counters/card state wrong")
+	if m.sess.ok != 1 {
+		t.Fatal("got it must count as correct")
+	}
+	if m.sess.cur != nil {
+		t.Fatal("review must move on to the next card by itself")
 	}
 }
 
@@ -508,8 +527,8 @@ func TestWordListCursorIsolated(t *testing.T) {
 		t.Fatal("esc must return to learn with cursor 0")
 	}
 	m = press(t, m, "enter")
-	if m.sess.mode != 0 {
-		t.Fatalf("session must start in mode 0, got %d", m.sess.mode)
+	if m.sess.mode != modeLearn {
+		t.Fatalf("Learn new words must start learning, got mode %d", m.sess.mode)
 	}
 }
 
@@ -587,11 +606,11 @@ func TestReviewCardUsesPool(t *testing.T) {
 		{ID: 1, Text: "el pan", Translations: map[string]string{"RUS": "хлеб"}},
 	}})
 	m = next.(Model)
-	c := m.reviewCard("el pan", 1)
+	c := m.reviewCard(1, "el pan", 1)
 	if c.done || c.native != "хлеб" {
 		t.Fatalf("card must come from pool without backend: %+v", c)
 	}
-	if _, ok := m.poolWord("missing"); ok {
+	if _, ok := m.poolWord(999); ok {
 		t.Fatal("unknown word must miss pool index")
 	}
 }
@@ -647,9 +666,9 @@ func TestLearnProgressBarNoPanic(t *testing.T) {
 		proofWord(4, "cuatro", "четыре", 0),
 	}
 	m.pool = pool
-	m.poolIdx = map[string]int{}
+	m.poolIdx = map[int64]int{}
 	for i, w := range pool {
-		m.poolIdx[w.Text] = i
+		m.poolIdx[w.ID] = i
 	}
 	m.screen = sSession
 	m.sess = session{mode: 1, learn: []rwcore.Word{pool[0]}, lpos: 1, started: true}
@@ -785,7 +804,7 @@ func fitModel(t *testing.T) Model {
 	m.catSel = map[string]bool{"custom": true}
 	m.catPct = map[string]string{"custom": "12%"}
 	m.pool = []rwcore.Word{longWord()}
-	m.poolIdx = map[string]int{longWord().Text: 0}
+	m.poolIdx = map[int64]int{longWord().ID: 0}
 	m.vocabWords = []rwcore.Word{longWord()}
 	m.word = &rwcore.Word{Text: longWord().Text, Translations: longWord().Translations, Examples: longWord().Examples,
 		Recognition: longWord().Recognition, Reproduction: longWord().Reproduction}
@@ -1141,8 +1160,8 @@ func TestEdgeCardAndOverlayContentAfterCrop(t *testing.T) {
 					fails = append(fails, fmt.Sprintf("R2 %dx%-2d choice %d cropped", w, h, i))
 				}
 			}
-			if !strings.Contains(out, "["+c.hint()+"]") {
-				fails = append(fails, fmt.Sprintf("R2 %dx%-2d in-card hint cropped", w, h))
+			if !strings.Contains(out, "1-4") {
+				fails = append(fails, fmt.Sprintf("R2 %dx%-2d pick keys missing from the footer", w, h))
 			}
 			if strings.Count(out, "┌") != strings.Count(out, "└") {
 				fails = append(fails, fmt.Sprintf("R2 %dx%-2d card frame cut (┌=%d └=%d)", w, h, strings.Count(out, "┌"), strings.Count(out, "└")))
@@ -1174,6 +1193,393 @@ func TestEdgeCardAndOverlayContentAfterCrop(t *testing.T) {
 	}
 	if len(fails) > 0 {
 		t.Errorf("%d crops remove content the user must see", len(fails))
+	}
+}
+
+func TestLearnMenuRowsMapToModes(t *testing.T) {
+	for row, want := range []int{modeLearn, modeReview, modeMixed} {
+		m := testModel(t)
+		m.screen = sLearn
+		m.menuIdx = row
+		m = press(t, m, "enter")
+		if m.sess.mode != want {
+			t.Fatalf("menu row %d must start mode %d, got %d", row, want, m.sess.mode)
+		}
+	}
+}
+
+func TestChosenCatsFollowSelection(t *testing.T) {
+	m := testModel(t)
+	if m.chosenCats() != nil {
+		t.Fatal("unknown categories must load the whole app")
+	}
+	m.cats = []rwcore.Category{{ID: "animals"}, {ID: "food"}, {ID: "custom"}}
+	m.catSel = map[string]bool{"animals": true, "custom": true}
+	if got := strings.Join(m.chosenCats(), ","); got != "animals,custom" {
+		t.Fatalf("pool must follow the chosen categories, got %q", got)
+	}
+	m.catSel = map[string]bool{}
+	if got := m.chosenCats(); got == nil || len(got) != 0 {
+		t.Fatalf("nothing chosen must mean an empty pool, got %v", got)
+	}
+	m.prefs.ReviewFrom = "all"
+	if m.chosenCats() != nil {
+		t.Fatal("review-from-all must load the whole app")
+	}
+}
+
+func TestNewWordHidesTranslationUntilShown(t *testing.T) {
+	m := testModel(t)
+	m.screen = sSession
+	m.sess.mode = modeLearn
+	m.sess.cur = m.learnFrom(rwcore.Word{Text: "la foca", Translations: map[string]string{"RUS": "тюлень"}})
+	if m.sess.cur.kind != cL1 {
+		t.Fatalf("setup: want a new-word card, got %v", m.sess.cur.kind)
+	}
+	out := m.View()
+	if strings.Contains(out, "тюлень") {
+		t.Fatal("a new word must hide its translation until space")
+	}
+	if !strings.Contains(out, "Start learning") || strings.Contains(out, "Got it") {
+		t.Fatal("a new word must offer the learning answers, not review grades")
+	}
+	m = press(t, m, " ")
+	if !strings.Contains(m.View(), "тюлень") {
+		t.Fatal("space must show the translation")
+	}
+	m.prefs.RevealAtOnce = true
+	m.sess.cur = m.learnFrom(rwcore.Word{Text: "el oso", Translations: map[string]string{"RUS": "медведь"}})
+	if !strings.Contains(m.View(), "медведь") {
+		t.Fatal("'show translation at once' must reveal new words too")
+	}
+}
+
+func TestReviewAdvancesByItself(t *testing.T) {
+	m := testModel(t)
+	m.screen = sSession
+	m.sess.mode = modeReview
+	m.pool = []rwcore.Word{{ID: 2, Text: "b", Translations: map[string]string{"RUS": "б"}}}
+	m.poolIdx = map[int64]int{2: 0}
+	m.sess.units = []reviewUnit{{id: 2, word: "b", mode: 1}}
+	m.sess.cur = &card{kind: cR1, word: "a", mode: "rec", reveal: true}
+	m = press(t, m, "g")
+	if m.sess.cur == nil || m.sess.cur.word != "b" {
+		t.Fatalf("got it in review must show the next word, cur=%+v", m.sess.cur)
+	}
+	m.sess.mode = modeLearn
+	m.sess.cur = &card{kind: cL1, word: "c", fromLearn: true}
+	m = press(t, m, "l")
+	if m.sess.cur == nil || m.sess.cur.word != "c" || !m.sess.cur.done {
+		t.Fatal("learning must wait for the user after a decision")
+	}
+	if m.sess.ok != 1 {
+		t.Fatalf("start learning is a decision, not a correct answer: ok=%d", m.sess.ok)
+	}
+}
+
+func TestReviewChoiceAdvancesAfterFlash(t *testing.T) {
+	m := testModel(t)
+	m.screen = sSession
+	m.sess.mode = modeReview
+	m.pool = []rwcore.Word{{ID: 2, Text: "b", Translations: map[string]string{"RUS": "б"}}}
+	m.poolIdx = map[int64]int{2: 0}
+	m.sess.units = []reviewUnit{{id: 2, word: "b", mode: 1}}
+	m.sess.cur = &card{kind: cR2, word: "a", mode: "rep", choices: []string{"x", "y", "z", "w"}, answer: 0}
+	next, cmd := m.Update(key("1"))
+	m = next.(Model)
+	if cmd == nil || !m.sess.cur.done {
+		t.Fatal("a picked choice must show its result and schedule the next card")
+	}
+	next, _ = m.Update(autoNextMsg{seq: m.sess.seq - 1})
+	if m = next.(Model); m.sess.cur.word != "a" {
+		t.Fatal("a stale tick must not skip a card")
+	}
+	next, _ = m.Update(autoNextMsg{seq: m.sess.seq})
+	if m = next.(Model); m.sess.cur == nil || m.sess.cur.word != "b" {
+		t.Fatal("the tick must move on to the next card")
+	}
+}
+
+func TestSwitchModeKeepsQueues(t *testing.T) {
+	m := testModel(t)
+	m.screen = sSession
+	m.pool = []rwcore.Word{
+		{ID: 1, Text: "r1", Translations: map[string]string{"RUS": "р"}, Recognition: rwcore.ModeState{Level: 2}, Reproduction: rwcore.ModeState{Level: 2}},
+		{ID: 2, Text: "n1", Translations: map[string]string{"RUS": "н"}},
+	}
+	m.poolIdx = map[int64]int{1: 0, 2: 1}
+	m.sess = session{mode: modeReview, units: []reviewUnit{{id: 1, word: "r1", mode: 1}}, revWords: 1, learn: []rwcore.Word{m.pool[1]}}
+	m.advance()
+	if m.sess.reviewLeft() != 1 || m.sess.learnLeft() != 1 {
+		t.Fatalf("setup: review=%d learn=%d", m.sess.reviewLeft(), m.sess.learnLeft())
+	}
+	m = press(t, m, "tab")
+	if m.sess.mode != modeLearn || m.sess.reviewLeft() != 1 || m.sess.cur == nil || m.sess.cur.word != "n1" {
+		t.Fatalf("tab must switch to learning and keep the unanswered review word (review=%d)", m.sess.reviewLeft())
+	}
+	m = press(t, m, "tab")
+	if m.sess.mode != modeReview || m.sess.learnLeft() != 1 || m.sess.cur == nil || m.sess.cur.word != "r1" {
+		t.Fatalf("tab back must resume review and keep the unanswered new word (learn=%d)", m.sess.learnLeft())
+	}
+}
+
+func TestSessionProgressCountsWords(t *testing.T) {
+	m := testModel(t)
+	m.screen = sSession
+	m.prefs.Keyboard, m.prefs.Guess = false, false
+	m.pool = []rwcore.Word{{ID: 5, Text: "a", Translations: map[string]string{"RUS": "а"}}}
+	m.poolIdx = map[int64]int{5: 0}
+	m.due = []rwcore.DueItem{{ID: 5, Word: "a", Modes: []int64{1, 2}}}
+	m.buildReview()
+	m.advance()
+	if bar := m.sessionBar(); !strings.Contains(bar, "0/1") {
+		t.Fatalf("a word with two sides is one word to review: %q", bar)
+	}
+	m = press(t, m, " ")
+	m = press(t, m, "g")
+	if bar := m.sessionBar(); !strings.Contains(bar, "0/1") {
+		t.Fatalf("a word is not done until both sides are: %q", bar)
+	}
+	m = press(t, m, " ")
+	m = press(t, m, "g")
+	if bar := m.sessionBar(); !strings.Contains(bar, "1/1") {
+		t.Fatalf("both sides answered must finish the word: %q", bar)
+	}
+}
+
+func TestSessionQuietQueue(t *testing.T) {
+	m := testModel(t)
+	m.screen = sSession
+	m.sess.cur = &card{kind: cR1, word: "a", mode: "rec", reveal: true}
+	m = press(t, m, "g")
+	if m.notice != "" {
+		t.Fatalf("grading must not raise a queued notice in a session: %q", m.notice)
+	}
+}
+
+func TestDuplicateTextsResolveByID(t *testing.T) {
+	m := testModel(t)
+	m.screen = sSession
+	m.sess.mode = modeReview
+	m.prefs.Keyboard, m.prefs.Guess = false, false
+	pool := []rwcore.Word{
+		{ID: 937, Text: "la carne", Translations: map[string]string{"RUS": "мясо"}},
+		{ID: 7393, Text: "la carne", Translations: map[string]string{"RUS": "мясо, плоть"},
+			Recognition: rwcore.ModeState{Level: 2, Step: 2}, Reproduction: rwcore.ModeState{Level: 2, Step: 4}},
+	}
+	m.due = []rwcore.DueItem{{ID: 7393, Word: "la carne", Modes: []int64{1}}}
+	next, _ := m.Update(wordsMsg{key: "pool", words: pool})
+	m = next.(Model)
+	if m.sess.cur == nil || m.sess.cur.wordID != 7393 || m.sess.cur.native != "мясо, плоть" {
+		t.Fatalf("the due word must come from its own id, got %+v", m.sess.cur)
+	}
+	m = press(t, m, " ")
+	m = press(t, m, "g")
+	if len(m.q.Items) != 1 {
+		t.Fatalf("want one queued grade, got %d", len(m.q.Items))
+	}
+	if got := m.q.Items[0].ApplyBody()["word"]; got != "7393" {
+		t.Fatalf("the grade must target the due word's id, not a same-text twin: %v", got)
+	}
+}
+
+func TestWordCardDetails(t *testing.T) {
+	m := testModel(t)
+	m.screen = sWord
+	tr := "[feˈliθ]"
+	m.word = &rwcore.Word{ID: 1, Text: "feliz", Transcription: &tr, Translations: map[string]string{"RUS": "счастливый"}}
+	m.wordLog = []rwcore.LogEntry{
+		{Date: "2026-08-10", Mode: 1, Queue: 2, Step: 0},
+		{Date: "2026-08-11", Mode: 1, Queue: 2, Step: 1},
+		{Date: "2026-08-12", Mode: 2, Queue: 2, Step: 2},
+	}
+	out := sgrRe.ReplaceAllString(m.View(), "")
+	if strings.Contains(out, "[[") {
+		t.Fatal("a transcription that carries brackets must not get a second pair")
+	}
+	for _, want := range []string{"1st review", "2nd review", "3rd review"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("history must read %q:\n%s", want, out)
+		}
+	}
+	lines := strings.Split(out, "\n")
+	rule := strings.Repeat("─", 10)
+	for i := 1; i < len(lines); i++ {
+		if strings.Contains(lines[i], rule) && strings.Contains(lines[i-1], rule) {
+			t.Fatal("a word without examples must not stack two separators")
+		}
+	}
+	if ordinal(11) != "11th" || ordinal(21) != "21st" || ordinal(112) != "112th" {
+		t.Fatal("ordinal suffixes are wrong for the teens")
+	}
+}
+
+func TestSwipeArrowsPickTheSideAnswer(t *testing.T) {
+	onCard := func(kind cardKind, reveal bool) Model {
+		m := testModel(t)
+		m.screen = sSession
+		m.sess.mode = modeLearn
+		m.sess.cur = &card{kind: kind, word: "w", wordID: 9, fromLearn: true, reveal: reveal, mode: "rec"}
+		return m
+	}
+	m := press(t, onCard(cL1, false), "left")
+	if it := m.q.Items; len(it) != 1 || it[0].Decision != "known" || m.sess.cur.verdict != "already known" {
+		t.Fatalf("← on a new word must mark it already known: %+v", it)
+	}
+	m = press(t, onCard(cL1, false), "right")
+	if it := m.q.Items; len(it) != 1 || it[0].Decision != "learn" {
+		t.Fatalf("→ on a new word must start learning: %+v", it)
+	}
+	m = press(t, onCard(cL1b, false), "right")
+	if len(m.q.Items) != 0 || !m.sess.cur.done || m.sess.cur.verdict != "keep showing" {
+		t.Fatal("→ on a learning word must keep showing it without queuing anything")
+	}
+	m = press(t, onCard(cL1b, true), "left")
+	if it := m.q.Items; len(it) != 1 || it[0].Decision != "learn" {
+		t.Fatalf("← on a learning word means i have memorized: %+v", it)
+	}
+	m = press(t, onCard(cR1, false), "left")
+	if len(m.q.Items) != 0 {
+		t.Fatal("arrows must not grade before the answer is shown")
+	}
+	m.sess.cur.reveal = true
+	m = press(t, m, "right")
+	if it := m.q.Items; len(it) != 1 || it[0].Result != "fail" {
+		t.Fatalf("→ after the answer means missed it: %+v", it)
+	}
+}
+
+func TestSwipeLabelsSitUnderTheCard(t *testing.T) {
+	m := testModel(t)
+	m.screen = sSession
+	m.width, m.height = 112, 40
+	m.sess.mode = modeLearn
+	m.sess.cur = m.learnFrom(rwcore.Word{ID: 3, Text: "el topo", Translations: map[string]string{"RUS": "крот"}})
+	lines := strings.Split(sgrRe.ReplaceAllString(m.View(), ""), "\n")
+	bottom := -1
+	for i, ln := range lines {
+		if strings.Contains(ln, "└") {
+			bottom = i
+		}
+	}
+	if bottom < 0 || bottom+1 >= len(lines) {
+		t.Fatal("no card frame rendered")
+	}
+	frame, under := lines[bottom], lines[bottom+1]
+	if !strings.Contains(under, "← Already known") || !strings.Contains(under, "Start learning →") {
+		t.Fatalf("the answers must sit right under the frame: %q", under)
+	}
+	leftEdge := lipgloss.Width(frame[:strings.Index(frame, "└")])
+	rightEdge := lipgloss.Width(frame[:strings.LastIndex(frame, "┘")])
+	if got := lipgloss.Width(under[:strings.Index(under, "←")]); got != leftEdge+2 {
+		t.Fatalf("← must line up with the card's text, col %d vs frame %d", got, leftEdge)
+	}
+	if got := lipgloss.Width(under[:strings.LastIndex(under, "→")]); got != rightEdge-2 {
+		t.Fatalf("→ must end at the card's right side, col %d vs frame %d", got, rightEdge)
+	}
+	for _, ln := range lines[:bottom] {
+		if strings.Contains(ln, "[space show") || strings.Contains(ln, "already know]") {
+			t.Fatal("the card must not repeat the footer keys inside the frame")
+		}
+	}
+}
+
+func TestReviewCountsSameTextWordsApart(t *testing.T) {
+	m := testModel(t)
+	m.due = []rwcore.DueItem{
+		{ID: 1, Word: "blanco", Modes: []int64{1}},
+		{ID: 2, Word: "blanco", Modes: []int64{1, 2}},
+	}
+	m.buildReview()
+	if m.sess.revWords != 2 || m.sess.reviewLeft() != 2 {
+		t.Fatalf("two words sharing a text are two words to review: total=%d left=%d", m.sess.revWords, m.sess.reviewLeft())
+	}
+}
+
+func TestArrowsKeepTyping(t *testing.T) {
+	m := testModel(t)
+	m.screen = sSession
+	m.sess.cur = &card{kind: cR3, word: "x", mode: "rep", expected: []string{"x"}, attempts: 3}
+	m.sess.typing, m.sess.input = true, "ab"
+	m = press(t, m, "left")
+	if !m.sess.typing || m.sess.input != "ab" {
+		t.Fatalf("an arrow must not end typing, typing=%v input=%q", m.sess.typing, m.sess.input)
+	}
+}
+
+func TestBurstInputReplaysRunes(t *testing.T) {
+	burst := func(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
+	m := testModel(t)
+	m.screen = sSession
+	m.sess.cur = &card{kind: cR3, word: "la carne", mode: "rep", expected: []string{"la carne"}, attempts: 3}
+	m.sess.typing = true
+	next, _ := m.Update(burst("la carne"))
+	if m = next.(Model); m.sess.input != "la carne" || !m.sess.typing {
+		t.Fatalf("a fast-typed answer must land in the input, got %q typing=%v", m.sess.input, m.sess.typing)
+	}
+	m = testModel(t)
+	m.screen, m.searchOn = sVocab, true
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("leche"), Paste: true})
+	if m = next.(Model); m.search != "leche" {
+		t.Fatalf("a pasted search must land in the field, got %q", m.search)
+	}
+}
+
+func TestLearningVerdictNotQueued(t *testing.T) {
+	m := testModel(t)
+	m.screen = sSession
+	m.sess.mode = modeLearn
+	m.sess.cur = m.learnFrom(rwcore.Word{Text: "la foca", Translations: map[string]string{"RUS": "тюлень"}})
+	m = press(t, m, "l")
+	out := m.View()
+	if !strings.Contains(out, "learning started") || strings.Contains(out, "queued:") || strings.Contains(out, "✓ queued") {
+		t.Fatal("start learning must say what it did, not that something was queued")
+	}
+}
+
+func TestSessionCardAlignsWithHeader(t *testing.T) {
+	m := fitModel(t)
+	m.screen, m.ov, m.searchOn = sSession, oNone, false
+	m.width, m.height = 112, 42
+	lines := strings.Split(sgrRe.ReplaceAllString(m.View(), ""), "\n")
+	rule := strings.Index(lines[1], "─")
+	for _, ln := range lines {
+		if i := strings.Index(ln, "┌"); i >= 0 {
+			if i != rule {
+				t.Fatalf("card must line up with the header rule: card at %d, rule at %d", i, rule)
+			}
+			return
+		}
+	}
+	t.Fatal("no card frame rendered")
+}
+
+func TestSessionCardCenteredWithModeColumn(t *testing.T) {
+	m := fitModel(t)
+	m.screen, m.ov, m.searchOn = sSession, oNone, false
+	m.width, m.height = 144, 42
+	var frame, modes int
+	lines := strings.Split(sgrRe.ReplaceAllString(m.View(), ""), "\n")
+	frame, modes = -1, -1
+	for i, ln := range lines {
+		if frame < 0 && strings.Contains(ln, "┌") {
+			frame = i
+		}
+		if modes < 0 && strings.Contains(ln, "Learning (") {
+			modes = i
+		}
+	}
+	if frame < 0 || modes < 0 {
+		t.Fatalf("session must show a card and the mode column (frame=%d modes=%d)", frame, modes)
+	}
+	fl := lines[frame]
+	left := strings.Index(fl, "┌")
+	right := lipgloss.Width(fl[:strings.LastIndex(fl, "┐")]) + 1
+	if d := left - (144 - right); d < -1 || d > 1 {
+		t.Fatalf("card must sit on the screen's center line: left margin %d, right margin %d", left, 144-right)
+	}
+	if col := strings.Index(lines[modes], "Learning ("); col < 0 || col >= left {
+		t.Fatalf("mode column must sit left of the card: col=%d card=%d", col, left)
 	}
 }
 

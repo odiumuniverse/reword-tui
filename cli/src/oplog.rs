@@ -320,7 +320,10 @@ pub fn replay_decision(conn: &rusqlite::Connection, app_id: &str, op: &Op) -> Re
         OpKind::Selected { category, selected } => {
             let cur: Option<i64> = conn
                 .query_row(
-                    "SELECT IS_SELECTED FROM CATEGORY WHERE ID = ? OR NAME_ENG = ?",
+                    &format!(
+                        "SELECT IS_SELECTED FROM CATEGORY WHERE ID = ? OR {} = ?",
+                        crate::store::cat_name_col(conn)?
+                    ),
                     rusqlite::params![category, category],
                     |r| r.get(0),
                 )
@@ -338,9 +341,14 @@ pub fn replay_decision(conn: &rusqlite::Connection, app_id: &str, op: &Op) -> Re
         }
         OpKind::CategoryAdded { id, name } => {
             let have: Option<String> = conn
-                .query_row("SELECT NAME_ENG FROM CATEGORY WHERE ID = ?", [id], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM CATEGORY WHERE ID = ?",
+                        crate::store::cat_name_col(conn)?
+                    ),
+                    [id],
+                    |r| r.get(0),
+                )
                 .optional()?;
             match have {
                 Some(n) if n == *name => Ok(ReplayAction::Skip("already exists".to_string())),
@@ -385,7 +393,10 @@ pub fn replay_decision(conn: &rusqlite::Connection, app_id: &str, op: &Op) -> Re
         }
         OpKind::CategoryAdmin { category, action } => {
             let present: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM CATEGORY WHERE ID = ? OR NAME_ENG = ?",
+                &format!(
+                    "SELECT COUNT(*) FROM CATEGORY WHERE ID = ? OR {} = ?",
+                    crate::store::cat_name_col(conn)?
+                ),
                 rusqlite::params![category, category],
                 |r| r.get(0),
             )?;
