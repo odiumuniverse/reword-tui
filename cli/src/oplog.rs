@@ -185,7 +185,10 @@ pub fn shelve_orphan(
         .open(orphans_path(data_dir))
         .context("cannot open orphan shelf")?;
     use std::io::Write as _;
-    writeln!(f, "{}", serde_json::to_string(&o)?).context("cannot shelve orphan")?;
+    let mut line = serde_json::to_string(&o)?;
+    line.push('\n');
+    f.write_all(line.as_bytes())
+        .context("cannot shelve orphan")?;
     f.sync_all().context("cannot fsync orphan shelf")?;
     Ok(())
 }

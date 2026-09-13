@@ -243,6 +243,7 @@ enum Cmd {
         yes: bool,
     },
     Categories,
+    Catstats,
     Today,
     Select {
         #[arg(long)]
@@ -619,6 +620,12 @@ fn main() -> Result<()> {
             let app = resolve_app(&cli, &root)?;
             let conn = store::open_ro(&app.backup_path)?;
             output::categories(&store::categories(&conn)?, cli.format)?;
+        }
+        Cmd::Catstats => {
+            let root = icloud_root(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let conn = store::open_ro(&app.backup_path)?;
+            output::category_stats(&store::category_stats(&conn)?, cli.format)?;
         }
         Cmd::Today => {
             let root = icloud_root(&cli)?;
@@ -1150,8 +1157,10 @@ fn main() -> Result<()> {
                     || rusqlite::Connection::open(&sim).with_context(|| "cannot open replay sim"),
                     "open replay sim",
                 )?;
-                let rep = replay_run(&sim_conn, &app.id, &ops)?;
+                let rep = replay_run(&sim_conn, &app.id, &ops);
+                drop(sim_conn);
                 std::fs::remove_file(&sim).ok();
+                let rep = rep?;
                 let mut kinds = std::collections::HashMap::new();
                 for o in ops.iter().filter(|o| o.app == app.id) {
                     kinds.insert(o.seq, serde_json::to_string(&o.kind).unwrap_or_default());

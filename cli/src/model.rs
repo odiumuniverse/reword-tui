@@ -178,6 +178,12 @@ pub struct Category {
     pub name_en: Option<String>,
     pub words: i64,
 }
+#[derive(Debug, Clone, Serialize)]
+pub struct CategoryStat {
+    pub category: String,
+    pub total: i64,
+    pub started: i64,
+}
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Settings {
     pub native_language: Option<String>,

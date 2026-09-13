@@ -6,9 +6,9 @@ RWCORE := rwcore
 all: build
 
 build:
-	cargo build --manifest-path cli/Cargo.toml
+	cargo build --release --manifest-path cli/Cargo.toml
 	go build -o $(TUI) .
-	cp cli/target/debug/$(RWCORE) ./$(RWCORE)
+	cp cli/target/release/$(RWCORE) ./$(RWCORE)
 
 test:
 	cargo test --manifest-path cli/Cargo.toml

@@ -45,6 +45,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.onStats(msg)
 	case catsMsg:
 		return m.onCats(msg)
+	case catStatsMsg:
+		return m.onCatStats(msg)
 	case wordsMsg:
 		return m.onWords(msg)
 	case wordMsg:
@@ -57,6 +59,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err.Error()
 		}
 		m.loading = ""
+		if msg.err == nil && msg.out == "pulled" {
+			m.notice = "pulled"
+			m.loading = "sync"
+			return m, m.loadSync()
+		}
 		return m, nil
 	case writeMsg:
 		return m.onWrite(msg)
@@ -92,6 +99,9 @@ func (m Model) onApps(msg appsMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.apps = msg.apps
+	if m.appIdx >= len(m.apps) {
+		m.appIdx = max(len(m.apps)-1, 0)
+	}
 	if len(m.apps) == 1 {
 		m.appID = m.apps[0].ID
 		m.screen = sLearn
@@ -114,6 +124,7 @@ func (m Model) onStats(msg statsMsg) (tea.Model, tea.Cmd) {
 	m.stats = &msg.stats
 	m.today = &msg.today
 	m.due = msg.due
+	m.maybeOnboard()
 	if m.screen == sSession && !m.sess.started && len(m.pool) == 0 {
 		return m, m.loadPool()
 	}
@@ -131,13 +142,78 @@ func (m Model) onCats(msg catsMsg) (tea.Model, tea.Cmd) {
 			m.catSel[c.ID] = c.Selected
 		}
 	}
-	if !m.prefs.Onboarded && m.appID != "" && m.obStep == 0 && len(msg.cats) > 0 {
+	if m.vocabIdx >= len(m.cats) {
+		m.vocabIdx = max(len(m.cats)-1, 0)
+	}
+	m.maybeOnboard()
+	return m, nil
+}
+
+func (m Model) onCatStats(msg catStatsMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil {
+		m.err = msg.err.Error()
+		return m, nil
+	}
+	for _, s := range msg.stats {
+		if s.Total > 0 {
+			m.catPct[s.Category] = fmt.Sprintf("%d%%", s.Started*100/s.Total)
+		} else {
+			m.catPct[s.Category] = "—"
+		}
+	}
+	return m, nil
+}
+
+func (m Model) anySelected() bool {
+	for _, c := range m.cats {
+		if m.catSel[c.ID] {
+			return true
+		}
+	}
+	return false
+}
+
+func (m Model) knownGoal() (int64, bool) {
+	if m.today != nil && m.today.Goal != nil {
+		return *m.today.Goal, true
+	}
+	if m.stats != nil && m.stats.Settings.DailyGoal != nil {
+		if g, err := strconv.Atoi(*m.stats.Settings.DailyGoal); err == nil {
+			return int64(g), true
+		}
+	}
+	return 0, false
+}
+
+func (m *Model) maybeOnboard() {
+	if m.prefs.Onboarded || m.appID == "" || m.obStep != 0 || len(m.cats) == 0 {
+		return
+	}
+	if m.stats == nil && m.today == nil {
+		return
+	}
+	if !m.anySelected() {
 		m.obStep = 1
 		m.screen = sVocab
 		m.vocabMode = 0
 		m.notice = "Choose some categories to start learning"
+		return
 	}
-	return m, nil
+	if _, ok := m.knownGoal(); !ok {
+		m.obStep = 2
+		m.goalTitle = "How many new words do you want to learn per day?"
+		m.goalInput = ""
+		m.ov = oGoal
+		return
+	}
+	m.prefs.Onboarded = true
+	_ = m.prefs.Save()
+}
+
+func (m Model) finishOnboarding() {
+	m.obStep = 0
+	m.prefs.Onboarded = true
+	_ = m.prefs.Save()
 }
 
 func (m Model) onWords(msg wordsMsg) (tea.Model, tea.Cmd) {
@@ -148,23 +224,21 @@ func (m Model) onWords(msg wordsMsg) (tea.Model, tea.Cmd) {
 	}
 	if msg.key == "pool" {
 		m.pool = msg.words
+		m.poolIdx = make(map[string]int, len(msg.words))
+		for i, w := range msg.words {
+			if _, ok := m.poolIdx[w.Text]; !ok {
+				m.poolIdx[w.Text] = i
+			}
+		}
+		m.menuIdx = 0
 		m.buildLearnQueue()
 		m.buildReview()
 		m.advance()
 		return m, nil
 	}
 	if strings.HasPrefix(msg.key, "pct:") {
-		cid := strings.TrimPrefix(msg.key, "pct:")
-		started := 0
-		for _, w := range msg.words {
-			if w.Recognition.Level > 0 || w.Reproduction.Level > 0 {
-				started++
-			}
-		}
-		if len(msg.words) > 0 {
-			m.catPct[cid] = fmt.Sprintf("%d%%", started*100/len(msg.words))
-		} else {
-			m.catPct[cid] = "—"
+		if m.menuIdx >= len(m.vocabWords) {
+			m.menuIdx = max(len(m.vocabWords)-1, 0)
 		}
 		return m, nil
 	}
@@ -202,6 +276,9 @@ func (m Model) onSync(msg syncMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) onWrite(msg writeMsg) (tea.Model, tea.Cmd) {
 	m.loading = ""
+	// Drop exactly the applied prefix: intents appended while the
+	// async write was in flight stay queued.
+	_ = m.q.Consume(msg.consumed)
 	if msg.dirty {
 		m.err = "DIRTY_SOURCE: pull first"
 		m.screen = sSync
@@ -212,8 +289,6 @@ func (m Model) onWrite(msg writeMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.written += msg.written
-	_ = m.q.Clear()
-	m.q = queue.Load(m.cfg.QueuePath)
 	quit := m.quitAfterWrite
 	m.quitAfterWrite = false
 	if quit && msg.orphaned == 0 {
@@ -262,13 +337,8 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.screen = sVocab
 		m.vocabMode = 0
-		cmds := []tea.Cmd{m.loadCats()}
-		for _, c := range m.cats {
-			if _, ok := m.catPct[c.ID]; !ok {
-				cmds = append(cmds, m.loadWords("pct:"+c.ID, "", c.ID, 200000))
-			}
-		}
-		return m, tea.Batch(cmds...)
+		m.menuIdx = 0
+		return m, tea.Batch(m.loadCats(), m.loadCatStats())
 	case "3":
 		m.screen = sMenu
 		m.menuIdx = 0
@@ -327,6 +397,12 @@ func (m Model) refresh() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) pickerKey(k string) (tea.Model, tea.Cmd) {
+	if len(m.apps) == 0 {
+		if k == "esc" {
+			return m, tea.Quit
+		}
+		return m, nil
+	}
 	if n, err := strconv.Atoi(k); err == nil {
 		if i := slices.IndexFunc(m.apps, func(a rwcore.App) bool { return a.N == n }); i >= 0 {
 			m.appIdx = i
@@ -364,7 +440,7 @@ func (m Model) learnKey(k string) (tea.Model, tea.Cmd) {
 		m.vocabMode = 0
 		return m, m.loadCats()
 	case "enter":
-		return m.startSession(m.menuIdx)
+		return m.startSession(min(max(m.menuIdx, 0), 2))
 	}
 	return m, nil
 }
@@ -564,8 +640,13 @@ func (m Model) sessionKey(k string) (tea.Model, tea.Cmd) {
 			s.ok++
 			nc := *c
 			nc.kind = cL2
-			w, err := m.cli.Show(m.appID, c.word)
-			if err == nil {
+			if w, ok := m.poolWord(c.word); ok {
+				if choices, ans, ok := m.makeChoices(w); ok {
+					nc.choices, nc.answer = choices, ans
+					m.sess.cur = &nc
+					return m, nil
+				}
+			} else if w, err := m.cli.Show(m.appID, c.word); err == nil {
 				if choices, ans, ok := m.makeChoices(w); ok {
 					nc.choices, nc.answer = choices, ans
 					m.sess.cur = &nc
@@ -656,13 +737,18 @@ func (m Model) vocabKey(k string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch k {
 		case "esc":
 			m.vocabMode = 0
+			m.menuIdx = 0
 			return m, nil
 		case "j", "down":
-			m.menuIdx = min(m.menuIdx+1, len(m.vocabWords)-1)
+			if len(m.vocabWords) > 0 {
+				m.menuIdx = min(m.menuIdx+1, len(m.vocabWords)-1)
+			}
 		case "k", "up":
-			m.menuIdx = max(m.menuIdx-1, 0)
+			if len(m.vocabWords) > 0 {
+				m.menuIdx = max(m.menuIdx-1, 0)
+			}
 		case "enter":
-			if m.menuIdx < len(m.vocabWords) {
+			if m.menuIdx >= 0 && m.menuIdx < len(m.vocabWords) {
 				return m, m.loadWord(m.vocabWords[m.menuIdx].Text)
 			}
 		}
@@ -670,9 +756,13 @@ func (m Model) vocabKey(k string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch k {
 	case "j", "down":
-		m.vocabIdx = min(m.vocabIdx+1, len(m.cats)-1)
+		if len(m.cats) > 0 {
+			m.vocabIdx = min(m.vocabIdx+1, len(m.cats)-1)
+		}
 	case "k", "up":
-		m.vocabIdx = max(m.vocabIdx-1, 0)
+		if len(m.cats) > 0 {
+			m.vocabIdx = max(m.vocabIdx-1, 0)
+		}
 	case " ":
 		if m.vocabIdx < len(m.cats) {
 			c := m.cats[m.vocabIdx]
@@ -681,6 +771,11 @@ func (m Model) vocabKey(k string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		if m.obStep == 1 {
+			if _, ok := m.knownGoal(); ok {
+				m.finishOnboarding()
+				m.screen = sLearn
+				return m, m.loadMain()
+			}
 			m.obStep = 2
 			m.goalTitle = "How many new words do you want to learn per day?"
 			m.goalInput = ""
@@ -715,13 +810,14 @@ func (m Model) vocabKey(k string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.ov = oConfirm
-			m.confirmT = "Are you sure you want to remove the category with all of its words?"
+			m.confirmT = fmt.Sprintf("Remove '%s' with all of its %d words?", c.DisplayName(), c.Words)
 			m.pending = "rmcat"
 		}
 	case "R":
 		if m.vocabIdx < len(m.cats) {
+			c := m.cats[m.vocabIdx]
 			m.ov = oConfirm
-			m.confirmT = "Are you sure you want to reset progress for each word in this category?"
+			m.confirmT = fmt.Sprintf("Reset progress for %d words in '%s'?", c.Words, c.DisplayName())
 			m.pending = "rscat"
 		}
 	case "D":
@@ -732,11 +828,12 @@ func (m Model) vocabKey(k string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.ov = oConfirm
-			m.confirmT = "Are you sure you want to remove all the words from this category?"
+			m.confirmT = fmt.Sprintf("Remove all %d words from '%s'?", c.Words, c.DisplayName())
 			m.pending = "clearcat"
 		}
 	case "esc":
 		m.screen = sLearn
+		m.menuIdx = 0
 		return m, m.loadMain()
 	}
 	_ = msg
@@ -1005,10 +1102,6 @@ func (m Model) overlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) doWriteAndQuit() tea.Cmd {
-	return tea.Sequence(m.doWrite(), tea.Quit)
-}
-
 func (m Model) addKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := msg.String()
 	for len(m.addF) < 4 {
@@ -1255,10 +1348,8 @@ func (m Model) goalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.ov = oNone
 		m.goalInput = ""
 		if m.obStep == 2 {
-			m.obStep = 0
+			m.finishOnboarding()
 			m.screen = sLearn
-			m.prefs.Onboarded = true
-			_ = m.prefs.Save()
 		}
 		return m, nil
 	case "enter":
@@ -1283,11 +1374,8 @@ func (m Model) submitGoal() (tea.Model, tea.Cmd) {
 	m.ov = oNone
 	m.goalInput = ""
 	m.loading = "goal"
-	ob := m.obStep == 2
-	if ob {
-		m.obStep = 0
-		m.prefs.Onboarded = true
-		_ = m.prefs.Save()
+	if m.obStep == 2 {
+		m.finishOnboarding()
 	}
 	return m, func() tea.Msg {
 		if _, err := cli.Goal(app, &g); err != nil {

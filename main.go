@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"reword-tui/pkg/ui"
@@ -27,8 +28,7 @@ func main() {
 		os.Exit(1)
 	}
 	home, _ := os.UserHomeDir()
-	data := cmp.Or(*dataDir, filepath.Join(home, ".local", "share", "reword"))
-	qp := cmp.Or(*queuePath, filepath.Join(data, "queue.jsonl"))
+	qp := cmp.Or(*queuePath, defaultQueuePath(*dataDir, home))
 	cfg := ui.Config{
 		Rwcore:     bin,
 		IcloudRoot: *icloudRoot,
@@ -42,6 +42,28 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func defaultQueuePath(dataDir, home string) string {
+	if dataDir != "" {
+		return filepath.Join(dataDir, "queue.jsonl")
+	}
+	legacy := filepath.Join(home, ".local", "share", "reword", "queue.jsonl")
+	dir := filepath.Join(home, ".local", "share", "reword")
+	if runtime.GOOS == "darwin" {
+		dir = filepath.Join(home, "Library", "Application Support", "reword")
+	}
+	next := filepath.Join(dir, "queue.jsonl")
+	if next == legacy {
+		return next
+	}
+	// Don't strand pending intents queued at the old location.
+	if _, err := os.Stat(next); os.IsNotExist(err) {
+		if _, err := os.Stat(legacy); err == nil {
+			return legacy
+		}
+	}
+	return next
 }
 
 func findRwcore(override string) (string, error) {

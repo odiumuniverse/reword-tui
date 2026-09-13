@@ -151,6 +151,18 @@ pub fn categories(list: &[Category], format: Format) -> Result<()> {
     }
     Ok(())
 }
+pub fn category_stats(list: &[crate::model::CategoryStat], format: Format) -> Result<()> {
+    match format {
+        Format::Json => println!("{}", serde_json::to_string_pretty(list)?),
+        Format::Table => {
+            println!("{:<16} {:>6} {:>7}", "CATEGORY", "TOTAL", "STARTED");
+            for s in list {
+                println!("{:<16} {:>6} {:>7}", s.category, s.total, s.started);
+            }
+        }
+    }
+    Ok(())
+}
 pub fn today(t: &crate::model::TodayStats, format: Format) -> Result<()> {
     match format {
         Format::Json => println!("{}", serde_json::to_string_pretty(t)?),

@@ -125,3 +125,49 @@ func (s *Store) Clear() error {
 	}
 	return nil
 }
+
+// Consume drops the first n applied intents, keeping intents appended
+// while the write was in flight. Unparseable lines are preserved as-is.
+func (s *Store) Consume(n int) error {
+	if n <= 0 {
+		return nil
+	}
+	data, err := os.ReadFile(s.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			s.Items = nil
+			return nil
+		}
+		return err
+	}
+	var keep []byte
+	skipped := 0
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var it Intent
+		if skipped < n && json.Unmarshal(line, &it) == nil && it.Op != "" {
+			skipped++
+			continue
+		}
+		keep = append(keep, line...)
+		keep = append(keep, '\n')
+	}
+	if len(keep) == 0 {
+		s.Items = nil
+		if err := os.Remove(s.Path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	if err := os.WriteFile(s.Path, keep, 0o644); err != nil {
+		return err
+	}
+	if n >= len(s.Items) {
+		s.Items = nil
+	} else {
+		s.Items = append([]Intent{}, s.Items[n:]...)
+	}
+	return nil
+}

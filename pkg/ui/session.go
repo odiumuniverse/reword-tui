@@ -62,6 +62,15 @@ type session struct {
 	input   string
 }
 
+// poolWord resolves a word from the already-loaded session pool,
+// avoiding a backend round-trip per card.
+func (m *Model) poolWord(text string) (rwcore.Word, bool) {
+	if i, ok := m.poolIdx[text]; ok && i >= 0 && i < len(m.pool) {
+		return m.pool[i], true
+	}
+	return rwcore.Word{}, false
+}
+
 func pickNative(w rwcore.Word, native string) string {
 	for _, k := range []string{native, "RUS", "ENG"} {
 		if k == "" {
@@ -241,9 +250,13 @@ func (m *Model) nextCard() *card {
 }
 
 func (m *Model) reviewCard(word string, mode int64) *card {
-	w, err := m.cli.Show(m.appID, word)
-	if err != nil {
-		return &card{kind: cR1, word: word, prompt: word, native: "(gone — skipped)", done: true, wasOk: true}
+	w, ok := m.poolWord(word)
+	if !ok {
+		var err error
+		w, err = m.cli.Show(m.appID, word)
+		if err != nil {
+			return &card{kind: cR1, word: word, prompt: word, native: "(gone — skipped)", done: true, wasOk: true}
+		}
 	}
 	nat := pickNative(w, m.nativeLang())
 	tr := ""

@@ -89,19 +89,24 @@ fn col_index(conn: &Connection) -> Result<HashMap<String, usize>> {
     rows.map(|r| r.context("decode PRAGMA row"))
         .collect::<Result<HashMap<_, _>>>()
 }
+fn col_of(idx: &HashMap<String, usize>, name: &str) -> rusqlite::Result<usize> {
+    idx.get(name)
+        .copied()
+        .ok_or_else(|| rusqlite::Error::InvalidColumnName(name.to_string()))
+}
 fn mode_state(
     row: &Row,
     idx: &HashMap<String, usize>,
     suffix: &str,
 ) -> rusqlite::Result<ModeState> {
-    let col = |base: &str| idx[&format!("{base}_{suffix}")];
+    let col = |base: &str| col_of(idx, &format!("{base}_{suffix}"));
     Ok(ModeState {
-        level: row.get(col("Q"))?,
-        step: row.get(col("S"))?,
-        easiness: row.get(col("E"))?,
-        fails: row.get(col("F"))?,
-        last_review_ts: row.get(col("T"))?,
-        interval_secs: row.get(col("I"))?,
+        level: row.get(col("Q")?)?,
+        step: row.get(col("S")?)?,
+        easiness: row.get(col("E")?)?,
+        fails: row.get(col("F")?)?,
+        last_review_ts: row.get(col("T")?)?,
+        interval_secs: row.get(col("I")?)?,
     })
 }
 fn word_from_row(
@@ -109,9 +114,9 @@ fn word_from_row(
     langs: &[Lang],
     idx: &HashMap<String, usize>,
 ) -> rusqlite::Result<Word> {
-    let id: i64 = row.get(idx["ID"])?;
-    let text: String = row.get(idx["WORD"])?;
-    let transcription: Option<String> = row.get(idx["TRANSCRIPTION"])?;
+    let id: i64 = row.get(col_of(idx, "ID")?)?;
+    let text: String = row.get(col_of(idx, "WORD")?)?;
+    let transcription: Option<String> = row.get(col_of(idx, "TRANSCRIPTION")?)?;
     let pos: Option<i64> = idx.get("POS").and_then(|i| row.get(*i).ok()).flatten();
     let mut translations = std::collections::BTreeMap::new();
     let mut examples = std::collections::BTreeMap::new();
@@ -279,6 +284,23 @@ pub fn categories(conn: &Connection) -> Result<Vec<Category>> {
     rows.map(|r| r.context("decode CATEGORY row"))
         .collect::<Result<Vec<_>>>()
 }
+pub fn category_stats(conn: &Connection) -> Result<Vec<crate::model::CategoryStat>> {
+    let mut st = conn.prepare(
+        "SELECT wc.CATEGORY_ID, COUNT(*),
+                SUM(CASE WHEN MAX(w.Q_REC, w.Q_REP) > 0 THEN 1 ELSE 0 END)
+         FROM WORD w JOIN WORD_CATEGORY wc ON wc.WORD_ID = w.ID
+         GROUP BY wc.CATEGORY_ID ORDER BY wc.CATEGORY_ID",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(crate::model::CategoryStat {
+            category: r.get(0)?,
+            total: r.get(1)?,
+            started: r.get(2)?,
+        })
+    })?;
+    rows.map(|r| r.context("decode category stat row"))
+        .collect::<Result<Vec<_>>>()
+}
 pub fn set_selected(conn: &Connection, category: &str, selected: bool) -> Result<String> {
     let id: Option<String> = conn
         .query_row(
@@ -297,20 +319,15 @@ pub fn set_selected(conn: &Connection, category: &str, selected: bool) -> Result
     Ok(id)
 }
 pub fn today(conn: &Connection, local_today: &str) -> Result<crate::model::TodayStats> {
-    let learned: i64 = conn
+    let (learned, reviewed): (i64, i64) = conn
         .query_row(
-            "SELECT COUNT(DISTINCT WORD_ID) FROM LOG WHERE QUEUE = 1 AND LOCAL_DATE = ?",
+            "SELECT COUNT(DISTINCT CASE WHEN QUEUE = 1 THEN WORD_ID END),
+                    COUNT(DISTINCT CASE WHEN QUEUE = 2 THEN WORD_ID END)
+             FROM LOG WHERE LOCAL_DATE = ? AND QUEUE IN (1, 2)",
             [local_today],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .context("count learned")?;
-    let reviewed: i64 = conn
-        .query_row(
-            "SELECT COUNT(DISTINCT WORD_ID) FROM LOG WHERE QUEUE = 2 AND LOCAL_DATE = ?",
-            [local_today],
-            |r| r.get(0),
-        )
-        .context("count reviewed")?;
+        .context("count learned/reviewed")?;
     let learning_now: i64 = conn
         .query_row("SELECT COUNT(*) FROM WORD WHERE Q_REC = 1", [], |r| {
             r.get(0)
@@ -491,21 +508,18 @@ pub fn import_rows(
         .optional()
         .context("lookup category")?;
     let cid = cid.with_context(|| format!("no category '{category}'"))?;
+    let mut existing: std::collections::HashSet<String> = conn
+        .prepare("SELECT WORD FROM WORD")?
+        .query_map([], |r| r.get::<_, Option<String>>(0))?
+        .filter_map(|r| r.transpose())
+        .collect::<rusqlite::Result<_>>()
+        .context("dup check")?;
     let mut added = 0usize;
     let mut skipped = 0usize;
     for row in rows {
         let word = row.word.trim();
         let tr = row.tr.trim();
-        if word.is_empty() || tr.is_empty() {
-            skipped += 1;
-            continue;
-        }
-        let taken: i64 = conn
-            .query_row("SELECT COUNT(*) FROM WORD WHERE WORD = ?", [word], |r| {
-                r.get(0)
-            })
-            .context("dup check")?;
-        if taken > 0 {
+        if word.is_empty() || tr.is_empty() || existing.contains(word) {
             skipped += 1;
             continue;
         }
@@ -537,6 +551,7 @@ pub fn import_rows(
             rusqlite::params![wc_id, word_id, cid],
         )
         .context("link WORD_CATEGORY")?;
+        existing.insert(word.to_string());
         added += 1;
     }
     Ok((added, skipped))
@@ -794,17 +809,36 @@ pub(crate) fn retry<T>(mut f: impl FnMut() -> Result<T>, what: &str) -> Result<T
     Err(last.unwrap()).with_context(|| format!("{what} failed after retries"))
 }
 const LOCK_TTL_SECS: u64 = 900;
+const GLOBAL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) struct LockGuard {
     path: PathBuf,
 }
 impl LockGuard {
-    fn acquire_global(data_dir: &Path) -> Result<LockGuard> {
-        Self::acquire_path(&data_dir.join("locks").join("rwcore-global.lock"))
+    pub(crate) fn acquire_global(data_dir: &Path) -> Result<LockGuard> {
+        let path = data_dir.join("locks").join("rwcore-global.lock");
+        let deadline = std::time::Instant::now() + GLOBAL_LOCK_WAIT;
+        loop {
+            if let Some(g) = Self::try_acquire(&path)? {
+                return Ok(g);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Self::acquire_path(&path);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
     pub(crate) fn lock_for_app(data_dir: &Path, app_id: &str) -> Result<LockGuard> {
         Self::acquire_path(&data_dir.join("locks").join(format!("rwcore-{app_id}.lock")))
     }
     fn acquire_path(path: &Path) -> Result<LockGuard> {
+        Self::try_acquire(path)?.with_context(|| {
+            format!(
+                "another rwcore writer holds {} (stale locks expire after {LOCK_TTL_SECS}s)",
+                path.display()
+            )
+        })
+    }
+    fn try_acquire(path: &Path) -> Result<Option<LockGuard>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
@@ -813,19 +847,16 @@ impl LockGuard {
             Ok(mut f) => {
                 use std::io::Write as _;
                 let _ = writeln!(f, "{} {}", std::process::id(), epoch_secs());
-                Ok(LockGuard {
+                Ok(Some(LockGuard {
                     path: path.to_path_buf(),
-                })
+                }))
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if lock_stale(path)? {
                     std::fs::remove_file(path).ok();
-                    return Self::acquire_path(path);
+                    return Self::try_acquire(path);
                 }
-                anyhow::bail!(
-                    "another rwcore writer holds {} (stale locks expire after {LOCK_TTL_SECS}s)",
-                    path.display()
-                )
+                Ok(None)
             }
             Err(e) => Err(e).with_context(|| format!("cannot create lock {}", path.display())),
         }
@@ -952,6 +983,14 @@ pub fn modify(
             }
         }
     };
+    let _global = LockGuard::acquire_global(data_dir)?;
+    if crate::sync::fingerprint(app)? != fp_pre {
+        std::fs::remove_file(&tmp).ok();
+        anyhow::bail!(
+            "DIRTY_SOURCE app={} changed while staging the write (writes blocked); run `pull`",
+            app.id
+        );
+    }
     let wb: Result<()> = (|| {
         let mut src = std::fs::File::open(&tmp).context("cannot reopen staged copy")?;
         let mut live = retry(
@@ -984,7 +1023,6 @@ pub fn modify(
     wb?;
     check_live(&app.backup_path).context("live copy unhealthy after write")?;
     let fp_post = crate::sync::fingerprint(app)?;
-    let _global = LockGuard::acquire_global(data_dir)?;
     if let Some(ts) = record_ts
         && !ops.is_empty()
     {
@@ -1377,6 +1415,26 @@ mod tests {
         fixture_root("englishwords~esen", "reword_es.backup")
     }
     #[test]
+    fn category_stats_counts_started_per_category() {
+        let (_tmp, db) = fixture_db();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("UPDATE WORD SET Q_REC = 1 WHERE ID = 1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO WORD (ID, WORD, Q_REC, Q_REP) VALUES (3, 'el agua', 2, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO WORD_CATEGORY VALUES (3, 3, 'food')", [])
+            .unwrap();
+        let stats = category_stats(&conn).unwrap();
+        assert_eq!(stats.len(), 2);
+        let custom = stats.iter().find(|s| s.category == "custom").unwrap();
+        assert_eq!((custom.total, custom.started), (1, 1));
+        let food = stats.iter().find(|s| s.category == "food").unwrap();
+        assert_eq!((food.total, food.started), (2, 1));
+    }
+    #[test]
     fn discover_maps_ids() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -1513,6 +1571,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(custom.len(), 2);
+    }
+    #[test]
+    fn modify_refuses_to_clobber_concurrent_live_change() {
+        let (tmp, db) = fixture_db();
+        let app = discover::App {
+            id: "es".to_string(),
+            container: "iCloud~ru~poas~englishwords~esen".to_string(),
+            backup_path: db.clone(),
+            backup_name: "reword_es.backup".to_string(),
+        };
+        let cache = tmp.path().join("cache");
+        let data = tmp.path().join("data");
+        let err = modify(&app, &cache, &data, Some(1_700_000_000), |tx| {
+            add_word(tx, "ours", None, &[(Lang::Eng, "o".to_string())])?;
+            let live = Connection::open(&app.backup_path)?;
+            live.execute("INSERT INTO WORD (ID, WORD) VALUES (50, 'phone')", [])?;
+            Ok(vec![])
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("DIRTY_SOURCE"));
+        let conn = open_ro(&db).unwrap();
+        assert!(get_word(&conn, "phone").unwrap().is_some());
+        assert!(get_word(&conn, "ours").unwrap().is_none());
+        assert!(crate::oplog::tail(&data, 10).is_empty());
     }
     #[test]
     fn cross_null_stays_null_on_review() {

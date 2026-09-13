@@ -44,7 +44,13 @@ fn save_state(data_dir: &Path, st: &GateState) -> Result<()> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("cannot create {}", data_dir.display()))?;
     let tmp = state_path(data_dir).with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(st)?)
+    let body = serde_json::to_string_pretty(st)?;
+    std::fs::File::create(&tmp)
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()
+        })
         .with_context(|| format!("cannot write {}", tmp.display()))?;
     std::fs::rename(&tmp, state_path(data_dir))
         .with_context(|| format!("cannot adopt {}", state_path(data_dir).display()))?;
@@ -128,6 +134,7 @@ pub fn pull(data_dir: &Path, app: &App) -> Result<PathBuf> {
     )?;
     crate::store::check_file(&qfile).context("quarantined copy unhealthy")?;
     let fp = fingerprint(app)?;
+    let _global = crate::store::LockGuard::acquire_global(data_dir)?;
     adopt(data_dir, app, &fp)?;
     Ok(qfile)
 }

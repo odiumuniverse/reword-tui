@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +11,8 @@ import (
 	"reword-tui/pkg/queue"
 	"reword-tui/pkg/rwcore"
 )
+
+var errTest = errors.New("test error")
 
 func testModel(t *testing.T) Model {
 	t.Helper()
@@ -187,10 +190,36 @@ func TestOnboardingTriggers(t *testing.T) {
 	m := testModel(t)
 	m.appID = "es"
 	m.screen = sLearn
-	next, _ := m.onCats(catsMsg{cats: []rwcore.Category{{ID: "c", Selected: true}}})
+	m.today = &rwcore.Today{}
+	next, _ := m.onCats(catsMsg{cats: []rwcore.Category{{ID: "c"}}})
 	m = next.(Model)
 	if m.obStep != 1 || m.screen != sVocab {
 		t.Fatal("first run must enter category onboarding")
+	}
+}
+
+func TestOnboardingSkipsKnownData(t *testing.T) {
+	m := testModel(t)
+	m.appID = "es"
+	m.screen = sLearn
+	g := int64(10)
+	m.today = &rwcore.Today{Goal: &g}
+	next, _ := m.onCats(catsMsg{cats: []rwcore.Category{{ID: "c", Selected: true}}})
+	m = next.(Model)
+	if m.obStep != 0 || !m.prefs.Onboarded {
+		t.Fatal("existing selection and goal must skip onboarding silently")
+	}
+}
+
+func TestOnboardingAsksGoalOnly(t *testing.T) {
+	m := testModel(t)
+	m.appID = "es"
+	m.screen = sLearn
+	m.today = &rwcore.Today{}
+	next, _ := m.onCats(catsMsg{cats: []rwcore.Category{{ID: "c", Selected: true}}})
+	m = next.(Model)
+	if m.obStep != 2 || m.ov != oGoal {
+		t.Fatal("existing selection without goal must ask goal only")
 	}
 }
 
@@ -394,5 +423,120 @@ func TestQuitGuard(t *testing.T) {
 	m = press(t, m, "esc")
 	if m.ov != oNone {
 		t.Fatal("esc must close guard")
+	}
+}
+
+func TestEmptyStatesNoPanic(t *testing.T) {
+	m := testModel(t)
+	m.screen = sPicker
+	m.apps = nil
+	for _, k := range []string{"j", "l", "enter", " "} {
+		m = press(t, m, k)
+		_ = m.View()
+	}
+	if m.appIdx != 0 {
+		t.Fatalf("appIdx must stay 0 on empty picker, got %d", m.appIdx)
+	}
+	m.screen = sVocab
+	m.vocabMode = 0
+	m.cats = nil
+	for _, k := range []string{"j", "k", " ", "enter", "X", "R", "D"} {
+		m = press(t, m, k)
+		_ = m.View()
+	}
+	if m.vocabIdx != 0 {
+		t.Fatalf("vocabIdx must stay 0 on empty cats, got %d", m.vocabIdx)
+	}
+	m.vocabMode = 1
+	m.vocabWords = nil
+	for _, k := range []string{"j", "k", "enter"} {
+		m = press(t, m, k)
+		_ = m.View()
+	}
+	if m.menuIdx != 0 {
+		t.Fatalf("menuIdx must stay 0 on empty word list, got %d", m.menuIdx)
+	}
+}
+
+func TestLearnEnterClampsMode(t *testing.T) {
+	m := testModel(t)
+	m.screen = sLearn
+	m.menuIdx = 57
+	m = press(t, m, "enter")
+	if m.screen != sSession {
+		t.Fatal("enter must start session")
+	}
+	if m.sess.mode < 0 || m.sess.mode > 2 {
+		t.Fatalf("session mode must be 0-2, got %d", m.sess.mode)
+	}
+}
+
+func TestOnWriteConsumesAppliedPrefix(t *testing.T) {
+	mk := func(t *testing.T) Model {
+		m := testModel(t)
+		for _, w := range []string{"a", "b", "c"} {
+			m.enqueue(queue.Intent{Op: "grade", Word: w, Mode: "rec", Result: "ok"})
+		}
+		return m
+	}
+	m := mk(t)
+	next, _ := m.onWrite(writeMsg{written: 1, consumed: 1, err: errTest})
+	m = next.(Model)
+	if len(m.q.Items) != 2 || m.q.Items[0].Word != "b" {
+		t.Fatalf("partial error must keep unapplied tail: %+v", m.q.Items)
+	}
+	m = mk(t)
+	next, _ = m.onWrite(writeMsg{written: 1, consumed: 1, dirty: true})
+	m = next.(Model)
+	if len(m.q.Items) != 2 || m.screen != sSync {
+		t.Fatalf("dirty must keep unapplied tail and go sync: %+v", m.q.Items)
+	}
+	m = mk(t)
+	next, _ = m.onWrite(writeMsg{written: 3, consumed: 3})
+	m = next.(Model)
+	if len(m.q.Items) != 0 {
+		t.Fatalf("success must drain queue: %+v", m.q.Items)
+	}
+}
+
+func TestPullChainsSyncReload(t *testing.T) {
+	m := testModel(t)
+	m.screen = sSync
+	next, cmd := m.Update(replayMsg{out: "pulled"})
+	m = next.(Model)
+	if cmd == nil || m.loading != "sync" || m.notice != "pulled" {
+		t.Fatal("pull must chain a sync reload")
+	}
+	next, cmd = m.Update(replayMsg{out: "plan"})
+	m = next.(Model)
+	if cmd != nil {
+		t.Fatal("plain replay must not chain commands")
+	}
+}
+
+func TestCatStatsFillsPct(t *testing.T) {
+	m := testModel(t)
+	next, _ := m.onCatStats(catStatsMsg{stats: []rwcore.CatStat{
+		{Category: "food", Total: 4, Started: 1},
+		{Category: "empty", Total: 0, Started: 0},
+	}})
+	m = next.(Model)
+	if m.catPct["food"] != "25%" || m.catPct["empty"] != "—" {
+		t.Fatalf("bad pct: %v", m.catPct)
+	}
+}
+
+func TestReviewCardUsesPool(t *testing.T) {
+	m := testModel(t)
+	next, _ := m.onWords(wordsMsg{key: "pool", words: []rwcore.Word{
+		{ID: 1, Text: "el pan", Translations: map[string]string{"RUS": "хлеб"}},
+	}})
+	m = next.(Model)
+	c := m.reviewCard("el pan", 1)
+	if c.done || c.native != "хлеб" {
+		t.Fatalf("card must come from pool without backend: %+v", c)
+	}
+	if _, ok := m.poolWord("missing"); ok {
+		t.Fatal("unknown word must miss pool index")
 	}
 }

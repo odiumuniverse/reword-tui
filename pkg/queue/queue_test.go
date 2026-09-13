@@ -3,6 +3,7 @@ package queue
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -54,5 +55,46 @@ func TestCorruptLinesSkipped(t *testing.T) {
 	os.WriteFile(path, []byte("{\"op\":\"grade\",\"word\":\"x\"}\nnope\n{\"op\":\"\"}\n"), 0o644)
 	if n := len(Load(path).Items); n != 1 {
 		t.Fatalf("want 1, got %d", n)
+	}
+}
+
+func TestConsumeKeepsTailAndGarbage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "q.jsonl")
+	s := Load(path)
+	for _, w := range []string{"a", "b", "c"} {
+		if err := s.Append(Intent{Op: "grade", Word: w}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// intent appended while the write was in flight
+	if err := s.Append(Intent{Op: "triage", Word: "d", Decision: "known"}); err != nil {
+		t.Fatal(err)
+	}
+	// garbage line between applied and pending
+	f, _ := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	f.WriteString("nope\n")
+	f.Close()
+	if err := s.Consume(3); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Items) != 1 || s.Items[0].Word != "d" {
+		t.Fatalf("tail lost: %+v", s.Items)
+	}
+	r := Load(path)
+	if len(r.Items) != 1 || r.Items[0].Word != "d" {
+		t.Fatalf("file tail lost: %+v", r.Items)
+	}
+	raw, _ := os.ReadFile(path)
+	if !strings.Contains(string(raw), "nope") {
+		t.Fatal("garbage line must survive consume")
+	}
+	if err := s.Consume(5); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Items) != 0 {
+		t.Fatal("items must be empty after full consume")
+	}
+	if len(Load(path).Items) != 0 {
+		t.Fatal("no valid intents may remain after full consume")
 	}
 }

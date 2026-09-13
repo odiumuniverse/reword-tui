@@ -83,6 +83,7 @@ type Model struct {
 	menuIdx        int
 	sess           session
 	pool           []rwcore.Word
+	poolIdx        map[string]int
 	addF           []string
 	addIdx         int
 	addEnroll      bool
@@ -125,6 +126,7 @@ func New(cfg Config) Model {
 		appMeta: map[string]appMeta{},
 		acted:   map[string]bool{},
 		q:       queue.Load(cfg.QueuePath),
+		poolIdx: map[string]int{},
 		width:   80,
 		height:  24,
 	}
@@ -149,6 +151,10 @@ type catsMsg struct {
 	cats []rwcore.Category
 	err  error
 }
+type catStatsMsg struct {
+	stats []rwcore.CatStat
+	err   error
+}
 type wordsMsg struct {
 	key   string
 	words []rwcore.Word
@@ -172,6 +178,7 @@ type replayMsg struct {
 type writeMsg struct {
 	written  int
 	orphaned int
+	consumed int
 	err      error
 	dirty    bool
 }
@@ -240,6 +247,14 @@ func (m Model) loadCats() tea.Cmd {
 	}
 }
 
+func (m Model) loadCatStats() tea.Cmd {
+	cli, app := m.cli, m.appID
+	return func() tea.Msg {
+		stats, err := cli.CatStats(app)
+		return catStatsMsg{stats, err}
+	}
+}
+
 func (m Model) loadWords(key, search, category string, limit int) tea.Cmd {
 	cli, app := m.cli, m.appID
 	return func() tea.Msg {
@@ -302,10 +317,11 @@ func (m Model) doWrite() tea.Cmd {
 				r, err = cli.Apply(app, it.ApplyBody())
 			}
 			if err != nil {
+				n := written + orphaned
 				if rwcore.IsDirty(err) {
-					return writeMsg{written: written, orphaned: orphaned, dirty: true, err: err}
+					return writeMsg{written: written, orphaned: orphaned, consumed: n, dirty: true, err: err}
 				}
-				return writeMsg{written: written, orphaned: orphaned, err: err}
+				return writeMsg{written: written, orphaned: orphaned, consumed: n, err: err}
 			}
 			if r.Detail.Orphaned {
 				orphaned++
@@ -313,7 +329,7 @@ func (m Model) doWrite() tea.Cmd {
 				written++
 			}
 		}
-		return writeMsg{written: written, orphaned: orphaned}
+		return writeMsg{written: written, orphaned: orphaned, consumed: len(items)}
 	}
 }
 
