@@ -286,8 +286,8 @@ pub fn categories(conn: &Connection) -> Result<Vec<Category>> {
 }
 pub fn category_stats(conn: &Connection) -> Result<Vec<crate::model::CategoryStat>> {
     let mut st = conn.prepare(
-        "SELECT wc.CATEGORY_ID, COUNT(*),
-                SUM(CASE WHEN MAX(w.Q_REC, w.Q_REP) > 0 THEN 1 ELSE 0 END)
+        "SELECT wc.CATEGORY_ID, COUNT(DISTINCT w.ID),
+                COUNT(DISTINCT CASE WHEN MAX(w.Q_REC, w.Q_REP) > 0 THEN w.ID END)
          FROM WORD w JOIN WORD_CATEGORY wc ON wc.WORD_ID = w.ID
          GROUP BY wc.CATEGORY_ID ORDER BY wc.CATEGORY_ID",
     )?;

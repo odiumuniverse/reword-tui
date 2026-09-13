@@ -412,6 +412,9 @@ func (m Model) viewSession() string {
 		total = len(m.sess.learn)
 	}
 	done := m.sess.ok + m.sess.fail
+	// One word can yield several grades (triage + quiz), so done may
+	// overshoot total: clamp for display, never panic on Repeat.
+	done = min(done, total)
 	barW := 20
 	filled := 0
 	if total > 0 {
@@ -570,13 +573,13 @@ func (m Model) viewVocab(cw, h int) string {
 		rows := make([]string, 0, len(m.vocabWords))
 		for i, w := range m.vocabWords {
 			line := fmt.Sprintf("%s — %s · S%d/S%d", w.Text, pickNative(w, m.nativeLang()), w.Recognition.Step, w.Reproduction.Step)
-			if i == m.menuIdx {
+			if i == m.wlIdx {
 				rows = append(rows, sel.Render("▸ "+line))
 			} else {
 				rows = append(rows, "  "+line)
 			}
 		}
-		b.WriteString(windowed(rows, m.menuIdx, h-2))
+		b.WriteString(windowed(rows, m.wlIdx, h-2))
 		return b.String()
 	}
 	if m.obStep == 1 {

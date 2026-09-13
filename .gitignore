@@ -6,8 +6,9 @@ target/
 Cargo.lock.offline
 
 # Go TUI build output (rwcore is bundled privately next to the binary)
-reword-tui
-rwcore
+# Anchored: must not ignore pkg/rwcore/ sources or cmd/reword-tui/ files.
+/reword-tui
+/rwcore
 
 # Never commit real backups or scratch copies
 *.backup

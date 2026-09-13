@@ -71,6 +71,7 @@ type Model struct {
 	catPct         map[string]string
 	vocabIdx       int
 	vocabMode      int
+	wlIdx          int
 	vocabWords     []rwcore.Word
 	wordListTitle  string
 	word           *rwcore.Word

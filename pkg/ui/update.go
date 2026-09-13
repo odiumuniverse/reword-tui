@@ -61,6 +61,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = ""
 		if msg.err == nil && msg.out == "pulled" {
 			m.notice = "pulled"
+			m.err = ""
 			m.loading = "sync"
 			return m, m.loadSync()
 		}
@@ -210,7 +211,7 @@ func (m *Model) maybeOnboard() {
 	_ = m.prefs.Save()
 }
 
-func (m Model) finishOnboarding() {
+func (m *Model) finishOnboarding() {
 	m.obStep = 0
 	m.prefs.Onboarded = true
 	_ = m.prefs.Save()
@@ -236,13 +237,10 @@ func (m Model) onWords(msg wordsMsg) (tea.Model, tea.Cmd) {
 		m.advance()
 		return m, nil
 	}
-	if strings.HasPrefix(msg.key, "pct:") {
-		if m.menuIdx >= len(m.vocabWords) {
-			m.menuIdx = max(len(m.vocabWords)-1, 0)
-		}
-		return m, nil
-	}
 	m.vocabWords = msg.words
+	if m.wlIdx >= len(m.vocabWords) {
+		m.wlIdx = max(len(m.vocabWords)-1, 0)
+	}
 	m.detail[msg.key] = msg.words
 	return m, nil
 }
@@ -278,7 +276,10 @@ func (m Model) onWrite(msg writeMsg) (tea.Model, tea.Cmd) {
 	m.loading = ""
 	// Drop exactly the applied prefix: intents appended while the
 	// async write was in flight stay queued.
-	_ = m.q.Consume(msg.consumed)
+	if err := m.q.Consume(msg.consumed); err != nil {
+		m.err = "queue not trimmed: " + err.Error() + " (will retry)"
+		m.quitAfterWrite = false
+	}
 	if msg.dirty {
 		m.err = "DIRTY_SOURCE: pull first"
 		m.screen = sSync
@@ -741,15 +742,15 @@ func (m Model) vocabKey(k string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "j", "down":
 			if len(m.vocabWords) > 0 {
-				m.menuIdx = min(m.menuIdx+1, len(m.vocabWords)-1)
+				m.wlIdx = min(m.wlIdx+1, len(m.vocabWords)-1)
 			}
 		case "k", "up":
 			if len(m.vocabWords) > 0 {
-				m.menuIdx = max(m.menuIdx-1, 0)
+				m.wlIdx = max(m.wlIdx-1, 0)
 			}
 		case "enter":
-			if m.menuIdx >= 0 && m.menuIdx < len(m.vocabWords) {
-				return m, m.loadWord(m.vocabWords[m.menuIdx].Text)
+			if m.wlIdx >= 0 && m.wlIdx < len(m.vocabWords) {
+				return m, m.loadWord(m.vocabWords[m.wlIdx].Text)
 			}
 		}
 		return m, nil
@@ -785,7 +786,7 @@ func (m Model) vocabKey(k string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.vocabIdx < len(m.cats) {
 			c := m.cats[m.vocabIdx]
 			m.vocabMode = 1
-			m.menuIdx = 0
+			m.wlIdx = 0
 			m.wordListTitle = c.DisplayName()
 			m.loading = "words"
 			return m, m.loadWords("cat:"+c.ID, "", c.ID, 200)
@@ -849,7 +850,7 @@ func (m Model) searchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		m.searchOn = false
 		m.vocabMode = 1
-		m.menuIdx = 0
+		m.wlIdx = 0
 		m.wordListTitle = "search: " + m.search
 		m.loading = "words"
 		return m, m.loadWords("search:"+m.search, m.search, "", 200)

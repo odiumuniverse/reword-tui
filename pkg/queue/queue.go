@@ -161,7 +161,33 @@ func (s *Store) Consume(n int) error {
 		}
 		return nil
 	}
-	if err := os.WriteFile(s.Path, keep, 0o644); err != nil {
+	// Atomic replace: crash between truncate and write must not eat the queue.
+	if dir := filepath.Dir(s.Path); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(s.Path), ".queue-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(keep); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, s.Path); err != nil {
+		os.Remove(tmpName)
 		return err
 	}
 	if n >= len(s.Items) {

@@ -453,8 +453,28 @@ func TestEmptyStatesNoPanic(t *testing.T) {
 		m = press(t, m, k)
 		_ = m.View()
 	}
-	if m.menuIdx != 0 {
-		t.Fatalf("menuIdx must stay 0 on empty word list, got %d", m.menuIdx)
+	if m.wlIdx != 0 {
+		t.Fatalf("wlIdx must stay 0 on empty word list, got %d", m.wlIdx)
+	}
+}
+
+func TestWordListCursorIsolated(t *testing.T) {
+	m := testModel(t)
+	m.screen = sVocab
+	m.vocabMode = 1
+	m.vocabWords = []rwcore.Word{{Text: "a"}, {Text: "b"}}
+	m = press(t, m, "j")
+	if m.wlIdx != 1 || m.menuIdx != 0 {
+		t.Fatalf("word-list cursor must not touch learn cursor: wl=%d menu=%d", m.wlIdx, m.menuIdx)
+	}
+	m = press(t, m, "esc")
+	m = press(t, m, "esc")
+	if m.screen != sLearn || m.menuIdx != 0 {
+		t.Fatal("esc must return to learn with cursor 0")
+	}
+	m = press(t, m, "enter")
+	if m.sess.mode != 0 {
+		t.Fatalf("session must start in mode 0, got %d", m.sess.mode)
 	}
 }
 
@@ -538,5 +558,90 @@ func TestReviewCardUsesPool(t *testing.T) {
 	}
 	if _, ok := m.poolWord("missing"); ok {
 		t.Fatal("unknown word must miss pool index")
+	}
+}
+
+func TestOnboardingPersists(t *testing.T) {
+	m := testModel(t)
+	g := int64(10)
+	m.today = &rwcore.Today{Goal: &g}
+	m.cats = []rwcore.Category{{ID: "food", Selected: true, Words: 5}}
+	m.catSel["food"] = true
+	m.screen = sVocab
+	m.vocabMode = 0
+	m.obStep = 1
+
+	m = press(t, m, "enter")
+	if m.obStep != 0 {
+		t.Errorf("obStep=%d after finishing onboarding, want 0", m.obStep)
+	}
+	if !m.prefs.Onboarded {
+		t.Error("in-memory prefs.Onboarded=false after finishing onboarding")
+	}
+
+	m.screen = sVocab
+	m = press(t, m, "enter")
+	if m.vocabMode != 1 {
+		t.Error("enter on category did not open word list: onboarding branch fired again")
+	}
+
+	m.screen = sSettings
+	m.setIdx = 0
+	m = press(t, m, "enter")
+	if !LoadPrefs().Onboarded {
+		t.Error("settings toggle overwrote onboarded=true on disk with false")
+	}
+}
+
+func proofWord(id int64, text, rus string, lvl int64) rwcore.Word {
+	return rwcore.Word{
+		ID:           id,
+		Text:         text,
+		Translations: map[string]string{"RUS": rus},
+		Recognition:  rwcore.ModeState{Level: lvl},
+		Reproduction: rwcore.ModeState{Level: lvl},
+	}
+}
+
+func TestLearnProgressBarNoPanic(t *testing.T) {
+	m := testModel(t)
+	pool := []rwcore.Word{
+		proofWord(1, "uno", "один", 1),
+		proofWord(2, "dos", "два", 0),
+		proofWord(3, "tres", "три", 0),
+		proofWord(4, "cuatro", "четыре", 0),
+	}
+	m.pool = pool
+	m.poolIdx = map[string]int{}
+	for i, w := range pool {
+		m.poolIdx[w.Text] = i
+	}
+	m.screen = sSession
+	m.sess = session{mode: 1, learn: []rwcore.Word{pool[0]}, lpos: 1, started: true}
+	m.sess.cur = m.learnCard(pool[0])
+	if m.sess.cur.kind != cL1b {
+		t.Fatalf("setup: want cL1b card, got %v", m.sess.cur.kind)
+	}
+
+	m = press(t, m, "l")
+	m = press(t, m, "1")
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("View panicked with done > total: %v", r)
+		}
+	}()
+	_ = m.View()
+}
+
+func TestPullClearsDirtyError(t *testing.T) {
+	m := testModel(t)
+	m.err = "DIRTY_SOURCE: pull first"
+	next, _ := m.Update(replayMsg{out: "pulled"})
+	m = next.(Model)
+	next, _ = m.Update(syncMsg{rows: []rwcore.StatusRow{{App: "es", State: "clean"}}})
+	m = next.(Model)
+	if m.err != "" {
+		t.Errorf("stale error still shown after successful pull + clean sync: %q", m.err)
 	}
 }
