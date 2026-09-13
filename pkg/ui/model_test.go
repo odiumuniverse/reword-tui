@@ -2,6 +2,7 @@ package ui
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"regexp"
@@ -856,5 +857,148 @@ func TestLayoutFitsEverywhere(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func measureView(out string) (lines, width int) {
+	ls := strings.Split(out, "\n")
+	for _, l := range ls {
+		width = max(width, lipgloss.Width(l))
+	}
+	return len(ls), width
+}
+
+var viewportScreens = []struct {
+	name   string
+	screen screen
+	mode   int
+	ov     overlay
+	typing bool
+}{
+	{"picker", sPicker, 0, oNone, false},
+	{"learn", sLearn, 0, oNone, false},
+	{"session", sSession, 0, oNone, false},
+	{"session-typing", sSession, 0, oNone, true},
+	{"vocab-cats", sVocab, 0, oNone, false},
+	{"vocab-words", sVocab, 1, oNone, false},
+	{"word", sWord, 0, oNone, false},
+	{"stats", sStats, 0, oNone, false},
+	{"sync", sSync, 0, oNone, false},
+	{"menu", sMenu, 0, oNone, false},
+	{"settings", sSettings, 0, oNone, false},
+	{"import", sImport, 0, oNone, false},
+	{"add", sAdd, 0, oNone, false},
+	{"addcat", sAddCat, 0, oNone, false},
+	{"ov-quit", sLearn, 0, oQuit, false},
+	{"ov-confirm", sVocab, 0, oConfirm, false},
+	{"ov-help", sSession, 0, oHelp, false},
+	{"ov-goal", sLearn, 0, oGoal, false},
+	{"ov-about", sLearn, 0, oAbout, false},
+	{"ov-orphans", sSync, 0, oOrphans, false},
+}
+
+func TestLayoutFitsViewport(t *testing.T) {
+	var fails []string
+	for _, w := range []int{30, 40, 60, 80} {
+		for _, h := range []int{8, 12, 16, 24} {
+			for _, sc := range viewportScreens {
+				m := fitModel(t)
+				m.width, m.height = w, h
+				m.screen, m.vocabMode, m.ov = sc.screen, sc.mode, sc.ov
+				if sc.typing && m.sess.cur != nil {
+					m.sess.typing = true
+					m.sess.input = "supercalifragilisticexpialidocious input typing"
+				}
+				n, mw := measureView(m.View())
+				if n > h || mw > w {
+					fails = append(fails, fmt.Sprintf("%-14s %3dx%-2d lines=%d width=%d", sc.name, w, h, n, mw))
+				}
+			}
+		}
+	}
+	for _, f := range fails {
+		t.Log(f)
+	}
+	if len(fails) > 0 {
+		t.Errorf("%d screen/size combos overflow the viewport", len(fails))
+	}
+}
+
+func TestCardKindsFitViewport(t *testing.T) {
+	long := longWord()
+	choices := []string{
+		"очень длинный вариант ответа номер один для узкого экрана",
+		"второй очень длинный вариант ответа",
+		"третий",
+		"четвёртый вариант ответа тоже довольно длинный",
+	}
+	nat := "очень длинный перевод который точно не влезет в узкую колонку терминала"
+	ex := "A very long example sentence that keeps going — Очень длинный пример который всё продолжается"
+	cards := []struct {
+		name string
+		c    card
+	}{
+		{"R1-reveal", card{kind: cR1, word: long.Text, prompt: long.Text, native: nat, tr: "[tr]", example: ex, reveal: true, mode: "rec"}},
+		{"R1-done", card{kind: cR1, word: long.Text, prompt: long.Text, native: nat, example: ex, reveal: true, done: true, mode: "rec"}},
+		{"R2", card{kind: cR2, word: long.Text, prompt: nat, choices: choices, answer: 1, mode: "rep"}},
+		{"R2-done-wrong", card{kind: cR2, word: long.Text, prompt: nat, choices: choices, answer: 1, done: true, mode: "rep"}},
+		{"R3-typing", card{kind: cR3, word: long.Text, prompt: nat, expected: []string{long.Text}, attempts: 3, mode: "rep"}},
+		{"L1", card{kind: cL1, word: long.Text, prompt: long.Text, native: nat, example: ex}},
+		{"L1b", card{kind: cL1b, word: long.Text, prompt: long.Text, native: nat, example: ex}},
+		{"L2-done-wrong", card{kind: cL2, word: long.Text, prompt: long.Text, choices: choices, answer: 0, done: true}},
+	}
+	var fails []string
+	for _, zen := range []bool{false, true} {
+		for _, w := range []int{30, 40, 60, 80} {
+			for _, h := range []int{12, 16, 24} {
+				for _, cc := range cards {
+					m := fitModel(t)
+					m.width, m.height = w, h
+					m.screen, m.ov = sSession, oNone
+					c := cc.c
+					m.sess.cur = &c
+					m.sess.zen = zen
+					if c.kind == cR3 {
+						m.sess.typing = true
+						m.sess.input = "supercalifragilisticexpialidocious typed"
+					}
+					n, mw := measureView(m.View())
+					if n > h || mw > w {
+						fails = append(fails, fmt.Sprintf("zen=%-5v %-14s %3dx%-2d lines=%d width=%d", zen, cc.name, w, h, n, mw))
+					}
+				}
+			}
+		}
+	}
+	for _, f := range fails {
+		t.Log(f)
+	}
+	if len(fails) > 0 {
+		t.Errorf("%d card/size combos overflow the viewport", len(fails))
+	}
+}
+
+func TestAsciiNoEscapes(t *testing.T) {
+	withProfile(termenv.Ascii, func() {
+		for _, sc := range viewportScreens {
+			m := fitModel(t)
+			m.width, m.height = 80, 24
+			m.screen, m.vocabMode, m.ov = sc.screen, sc.mode, sc.ov
+			if out := m.View(); strings.Contains(out, "\x1b[") {
+				i := strings.Index(out, "\x1b[")
+				t.Errorf("%s: ANSI escape under Ascii profile near %q", sc.name, out[max(0, i-20):min(len(out), i+20)])
+			}
+		}
+	})
+}
+
+func TestFrameBoxModel(t *testing.T) {
+	if _, w := measureView(abox.Width(20).Render("x")); w != 22 {
+		t.Fatalf("abox.Width(20) outer=%d, want 22 (padding inside, border outside)", w)
+	}
+	m := fitModel(t)
+	m.width, m.height = 80, 24
+	if _, w := measureView(m.viewCard(76, 10)); w != 76 {
+		t.Fatalf("viewCard(cw=76) outer=%d, want 76", w)
 	}
 }

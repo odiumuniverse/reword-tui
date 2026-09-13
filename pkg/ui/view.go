@@ -25,9 +25,15 @@ func (m Model) View() string {
 		h = 24
 	}
 	cw := min(max(w-4, 20), 76)
+	if w < 24 || h < 10 {
+		msg := truncateCell(fmt.Sprintf("need a bigger terminal (%dx%d)", w, h), w)
+		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, msg)
+	}
 	col := lipgloss.NewStyle().Width(cw)
 	if m.screen == sSession && m.sess.cur != nil && zenOn(m) {
-		body := col.Render(strings.TrimRight(m.viewCard(cw, h-2), "\n"))
+		// Width first (pads and wraps strays to cw), then height:
+		// Place pads short content but never crops tall content.
+		body := fitHeight(col.Render(strings.TrimRight(m.viewCard(cw, h-2), "\n")), h)
 		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Position(0.45), body)
 	}
 	header := col.Render(m.viewHeader(cw) + "\n" + faint.Render(strings.Repeat("─", cw)))
@@ -43,7 +49,10 @@ func (m Model) View() string {
 	} else {
 		body = m.viewBody(cw, bodyH)
 	}
-	body = col.Render(strings.TrimRight(body, "\n"))
+	// Place pads but never crops: clip the body so header, status and
+	// footer hints always survive short terminals. Width-fit first, since
+	// col.Render also wraps overlong lines (which changes row count).
+	body = fitHeight(col.Render(strings.TrimRight(body, "\n")), bodyH)
 	mid := lipgloss.Place(w, bodyH, lipgloss.Center, lipgloss.Position(0.45), body)
 	return lipgloss.JoinVertical(lipgloss.Left,
 		lipgloss.PlaceHorizontal(w, lipgloss.Center, header),
@@ -145,6 +154,22 @@ func window(n, cur, h int) (from, to int) {
 	return from, from + h
 }
 
+// fitHeight crops s to h rows, marking the cut. Place pads short content
+// but never crops tall content, so without this the footer hints are the
+// first thing pushed off-screen on short terminals.
+func fitHeight(s string, h int) string {
+	if h < 1 {
+		h = 1
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= h {
+		return s
+	}
+	keep := append([]string{}, lines[:h-1]...)
+	keep = append(keep, dim.Render(fmt.Sprintf("… +%d more", len(lines)-h+1)))
+	return strings.Join(keep, "\n")
+}
+
 // pctBar renders a 5-cell pink mini-bar from a "12%" string, "—" when empty.
 func pctBar(pct string) string {
 	n, err := strconv.Atoi(strings.TrimSuffix(pct, "%"))
@@ -171,46 +196,6 @@ func truncateCell(s string, w int) string {
 		r = r[:len(r)-1]
 	}
 	return string(r) + "…"
-}
-
-// wrapCell splits plain text into lines of at most w cells, breaking on
-// spaces and hard-splitting overlong words. Wrap before styling.
-func wrapCell(s string, w int) []string {
-	if w < 4 {
-		w = 4
-	}
-	var lines []string
-	for _, para := range strings.Split(s, "\n") {
-		cur := ""
-		flush := func() {
-			if cur != "" {
-				lines = append(lines, cur)
-				cur = ""
-			}
-		}
-		for _, word := range strings.Fields(para) {
-			if cur == "" {
-				cur = word
-				continue
-			}
-			if lipgloss.Width(cur+" "+word) <= w {
-				cur += " " + word
-				continue
-			}
-			flush()
-			cur = word
-		}
-		for lipgloss.Width(cur) > w {
-			cut := splitAt(cur, w)
-			lines = append(lines, cur[:cut])
-			cur = cur[cut:]
-		}
-		flush()
-	}
-	if len(lines) == 0 {
-		return []string{""}
-	}
-	return lines
 }
 
 // wrapStyled splits an already-styled line into lines of at most w cells,
@@ -255,31 +240,13 @@ func wrapStyled(line string, w int) []string {
 }
 
 // fitBox wraps every line of a box body to inner width and frames it at cw.
-// lipgloss Width is content-box: padding + border add 6 on top.
+// lipgloss Width covers content + padding; the border adds 2 outside.
 func fitBox(body string, w, cw int, frame lipgloss.Style) string {
 	var lines []string
 	for _, ln := range strings.Split(body, "\n") {
 		lines = append(lines, wrapStyled(ln, w)...)
 	}
-	return frame.Width(max(cw-6, 10)).Render(strings.Join(lines, "\n"))
-}
-
-// splitAt returns a byte index in s holding at most w cells.
-func splitAt(s string, w int) int {
-	cells := 0
-	for i, r := range s {
-		rw := lipgloss.Width(string(r))
-		if cells+rw > w {
-			if i == 0 {
-				// one wide rune: still consume it to make progress
-				_, size := utf8.DecodeRuneInString(s)
-				return size
-			}
-			return i
-		}
-		cells += rw
-	}
-	return len(s)
+	return frame.Width(max(cw-2, 10)).Render(strings.Join(lines, "\n"))
 }
 
 func windowed(items []string, cur, h int) string {
@@ -732,8 +699,8 @@ func (m Model) viewCard(cw, maxH int) string {
 		lines = append(lines, wrapStyled(ln, inner)...)
 	}
 	cardH := min(10, max(4, maxH))
-	// lipgloss Width is content-box: padding + border add 6 on top.
-	return abox.Width(max(cw-6, 10)).Height(cardH).Render(strings.Join(lines, "\n"))
+	// lipgloss Width covers content + padding; the border adds 2 outside.
+	return abox.Width(max(cw-2, 10)).Height(cardH).Render(strings.Join(lines, "\n"))
 }
 
 func (m Model) viewVocab(cw, h int) string {
@@ -945,7 +912,15 @@ func (m Model) viewSync(cw int) string {
 	b.WriteString(fmt.Sprintf("op-queue     %d intents queued · oplog tail %d\n", len(m.q.Items), len(m.oplog)))
 	b.WriteString(fmt.Sprintf("orphans      %d shelved\n", len(m.orphans)))
 	b.WriteString(faint.Render(strings.Repeat("─", cw)) + "\n")
-	b.WriteString("[p] pull   [w] write queue now\n[r] replay dry-run   [R] replay --apply\n[o] orphans   [a] abort queue\n")
+	for _, ln := range []string{
+		"[p] pull   [w] write queue now",
+		"[r] replay dry-run   [R] replay --apply",
+		"[o] orphans   [a] abort queue",
+	} {
+		for _, wln := range wrapStyled(ln, cw) {
+			b.WriteString(wln + "\n")
+		}
+	}
 	if m.replayPlan != "" {
 		lines := strings.Split(m.replayPlan, "\n")
 		if len(lines) > 10 {
