@@ -2,29 +2,34 @@ use crate::model::{CardMode, Word};
 pub const CROSS_SIDE_INTERVAL_SECS: i64 = 1166400;
 pub fn due_modes(w: &Word, now: i64) -> Vec<CardMode> {
     let mut out = Vec::new();
-    if due_side(
-        w.recognition.last_review_ts,
-        w.recognition.interval_secs,
-        now,
-    ) {
+    if w.recognition.level == 2
+        && due_side(
+            w.recognition.last_review_ts,
+            w.recognition.interval_secs,
+            now,
+        )
+    {
         out.push(CardMode::Recognition);
     }
-    if due_side(
-        w.reproduction.last_review_ts,
-        w.reproduction.interval_secs,
-        now,
-    ) {
+    if w.reproduction.level == 2
+        && due_side(
+            w.reproduction.last_review_ts,
+            w.reproduction.interval_secs,
+            now,
+        )
+    {
         out.push(CardMode::Reproduction);
     }
     out
 }
 fn due_side(t: Option<i64>, i: Option<i64>, now: i64) -> bool {
     match (t, i) {
-        (Some(t), Some(i)) => t.saturating_add(i) <= now,
+        (Some(t), Some(i)) => t.saturating_add(i) <= now.saturating_add(30),
         _ => false,
     }
 }
 pub fn ladder_interval(level: i64, easiness: f64, mode: CardMode) -> i64 {
+    let _ = easiness;
     if level <= 1 {
         return match mode {
             CardMode::Recognition => 2700,
@@ -33,10 +38,10 @@ pub fn ladder_interval(level: i64, easiness: f64, mode: CardMode) -> i64 {
     }
     match level {
         2 => 10800,
-        3 if easiness < 2.5 => 129600,
         3 => 86400,
-        4 => 432000,
-        5 => 3782000,
+        4 => 28800,
+        5 => 1209600,
+        6 => 5184000,
         _ => 5184000,
     }
 }
@@ -52,7 +57,7 @@ mod tests {
         rep_i: Option<i64>,
     ) -> Word {
         let mode = |t, i| ModeState {
-            level: 0,
+            level: 2,
             step: 0,
             easiness: 2.5,
             fails: 0,
@@ -63,6 +68,7 @@ mod tests {
             id: WordId(1),
             text: "x".to_string(),
             transcription: None,
+            pos: None,
             translations: BTreeMap::new(),
             examples: BTreeMap::new(),
             recognition: mode(rec_t, rec_i),
@@ -79,11 +85,17 @@ mod tests {
             due_modes(&word(Some(1), Some(10), None, None), 11),
             vec![CardMode::Recognition]
         );
-        assert!(due_modes(&word(Some(1), Some(10), None, None), 10).is_empty());
-        assert!(due_modes(&word(Some(1), Some(10), None, None), 11).len() == 1);
+        assert!(due_modes(&word(Some(1), Some(10), None, None), -20).is_empty());
+        assert!(due_modes(&word(Some(1), Some(10), None, None), -21).is_empty());
+        assert_eq!(due_modes(&word(Some(1), Some(10), None, None), 11).len(), 1);
         assert_eq!(
             due_modes(&word(Some(1), Some(10), Some(1), Some(10)), 11).len(),
             2
+        );
+        assert_eq!(due_modes(&word(Some(1), Some(10), None, None), 0).len(), 1);
+        assert_eq!(
+            due_modes(&word(Some(1), Some(10), None, None), -19).len(),
+            1
         );
         assert_eq!(
             due_modes(&word(Some(i64::MAX - 1), Some(100), None, None), 0).len(),
@@ -98,9 +110,10 @@ mod tests {
         assert_eq!(ladder_interval(2, 2.75, CardMode::Recognition), 10800);
         assert_eq!(ladder_interval(2, 2.75, CardMode::Reproduction), 10800);
         assert_eq!(ladder_interval(3, 3.0, CardMode::Recognition), 86400);
-        assert_eq!(ladder_interval(3, 2.25, CardMode::Reproduction), 129600);
-        assert_eq!(ladder_interval(4, 3.25, CardMode::Recognition), 432000);
-        assert_eq!(ladder_interval(5, 3.5, CardMode::Reproduction), 3782000);
+        assert_eq!(ladder_interval(3, 2.25, CardMode::Reproduction), 86400);
+        assert_eq!(ladder_interval(4, 3.25, CardMode::Recognition), 28800);
+        assert_eq!(ladder_interval(5, 3.5, CardMode::Reproduction), 1209600);
+        assert_eq!(ladder_interval(6, 3.0, CardMode::Recognition), 5184000);
         assert_eq!(ladder_interval(9, 3.0, CardMode::Recognition), 5184000);
     }
 }

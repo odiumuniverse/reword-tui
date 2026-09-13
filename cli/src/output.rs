@@ -135,18 +135,50 @@ pub fn categories(list: &[Category], format: Format) -> Result<()> {
     match format {
         Format::Json => println!("{}", serde_json::to_string_pretty(list)?),
         Format::Table => {
-            let (a, b, c, d) = ("ID", "CUSTOM", "WORDS", "NAME");
-            println!("{a:<16} {b:<6} {c:>6} {d}");
+            let (a, b, c, d, e) = ("ID", "CUSTOM", "SEL", "WORDS", "NAME");
+            println!("{a:<16} {b:<6} {c:<3} {d:>6} {e}");
             for c in list {
                 println!(
-                    "{:<16} {:<6} {:>6} {}",
+                    "{:<16} {:<6} {:<3} {:>6} {}",
                     c.id,
                     c.custom,
+                    if c.selected { "+" } else { "-" },
                     c.words,
                     c.name_en.as_deref().unwrap_or("-")
                 );
             }
         }
+    }
+    Ok(())
+}
+pub fn today(t: &crate::model::TodayStats, format: Format) -> Result<()> {
+    match format {
+        Format::Json => println!("{}", serde_json::to_string_pretty(t)?),
+        Format::Table => {
+            println!("date:          {}", t.today);
+            println!("learned:       {}", t.learned);
+            println!("reviewed:      {}", t.reviewed);
+            println!("memorizing:    {}", t.memorizing);
+            println!("mastered:      {}", t.mastered);
+            println!("known:         {}", t.known);
+            println!(
+                "goal:          {}",
+                t.goal
+                    .map(|g| g.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+            println!("streak:        {} (best {})", t.streak_cur, t.streak_best);
+        }
+    }
+    Ok(())
+}
+pub fn goal(g: &Option<i64>, format: Format) -> Result<()> {
+    match format {
+        Format::Json => println!("{}", serde_json::to_string_pretty(g)?),
+        Format::Table => match g {
+            Some(v) => println!("daily goal: {v}"),
+            None => println!("Daily goal is not set"),
+        },
     }
     Ok(())
 }

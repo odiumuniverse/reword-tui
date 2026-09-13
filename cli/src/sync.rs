@@ -20,16 +20,34 @@ fn state_path(data_dir: &Path) -> PathBuf {
     data_dir.join("fingerprints.json")
 }
 fn load_state(data_dir: &Path) -> GateState {
-    std::fs::read_to_string(state_path(data_dir))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let path = state_path(data_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return GateState::default(),
+    };
+    match serde_json::from_str(&text) {
+        Ok(st) => st,
+        Err(_) => {
+            let backup = data_dir.join(format!(
+                "fingerprints.corrupt.{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            ));
+            std::fs::rename(&path, &backup).ok();
+            GateState::default()
+        }
+    }
 }
 fn save_state(data_dir: &Path, st: &GateState) -> Result<()> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("cannot create {}", data_dir.display()))?;
-    std::fs::write(state_path(data_dir), serde_json::to_string_pretty(st)?)
-        .with_context(|| format!("cannot write {}", state_path(data_dir).display()))?;
+    let tmp = state_path(data_dir).with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(st)?)
+        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    std::fs::rename(&tmp, state_path(data_dir))
+        .with_context(|| format!("cannot adopt {}", state_path(data_dir).display()))?;
     Ok(())
 }
 fn mtime_ns(path: &Path) -> Result<u64> {
@@ -42,6 +60,9 @@ fn mtime_ns(path: &Path) -> Result<u64> {
         .unwrap_or(0))
 }
 pub fn fingerprint(app: &App) -> Result<Fingerprint> {
+    crate::store::retry(|| fingerprint_once(app), "fingerprint backup")
+}
+fn fingerprint_once(app: &App) -> Result<Fingerprint> {
     let meta = crate::store::retry(
         || {
             std::fs::metadata(&app.backup_path)
@@ -84,18 +105,28 @@ pub fn check(data_dir: &Path, app: &App, current: &Fingerprint) -> Result<()> {
     }
 }
 pub fn pull(data_dir: &Path, app: &App) -> Result<PathBuf> {
-    let qdir = data_dir
-        .join("quarantine")
-        .join(format!("{}-{}", epoch_secs(), app.id));
+    let _lock = crate::store::LockGuard::lock_for_app(data_dir, &app.id)?;
+    let qdir = data_dir.join("quarantine").join(format!(
+        "{}-{}-{}",
+        epoch_secs(),
+        std::process::id(),
+        app.id
+    ));
     std::fs::create_dir_all(&qdir).with_context(|| format!("cannot create {}", qdir.display()))?;
     let qfile = qdir.join(&app.backup_name);
-    std::fs::copy(&app.backup_path, &qfile).with_context(|| {
-        format!(
-            "cannot quarantine {} -> {}",
-            app.backup_path.display(),
-            qfile.display()
-        )
-    })?;
+    crate::store::retry(
+        || {
+            std::fs::copy(&app.backup_path, &qfile).with_context(|| {
+                format!(
+                    "cannot quarantine {} -> {}",
+                    app.backup_path.display(),
+                    qfile.display()
+                )
+            })
+        },
+        "quarantine copy",
+    )?;
+    crate::store::check_file(&qfile).context("quarantined copy unhealthy")?;
     let fp = fingerprint(app)?;
     adopt(data_dir, app, &fp)?;
     Ok(qfile)

@@ -34,3 +34,17 @@ rwcore --app en status                     # snapshot vs live: clean/dirty
 Writes go through a snapshot gate and are logged to a local op-log,
 replayable onto a fresh backup (`pull` → `replay`). CI runs
 `fmt --check`, `clippy -D warnings` and `cargo test` on every push and PR.
+
+## Go TUI
+
+```sh
+make build            # builds ./reword-tui + private ./rwcore next to it
+./reword-tui                              # app picker (or straight to Learn)
+./reword-tui --app es                     # skip picker
+./reword-tui --rwcore PATH --icloud-root DIR --data-dir DIR --queue FILE
+make test             # rust tests + clippy + fmt + go tests (incl. rwcore E2E)
+```
+
+The TUI never opens SQLite: every read is `rwcore --format json`,
+every mutation is a queued intent written once via `snapshot` → `apply`.
+`q` anywhere reminds you to tap `Restore` on the phone.

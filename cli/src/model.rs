@@ -152,6 +152,7 @@ pub struct Word {
     pub id: WordId,
     pub text: String,
     pub transcription: Option<String>,
+    pub pos: Option<i64>,
     pub translations: BTreeMap<Lang, String>,
     pub examples: BTreeMap<Lang, String>,
     pub recognition: ModeState,
@@ -173,6 +174,7 @@ pub struct LogEntry {
 pub struct Category {
     pub id: String,
     pub custom: bool,
+    pub selected: bool,
     pub name_en: Option<String>,
     pub words: i64,
 }
@@ -181,6 +183,19 @@ pub struct Settings {
     pub native_language: Option<String>,
     pub daily_goal: Option<String>,
     pub ui_language: Option<String>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct TodayStats {
+    pub today: String,
+    pub learned: i64,
+    pub reviewed: i64,
+    pub memorizing: i64,
+    pub mastered: i64,
+    pub known: i64,
+    pub goal: Option<i64>,
+    pub streak_cur: i64,
+    pub streak_best: i64,
+    pub active_dates: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Stats {

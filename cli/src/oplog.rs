@@ -1,6 +1,7 @@
 use crate::model::{CardMode, WordId};
 use crate::sync::Fingerprint;
 use anyhow::{Context, Result};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 pub const OP_VERSION: u32 = 1;
@@ -12,6 +13,8 @@ pub enum OpKind {
         text: String,
         transcription: Option<String>,
         tr: Vec<(String, String)>,
+        ex: Vec<(String, String)>,
+        category: String,
     },
     Graded {
         id: i64,
@@ -26,6 +29,32 @@ pub enum OpKind {
     },
     Enrolled {
         id: i64,
+    },
+    Selected {
+        category: String,
+        selected: bool,
+    },
+    CategoryAdded {
+        id: String,
+        name: String,
+    },
+    Removed {
+        id: i64,
+        text: String,
+    },
+    Reset {
+        id: i64,
+    },
+    CategoryAdmin {
+        category: String,
+        action: String,
+    },
+    Postponed {
+        id: i64,
+    },
+    GoalSet {
+        date: String,
+        goal: i64,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,44 +88,68 @@ fn read_lines(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 fn next_seq(data_dir: &Path) -> u64 {
-    read_lines(&oplog_path(data_dir))
-        .iter()
-        .filter_map(|l| serde_json::from_str::<Op>(l).ok())
-        .map(|o| o.seq)
-        .max()
+    std::fs::read_to_string(oplog_path(data_dir))
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| serde_json::from_str::<Op>(l).ok())
+                .map(|o| o.seq)
+                .max()
+                .unwrap_or(0)
+        })
         .unwrap_or(0)
         + 1
 }
-pub fn append(
+pub fn append_many(
+    data_dir: &Path,
+    app_id: &str,
+    ts: i64,
+    kinds: Vec<OpKind>,
+    pre: &Fingerprint,
+    post: &Fingerprint,
+) -> Result<Vec<Op>> {
+    if let Some(parent) = oplog_path(data_dir).parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    let mut out = Vec::with_capacity(kinds.len());
+    let mut buf = String::new();
+    for (seq, kind) in (next_seq(data_dir)..).zip(kinds) {
+        let op = Op {
+            v: OP_VERSION,
+            seq,
+            ts,
+            app: app_id.to_string(),
+            kind,
+            pre: pre.clone(),
+            post: post.clone(),
+        };
+        buf.push_str(&serde_json::to_string(&op)?);
+        buf.push('\n');
+        out.push(op);
+    }
+    if !buf.is_empty() {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(oplog_path(data_dir))
+            .context("cannot open oplog")?;
+        use std::io::Write as _;
+        f.write_all(buf.as_bytes()).context("cannot append ops")?;
+        f.sync_all().context("cannot fsync oplog")?;
+    }
+    Ok(out)
+}
+#[cfg(test)]
+fn append(
     data_dir: &Path,
     app_id: &str,
     ts: i64,
     kind: OpKind,
     pre: &Fingerprint,
     post: &Fingerprint,
-) -> Result<Op> {
-    if let Some(parent) = oplog_path(data_dir).parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
-    }
-    let op = Op {
-        v: OP_VERSION,
-        seq: next_seq(data_dir),
-        ts,
-        app: app_id.to_string(),
-        kind,
-        pre: pre.clone(),
-        post: post.clone(),
-    };
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(oplog_path(data_dir))
-        .context("cannot open oplog")?;
-    use std::io::Write as _;
-    writeln!(f, "{}", serde_json::to_string(&op)?).context("cannot append op")?;
-    f.sync_all().ok();
-    Ok(op)
+) -> Result<()> {
+    append_many(data_dir, app_id, ts, vec![kind], pre, post)?;
+    Ok(())
 }
 pub fn tail(data_dir: &Path, limit: usize) -> Vec<Op> {
     let mut ops: Vec<Op> = read_lines(&oplog_path(data_dir))
@@ -133,7 +186,7 @@ pub fn shelve_orphan(
         .context("cannot open orphan shelf")?;
     use std::io::Write as _;
     writeln!(f, "{}", serde_json::to_string(&o)?).context("cannot shelve orphan")?;
-    f.sync_all().ok();
+    f.sync_all().context("cannot fsync orphan shelf")?;
     Ok(())
 }
 pub fn orphans(data_dir: &Path) -> Vec<Orphan> {
@@ -165,16 +218,27 @@ pub fn replay_decision(conn: &rusqlite::Connection, app_id: &str, op: &Op) -> Re
             text,
             transcription,
             tr,
+            ex,
+            category,
         } => {
-            if exists(*id)? {
-                Ok(ReplayAction::Skip("already exists".to_string()))
-            } else {
-                Ok(ReplayAction::ApplyAdd {
+            let row: Option<(String,)> = conn
+                .query_row("SELECT WORD FROM WORD WHERE ID=?", [*id], |r| {
+                    Ok((r.get(0)?,))
+                })
+                .optional()?;
+            match row {
+                Some((have,)) if have != *text => Ok(ReplayAction::Orphan(
+                    "id reused by another word".to_string(),
+                )),
+                Some(_) => Ok(ReplayAction::Skip("already exists".to_string())),
+                None => Ok(ReplayAction::ApplyAdd {
                     id: WordId(*id),
                     text: text.clone(),
                     transcription: transcription.clone(),
                     tr: tr.clone(),
-                })
+                    ex: ex.clone(),
+                    category: category.clone(),
+                }),
             }
         }
         OpKind::Graded {
@@ -188,14 +252,12 @@ pub fn replay_decision(conn: &rusqlite::Connection, app_id: &str, op: &Op) -> Re
                 return Ok(ReplayAction::Orphan("word missing".to_string()));
             }
             if *ok {
-                let covered: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM LOG WHERE WORD_ID=? AND MODE=?
-                         AND QUEUE=2 AND TIMESTAMP>=?",
-                        rusqlite::params![*id, *mode, op.ts],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
+                let covered: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM LOG WHERE WORD_ID=? AND MODE=?
+                     AND QUEUE=2 AND TIMESTAMP>=?",
+                    rusqlite::params![*id, *mode, op.ts],
+                    |r| r.get(0),
+                )?;
                 if covered > 0 {
                     Ok(ReplayAction::Skip("covered by a review row".to_string()))
                 } else {
@@ -212,12 +274,14 @@ pub fn replay_decision(conn: &rusqlite::Connection, app_id: &str, op: &Op) -> Re
                         [*id],
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )
-                    .ok();
+                    .optional()?;
                 match cur {
-                    Some((e, f)) if e == *pre_e && f == *pre_f => Ok(ReplayAction::ApplyGrade {
-                        id: WordId(*id),
-                        mode: CardMode::from_i64(*mode),
-                    }),
+                    Some((e, f)) if (e - *pre_e).abs() < 1e-9 && f == *pre_f => {
+                        Ok(ReplayAction::ApplyGrade {
+                            id: WordId(*id),
+                            mode: CardMode::from_i64(*mode),
+                        })
+                    }
                     _ => Ok(ReplayAction::Skip(
                         "fail already applied/diverged".to_string(),
                     )),
@@ -228,9 +292,9 @@ pub fn replay_decision(conn: &rusqlite::Connection, app_id: &str, op: &Op) -> Re
             if !exists(*id)? {
                 return Ok(ReplayAction::Orphan("word missing".to_string()));
             }
-            let (qr, _qp) = q_of(*id)?;
+            let (qr, qp) = q_of(*id)?;
             let target = if decision == "known" { 3 } else { 2 };
-            if qr >= target {
+            if qr >= target && qp >= target {
                 Ok(ReplayAction::Skip("Q already at target".to_string()))
             } else {
                 Ok(ReplayAction::ApplyTriage {
@@ -243,13 +307,116 @@ pub fn replay_decision(conn: &rusqlite::Connection, app_id: &str, op: &Op) -> Re
             if !exists(*id)? {
                 return Ok(ReplayAction::Orphan("word missing".to_string()));
             }
-            let (qr, _qp) = q_of(*id)?;
-            if qr >= 2 {
+            let (qr, qp) = q_of(*id)?;
+            if qr >= 2 && qp >= 2 {
                 Ok(ReplayAction::Skip("already enrolled".to_string()))
             } else {
                 Ok(ReplayAction::ApplyEnroll { id: WordId(*id) })
             }
         }
+        OpKind::Selected { category, selected } => {
+            let cur: Option<i64> = conn
+                .query_row(
+                    "SELECT IS_SELECTED FROM CATEGORY WHERE ID = ? OR NAME_ENG = ?",
+                    rusqlite::params![category, category],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match cur {
+                None => Ok(ReplayAction::Orphan("category missing".to_string())),
+                Some(v) if (v != 0) == *selected => {
+                    Ok(ReplayAction::Skip("already at target".to_string()))
+                }
+                _ => Ok(ReplayAction::ApplySelect {
+                    category: category.clone(),
+                    selected: *selected,
+                }),
+            }
+        }
+        OpKind::CategoryAdded { id, name } => {
+            let have: Option<String> = conn
+                .query_row("SELECT NAME_ENG FROM CATEGORY WHERE ID = ?", [id], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            match have {
+                Some(n) if n == *name => Ok(ReplayAction::Skip("already exists".to_string())),
+                Some(_) => Ok(ReplayAction::Orphan(
+                    "id reused by another category".to_string(),
+                )),
+                None => Ok(ReplayAction::ApplyCategory {
+                    id: id.clone(),
+                    name: name.clone(),
+                }),
+            }
+        }
+        OpKind::Removed { id, text } => {
+            let row: Option<String> = conn
+                .query_row("SELECT WORD FROM WORD WHERE ID=?", [*id], |r| r.get(0))
+                .optional()?;
+            match row {
+                None => Ok(ReplayAction::Skip("already gone".to_string())),
+                Some(have) if have != *text => Ok(ReplayAction::Orphan(
+                    "id reused by another word".to_string(),
+                )),
+                Some(_) => Ok(ReplayAction::ApplyRemove { id: WordId(*id) }),
+            }
+        }
+        OpKind::Reset { id } => {
+            if !exists(*id)? {
+                return Ok(ReplayAction::Orphan("word missing".to_string()));
+            }
+            let clean: bool = conn.query_row(
+                "SELECT Q_REC=0 AND Q_REP=0 AND S_REC=0 AND S_REP=0
+                     AND E_REC=2.5 AND E_REP=2.5 AND F_REC=0 AND F_REP=0
+                     AND T_REC IS NULL AND T_REP IS NULL
+                     AND I_REC IS NULL AND I_REP IS NULL FROM WORD WHERE ID=?",
+                [*id],
+                |r| r.get(0),
+            )?;
+            if clean {
+                Ok(ReplayAction::Skip("already reset".to_string()))
+            } else {
+                Ok(ReplayAction::ApplyReset { id: WordId(*id) })
+            }
+        }
+        OpKind::CategoryAdmin { category, action } => {
+            let present: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM CATEGORY WHERE ID = ? OR NAME_ENG = ?",
+                rusqlite::params![category, category],
+                |r| r.get(0),
+            )?;
+            if present == 0 {
+                if action == "remove" {
+                    return Ok(ReplayAction::Skip("already gone".to_string()));
+                }
+                return Ok(ReplayAction::Orphan("category missing".to_string()));
+            }
+            Ok(ReplayAction::ApplyCategoryAdmin {
+                category: category.clone(),
+                action: action.clone(),
+            })
+        }
+        OpKind::Postponed { id } => {
+            if !exists(*id)? {
+                return Ok(ReplayAction::Orphan("word missing".to_string()));
+            }
+            let fresh: Option<(Option<i64>, Option<i64>)> = conn
+                .query_row("SELECT T_REC, T_REP FROM WORD WHERE ID=?", [*id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            match fresh {
+                Some((Some(a), Some(b))) if a >= op.ts && b >= op.ts => {
+                    Ok(ReplayAction::Skip("already postponed later".to_string()))
+                }
+                _ => Ok(ReplayAction::ApplyPostpone { id: WordId(*id) }),
+            }
+        }
+        OpKind::GoalSet { date, goal } => Ok(ReplayAction::ApplyGoal {
+            date: date.clone(),
+            goal: *goal,
+        }),
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +428,8 @@ pub enum ReplayAction {
         text: String,
         transcription: Option<String>,
         tr: Vec<(String, String)>,
+        ex: Vec<(String, String)>,
+        category: String,
     },
     ApplyGrade {
         id: WordId,
@@ -272,6 +441,31 @@ pub enum ReplayAction {
     },
     ApplyEnroll {
         id: WordId,
+    },
+    ApplySelect {
+        category: String,
+        selected: bool,
+    },
+    ApplyCategory {
+        id: String,
+        name: String,
+    },
+    ApplyRemove {
+        id: WordId,
+    },
+    ApplyReset {
+        id: WordId,
+    },
+    ApplyCategoryAdmin {
+        category: String,
+        action: String,
+    },
+    ApplyPostpone {
+        id: WordId,
+    },
+    ApplyGoal {
+        date: String,
+        goal: i64,
     },
 }
 #[cfg(test)]
@@ -413,5 +607,198 @@ mod tests {
         assert!(matches!(acts[5], ReplayAction::Skip(_)));
         shelve_orphan(data, 1, "es", "test", None, Some("x".to_string())).unwrap();
         assert_eq!(orphans(data).len(), 1);
+    }
+    #[test]
+    fn replay_guards_content_ops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("g.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE WORD (ID INTEGER PRIMARY KEY, WORD TEXT NOT NULL DEFAULT '',
+              Q_REC INTEGER DEFAULT 0, Q_REP INTEGER DEFAULT 0,
+              S_REC INTEGER DEFAULT 0, S_REP INTEGER DEFAULT 0,
+              E_REC REAL DEFAULT 2.5, E_REP REAL DEFAULT 2.5,
+              F_REC INTEGER DEFAULT 0, F_REP INTEGER DEFAULT 0,
+              T_REC INTEGER DEFAULT NULL, T_REP INTEGER DEFAULT NULL,
+              I_REC INTEGER DEFAULT NULL, I_REP INTEGER DEFAULT NULL);
+             CREATE TABLE CATEGORY (ID TEXT PRIMARY KEY, IS_SELECTED INTEGER NOT NULL,
+              NAME_ENG TEXT);
+             INSERT INTO WORD VALUES (1, 'kept', 2, 2, 1, 1, 2.5, 2.5, 0, 0,
+              NULL, NULL, NULL, NULL);
+             INSERT INTO WORD VALUES (2, 'other', 1, 1, 0, 0, 2.5, 2.5, 0, 0,
+              NULL, NULL, NULL, NULL);
+             INSERT INTO CATEGORY VALUES ('custom', 1, 'My words');",
+        )
+        .unwrap();
+        let mk = |seq: u64, kind: OpKind| Op {
+            v: OP_VERSION,
+            seq,
+            ts: 1,
+            app: "es".to_string(),
+            kind,
+            pre: fp(0, 0, 0),
+            post: fp(0, 0, 0),
+        };
+        let d = |o: &Op| replay_decision(&conn, "es", o).unwrap();
+        assert!(matches!(
+            d(&mk(
+                1,
+                OpKind::Removed {
+                    id: 9,
+                    text: "x".into()
+                }
+            )),
+            ReplayAction::Skip(_)
+        ));
+        assert!(matches!(
+            d(&mk(
+                2,
+                OpKind::Removed {
+                    id: 2,
+                    text: "changed".into()
+                }
+            )),
+            ReplayAction::Orphan(_)
+        ));
+        assert!(matches!(
+            d(&mk(
+                3,
+                OpKind::Removed {
+                    id: 2,
+                    text: "other".into()
+                }
+            )),
+            ReplayAction::ApplyRemove { .. }
+        ));
+        assert!(matches!(
+            d(&mk(4, OpKind::Reset { id: 9 })),
+            ReplayAction::Orphan(_)
+        ));
+        assert!(matches!(
+            d(&mk(5, OpKind::Reset { id: 2 })),
+            ReplayAction::ApplyReset { .. }
+        ));
+        assert!(matches!(
+            d(&mk(
+                6,
+                OpKind::Added {
+                    id: 1,
+                    text: "kept".into(),
+                    transcription: None,
+                    tr: vec![],
+                    ex: vec![],
+                    category: "custom".into(),
+                }
+            )),
+            ReplayAction::Skip(_)
+        ));
+        assert!(matches!(
+            d(&mk(
+                7,
+                OpKind::Added {
+                    id: 1,
+                    text: "impostor".into(),
+                    transcription: None,
+                    tr: vec![],
+                    ex: vec![],
+                    category: "custom".into(),
+                }
+            )),
+            ReplayAction::Orphan(_)
+        ));
+        assert!(matches!(
+            d(&mk(
+                8,
+                OpKind::Added {
+                    id: 7,
+                    text: "new".into(),
+                    transcription: None,
+                    tr: vec![],
+                    ex: vec![],
+                    category: "custom".into(),
+                }
+            )),
+            ReplayAction::ApplyAdd { .. }
+        ));
+        assert!(matches!(
+            d(&mk(
+                9,
+                OpKind::CategoryAdded {
+                    id: "custom".into(),
+                    name: "My words".into()
+                }
+            )),
+            ReplayAction::Skip(_)
+        ));
+        assert!(matches!(
+            d(&mk(
+                10,
+                OpKind::CategoryAdded {
+                    id: "custom".into(),
+                    name: "Renamed".into()
+                }
+            )),
+            ReplayAction::Orphan(_)
+        ));
+        assert!(matches!(
+            d(&mk(
+                11,
+                OpKind::GoalSet {
+                    date: "20260913".into(),
+                    goal: 30
+                }
+            )),
+            ReplayAction::ApplyGoal { .. }
+        ));
+    }
+    #[test]
+    fn replay_select_apply_skip_orphan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("s.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE WORD (ID INTEGER PRIMARY KEY, Q_REC INTEGER DEFAULT 0,
+             Q_REP INTEGER DEFAULT 0);
+             CREATE TABLE LOG (ID INTEGER PRIMARY KEY, TIMESTAMP INTEGER NOT NULL,
+              LOCAL_DATE TEXT NOT NULL, WORD_ID INTEGER NOT NULL, MODE INTEGER NOT NULL,
+              QUEUE INTEGER NOT NULL, STEP INTEGER NOT NULL, NQUEUE INTEGER NOT NULL,
+              FLAGS INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE CATEGORY (ID TEXT PRIMARY KEY, IS_SELECTED INTEGER NOT NULL,
+              NAME_ENG TEXT);
+             INSERT INTO CATEGORY VALUES ('custom', 1, 'My words');",
+        )
+        .unwrap();
+        let mk = |seq: u64, app: &str, category: &str, selected: bool| Op {
+            v: OP_VERSION,
+            seq,
+            ts: 1,
+            app: app.to_string(),
+            kind: OpKind::Selected {
+                category: category.to_string(),
+                selected,
+            },
+            pre: fp(0, 0, 0),
+            post: fp(0, 0, 0),
+        };
+        assert!(matches!(
+            replay_decision(&conn, "es", &mk(1, "es", "custom", true)).unwrap(),
+            ReplayAction::Skip(_)
+        ));
+        assert!(matches!(
+            replay_decision(&conn, "es", &mk(2, "es", "custom", false)).unwrap(),
+            ReplayAction::ApplySelect { .. }
+        ));
+        assert!(matches!(
+            replay_decision(&conn, "es", &mk(3, "es", "nope", true)).unwrap(),
+            ReplayAction::Orphan(_)
+        ));
+        assert!(matches!(
+            replay_decision(&conn, "en", &mk(4, "en", "custom", false)).unwrap(),
+            ReplayAction::ApplySelect { .. }
+        ));
+        assert!(matches!(
+            replay_decision(&conn, "es", &mk(5, "en", "custom", false)).unwrap(),
+            ReplayAction::Skip(_)
+        ));
     }
 }

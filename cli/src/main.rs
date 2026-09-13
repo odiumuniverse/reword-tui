@@ -21,6 +21,21 @@ fn now_local() -> (i64, String) {
     let now = chrono::Local::now();
     (now.timestamp(), now.format("%F").to_string())
 }
+fn shelve_missing(
+    data: &std::path::Path,
+    app_id: &str,
+    reason: &str,
+    word_query: &str,
+) -> Result<Receipt> {
+    let (ts, _) = now_local();
+    crate::oplog::shelve_orphan(data, ts, app_id, reason, None, Some(word_query.to_string()))?;
+    Ok(Receipt {
+        applied: false,
+        orphaned: true,
+        snapshot: None,
+        detail: serde_json::json!({ "word": word_query }),
+    })
+}
 fn do_grade(
     app: &discover::App,
     cache: &std::path::Path,
@@ -31,27 +46,13 @@ fn do_grade(
 ) -> Result<Receipt> {
     let probe = store::open_ro(&app.backup_path)?;
     if store::get_word(&probe, word_query)?.is_none() {
-        let (ts, _) = now_local();
-        crate::oplog::shelve_orphan(
-            data,
-            ts,
-            &app.id,
-            "grade on missing word",
-            None,
-            Some(word_query.to_string()),
-        )?;
-        return Ok(Receipt {
-            applied: false,
-            orphaned: true,
-            snapshot: None,
-            detail: serde_json::json!({ "word": word_query }),
-        });
+        return shelve_missing(data, &app.id, "grade on missing word", word_query);
     }
     drop(probe);
-    let snap = store::modify(app, cache, data, true, |tx| {
+    let (ts, date) = now_local();
+    let snap = match store::modify(app, cache, data, Some(ts), |tx| {
         let w =
             store::get_word(tx, word_query)?.with_context(|| format!("no word '{word_query}'"))?;
-        let (ts, date) = now_local();
         let (pre_e, pre_f) = store::grade_review(tx, w.id, mode, ok, ts, &date)?;
         Ok(vec![OpKind::Graded {
             id: w.id.0,
@@ -60,7 +61,16 @@ fn do_grade(
             pre_e,
             pre_f,
         }])
-    })?;
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            let probe2 = store::open_ro(&app.backup_path)?;
+            if store::get_word(&probe2, word_query)?.is_none() {
+                return shelve_missing(data, &app.id, "grade on missing word", word_query);
+            }
+            return Err(e);
+        }
+    };
     Ok(Receipt {
         applied: true,
         orphaned: false,
@@ -77,27 +87,13 @@ fn do_triage(
 ) -> Result<Receipt> {
     let probe = store::open_ro(&app.backup_path)?;
     if store::get_word(&probe, word_query)?.is_none() {
-        let (ts, _) = now_local();
-        crate::oplog::shelve_orphan(
-            data,
-            ts,
-            &app.id,
-            "triage on missing word",
-            None,
-            Some(word_query.to_string()),
-        )?;
-        return Ok(Receipt {
-            applied: false,
-            orphaned: true,
-            snapshot: None,
-            detail: serde_json::json!({ "word": word_query }),
-        });
+        return shelve_missing(data, &app.id, "triage on missing word", word_query);
     }
     drop(probe);
-    let snap = store::modify(app, cache, data, true, |tx| {
+    let (ts, date) = now_local();
+    let snap = match store::modify(app, cache, data, Some(ts), |tx| {
         let w =
             store::get_word(tx, word_query)?.with_context(|| format!("no word '{word_query}'"))?;
-        let (ts, date) = now_local();
         let op = if known {
             store::triage_known(tx, w.id, ts, &date)?;
             OpKind::Triaged {
@@ -105,16 +101,61 @@ fn do_triage(
                 decision: "known".to_string(),
             }
         } else {
-            store::enroll_word(tx, w.id, ts, &date)?;
-            OpKind::Enrolled { id: w.id.0 }
+            match store::advance_learn(tx, w.id, ts, &date)? {
+                Some(op) => op,
+                None => return Ok(vec![]),
+            }
         };
         Ok(vec![op])
-    })?;
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            let probe2 = store::open_ro(&app.backup_path)?;
+            if store::get_word(&probe2, word_query)?.is_none() {
+                return shelve_missing(data, &app.id, "triage on missing word", word_query);
+            }
+            return Err(e);
+        }
+    };
     Ok(Receipt {
         applied: true,
         orphaned: false,
         snapshot: Some(snap),
         detail: serde_json::json!({ "word": word_query, "known": known }),
+    })
+}
+fn do_remove(
+    app: &discover::App,
+    cache: &std::path::Path,
+    data: &std::path::Path,
+    word_query: &str,
+) -> Result<Receipt> {
+    let probe = store::open_ro(&app.backup_path)?;
+    if store::get_word(&probe, word_query)?.is_none() {
+        return shelve_missing(data, &app.id, "remove on missing word", word_query);
+    }
+    drop(probe);
+    let (ts, _) = now_local();
+    let snap = match store::modify(app, cache, data, Some(ts), |tx| {
+        let w =
+            store::get_word(tx, word_query)?.with_context(|| format!("no word '{word_query}'"))?;
+        let text = store::remove_word(tx, w.id)?;
+        Ok(vec![OpKind::Removed { id: w.id.0, text }])
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            let probe2 = store::open_ro(&app.backup_path)?;
+            if store::get_word(&probe2, word_query)?.is_none() {
+                return shelve_missing(data, &app.id, "remove on missing word", word_query);
+            }
+            return Err(e);
+        }
+    };
+    Ok(Receipt {
+        applied: true,
+        orphaned: false,
+        snapshot: Some(snap),
+        detail: serde_json::json!({ "word": word_query }),
     })
 }
 fn print_receipt(action: &str, r: &Receipt, format: Format) {
@@ -202,6 +243,74 @@ enum Cmd {
         yes: bool,
     },
     Categories,
+    Today,
+    Select {
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long)]
+        on: bool,
+        #[arg(long)]
+        off: bool,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    AddCategory {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    ImportCsv {
+        #[arg(long)]
+        category: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        lang: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    Remove {
+        word: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    Reset {
+        word: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    Postpone {
+        word: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    ClearCategory {
+        #[arg(long)]
+        category: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    RemoveCategory {
+        #[arg(long)]
+        category: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    ResetCategory {
+        #[arg(long)]
+        category: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    Goal {
+        #[arg(long)]
+        set: Option<i64>,
+    },
     Add {
         #[arg(long)]
         word: String,
@@ -277,6 +386,13 @@ fn parse_tr(items: &[String]) -> Result<Vec<(Lang, String)>> {
         })
         .collect()
 }
+fn parse_result(s: &str) -> Result<bool> {
+    match s.to_lowercase().as_str() {
+        "ok" | "remembered" | "correct" | "got-it" | "gotit" => Ok(true),
+        "fail" | "forgotten" | "missed" | "missed-it" | "missedit" => Ok(false),
+        _ => anyhow::bail!("bad result '{s}'; want ok|fail"),
+    }
+}
 fn parse_mode(s: &str) -> Result<crate::model::CardMode> {
     use crate::model::CardMode;
     match s.to_lowercase().as_str() {
@@ -295,6 +411,106 @@ fn default_bin_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("cannot determine home dir")?;
     Ok(home.join(".local/bin"))
 }
+struct ReplayReport {
+    outcomes: Vec<(u64, String, String)>,
+    orphaned: Vec<(crate::oplog::Op, String)>,
+}
+fn replay_run(
+    conn: &rusqlite::Connection,
+    app_id: &str,
+    ops: &[crate::oplog::Op],
+) -> Result<ReplayReport> {
+    let mut outcomes = Vec::new();
+    let mut orphaned = Vec::new();
+    for o in ops.iter().filter(|o| o.app == app_id) {
+        let date = chrono::DateTime::from_timestamp(o.ts, 0)
+            .context("bad op ts")?
+            .with_timezone(&chrono::Local)
+            .format("%F")
+            .to_string();
+        let tx: &rusqlite::Connection = conn;
+        match crate::oplog::replay_decision(conn, app_id, o)? {
+            crate::oplog::ReplayAction::ApplyAdd {
+                id,
+                text,
+                transcription,
+                tr,
+                ex,
+                category,
+            } => {
+                store::readd_word(tx, id, &text, transcription.as_deref(), &tr, &ex, &category)?;
+                outcomes.push((o.seq, "apply-add".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplyGrade { id, mode } => {
+                let ok = matches!(o.kind, crate::oplog::OpKind::Graded { ok: true, .. });
+                store::grade_review(tx, id, mode, ok, o.ts, &date)?;
+                outcomes.push((o.seq, "apply-grade".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplyTriage { id, known } => {
+                if known {
+                    store::triage_known(tx, id, o.ts, &date)?;
+                } else {
+                    store::advance_learn(tx, id, o.ts, &date)?;
+                }
+                outcomes.push((o.seq, "apply-triage".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplyEnroll { id } => {
+                store::enroll_word(tx, id, o.ts, &date)?;
+                outcomes.push((o.seq, "apply-enroll".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplySelect { category, selected } => {
+                store::set_selected(tx, &category, selected)?;
+                outcomes.push((o.seq, "apply-select".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplyCategory { id, name } => {
+                store::add_category(tx, &id, &name)?;
+                outcomes.push((o.seq, "apply-category".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplyRemove { id } => {
+                store::remove_word(tx, id)?;
+                outcomes.push((o.seq, "apply-remove".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplyReset { id } => {
+                store::reset_word(tx, id)?;
+                outcomes.push((o.seq, "apply-reset".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplyPostpone { id } => {
+                store::postpone_word(tx, id, o.ts)?;
+                outcomes.push((o.seq, "apply-postpone".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplyGoal { date, goal } => {
+                store::set_goal(tx, &date, goal)?;
+                outcomes.push((o.seq, "apply-goal".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplyCategoryAdmin { category, action } => {
+                match action.as_str() {
+                    "clear" => {
+                        store::clear_category(tx, &category)?;
+                    }
+                    "remove" => {
+                        store::remove_category(tx, &category)?;
+                    }
+                    "reset" => {
+                        store::reset_category(tx, &category)?;
+                    }
+                    other => {
+                        anyhow::bail!("unknown category action '{other}'");
+                    }
+                }
+                outcomes.push((o.seq, "apply-catadmin".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::Orphan(reason) => {
+                orphaned.push((o.clone(), reason.clone()));
+                outcomes.push((o.seq, "orphan".to_string(), reason));
+            }
+            crate::oplog::ReplayAction::Skip(reason) => {
+                outcomes.push((o.seq, "skip".to_string(), reason));
+            }
+        }
+    }
+    Ok(ReplayReport { outcomes, orphaned })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
@@ -369,11 +585,7 @@ fn main() -> Result<()> {
             if !yes {
                 anyhow::bail!("refusing to write without --yes");
             }
-            let ok = match result.to_lowercase().as_str() {
-                "ok" | "remembered" | "correct" | "got-it" | "gotit" => true,
-                "fail" | "forgotten" | "missed" | "missed-it" | "missedit" => false,
-                _ => anyhow::bail!("bad --result '{result}'; want ok|fail"),
-            };
+            let ok = parse_result(result)?;
             let mode = parse_mode(mode)?;
             let root = icloud_root(&cli)?;
             let cache = cache_dir(&cli)?;
@@ -408,6 +620,360 @@ fn main() -> Result<()> {
             let conn = store::open_ro(&app.backup_path)?;
             output::categories(&store::categories(&conn)?, cli.format)?;
         }
+        Cmd::Today => {
+            let root = icloud_root(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let conn = store::open_ro(&app.backup_path)?;
+            let today = chrono::Local::now().format("%F").to_string();
+            output::today(&store::today(&conn, &today)?, cli.format)?;
+        }
+        Cmd::Select {
+            category,
+            on,
+            off,
+            all,
+            yes,
+        } => {
+            if !yes {
+                anyhow::bail!("refusing to write without --yes");
+            }
+            if *on == *off {
+                anyhow::bail!("pass exactly one of --on / --off");
+            }
+            let selected = *on;
+            let root = icloud_root(&cli)?;
+            let cache = cache_dir(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let data = data_dir(&cli)?;
+            let snap = store::modify(&app, &cache, &data, Some(now_local().0), |tx| {
+                if *all {
+                    let cats = store::categories(tx)?;
+                    let mut ops = Vec::with_capacity(cats.len());
+                    for c in &cats {
+                        if c.selected != selected {
+                            store::set_selected(tx, &c.id, selected)?;
+                            ops.push(OpKind::Selected {
+                                category: c.id.clone(),
+                                selected,
+                            });
+                        }
+                    }
+                    Ok(ops)
+                } else {
+                    let category = category
+                        .as_deref()
+                        .context("missing --category (or pass --all)")?;
+                    let id = store::set_selected(tx, category, selected)?;
+                    Ok(vec![OpKind::Selected {
+                        category: id,
+                        selected,
+                    }])
+                }
+            })?;
+            match cli.format {
+                Format::Json => output::ok_json(
+                    "selected",
+                    serde_json::json!({ "selected": selected, "snapshot": snap }),
+                ),
+                Format::Table => println!("selected={selected} (snapshot: {})", snap.display()),
+            }
+        }
+        Cmd::AddCategory { id, name, yes } => {
+            if !yes {
+                anyhow::bail!("refusing to write without --yes");
+            }
+            let root = icloud_root(&cli)?;
+            let cache = cache_dir(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let data = data_dir(&cli)?;
+            let idc = id.clone();
+            let namec = name.clone();
+            let snap = store::modify(&app, &cache, &data, Some(now_local().0), |tx| {
+                store::add_category(tx, &idc, &namec)?;
+                Ok(vec![OpKind::CategoryAdded {
+                    id: idc.clone(),
+                    name: namec.clone(),
+                }])
+            })?;
+            match cli.format {
+                Format::Json => output::ok_json(
+                    "category added",
+                    serde_json::json!({ "id": id, "snapshot": snap }),
+                ),
+                Format::Table => println!("added category '{id}' (snapshot: {})", snap.display()),
+            }
+        }
+        Cmd::ImportCsv {
+            category,
+            file,
+            lang,
+            yes,
+        } => {
+            if !yes {
+                anyhow::bail!("refusing to write without --yes");
+            }
+            let root = icloud_root(&cli)?;
+            let cache = cache_dir(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let data = data_dir(&cli)?;
+            let text = std::fs::read_to_string(file)
+                .with_context(|| "Could not load words from the selected file")?;
+            let rows = store::parse_csv(&text);
+            if rows.is_empty() {
+                anyhow::bail!("Could not load words from the selected file");
+            }
+            let probe = store::open_ro(&app.backup_path)?;
+            let tl = match lang.as_deref() {
+                Some(l) => Lang::parse(l)
+                    .with_context(|| format!("bad lang '{l}'; known: {}", Lang::known_codes()))?,
+                None => {
+                    let st = store::settings(&probe)?;
+                    st.native_language
+                        .as_deref()
+                        .and_then(Lang::parse)
+                        .unwrap_or(Lang::Eng)
+                }
+            };
+            drop(probe);
+            let catc = category.clone();
+            let snap = store::modify(&app, &cache, &data, Some(now_local().0), |tx| {
+                let since: i64 = tx
+                    .query_row("SELECT COALESCE(MAX(ID), 0) FROM WORD", [], |r| r.get(0))
+                    .context("read max id")?;
+                let _ = store::import_rows(tx, &catc, &rows, &tl)?;
+                let mut ops = Vec::new();
+                let mut st = tx
+                    .prepare("SELECT ID FROM WORD WHERE ID > ? ORDER BY ID")
+                    .context("read back import")?;
+                let ids: Vec<i64> = st
+                    .query_map([since], |r| r.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .context("read back import")?;
+                for id in ids {
+                    let (text, transcription, tr, ex) =
+                        store::word_payload(tx, crate::model::WordId(id))?;
+                    ops.push(OpKind::Added {
+                        id,
+                        text,
+                        transcription,
+                        tr,
+                        ex,
+                        category: catc.clone(),
+                    });
+                }
+                Ok(ops)
+            })?;
+            match cli.format {
+                Format::Json => output::ok_json(
+                    "The words have been successfully imported",
+                    serde_json::json!({ "category": category, "snapshot": snap }),
+                ),
+                Format::Table => {
+                    println!(
+                        "The words have been successfully imported (snapshot: {})",
+                        snap.display()
+                    )
+                }
+            }
+        }
+        Cmd::Remove { word, yes } => {
+            if !yes {
+                anyhow::bail!("refusing to write without --yes");
+            }
+            let root = icloud_root(&cli)?;
+            let cache = cache_dir(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let data = data_dir(&cli)?;
+            let qc = word.clone();
+            let r = do_remove(&app, &cache, &data, &qc)?;
+            print_receipt("removed", &r, cli.format);
+        }
+        Cmd::Reset { word, yes } => {
+            if !yes {
+                anyhow::bail!("refusing to write without --yes");
+            }
+            let root = icloud_root(&cli)?;
+            let cache = cache_dir(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let data = data_dir(&cli)?;
+            let qc = word.clone();
+            let snap = match store::modify(&app, &cache, &data, Some(now_local().0), |tx| {
+                let w = store::get_word(tx, &qc)?.with_context(|| format!("no word '{qc}'"))?;
+                store::reset_word(tx, w.id)?;
+                Ok(vec![OpKind::Reset { id: w.id.0 }])
+            }) {
+                Ok(s) => s,
+                Err(e) => {
+                    let probe = store::open_ro(&app.backup_path)?;
+                    if store::get_word(&probe, &qc)?.is_none() {
+                        let r = shelve_missing(
+                            data_dir(&cli)?.as_path(),
+                            &app.id,
+                            "reset on missing word",
+                            &qc,
+                        )?;
+                        print_receipt("reset", &r, cli.format);
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+            };
+            match cli.format {
+                Format::Json => output::ok_json(
+                    "Progress has been reset",
+                    serde_json::json!({ "word": word, "snapshot": snap }),
+                ),
+                Format::Table => {
+                    println!("Progress has been reset (snapshot: {})", snap.display())
+                }
+            }
+        }
+        Cmd::Postpone { word, yes } => {
+            if !yes {
+                anyhow::bail!("refusing to write without --yes");
+            }
+            let root = icloud_root(&cli)?;
+            let cache = cache_dir(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let data = data_dir(&cli)?;
+            let qc = word.clone();
+            let (pts, _) = now_local();
+            let snap = match store::modify(&app, &cache, &data, Some(pts), |tx| {
+                let w = store::get_word(tx, &qc)?.with_context(|| format!("no word '{qc}'"))?;
+                store::postpone_word(tx, w.id, pts)?;
+                Ok(vec![OpKind::Postponed { id: w.id.0 }])
+            }) {
+                Ok(s) => s,
+                Err(e) => {
+                    let probe = store::open_ro(&app.backup_path)?;
+                    if store::get_word(&probe, &qc)?.is_none() {
+                        let r = shelve_missing(
+                            data_dir(&cli)?.as_path(),
+                            &app.id,
+                            "postpone on missing word",
+                            &qc,
+                        )?;
+                        print_receipt("postponed", &r, cli.format);
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+            };
+            match cli.format {
+                Format::Json => output::ok_json(
+                    "postponed",
+                    serde_json::json!({ "word": word, "snapshot": snap }),
+                ),
+                Format::Table => {
+                    println!("postponed '{word}' (snapshot: {})", snap.display())
+                }
+            }
+        }
+        Cmd::ClearCategory { category, yes } => {
+            if !yes {
+                anyhow::bail!("refusing to write without --yes");
+            }
+            let root = icloud_root(&cli)?;
+            let cache = cache_dir(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let data = data_dir(&cli)?;
+            let cc = category.clone();
+            let snap = store::modify(&app, &cache, &data, Some(now_local().0), |tx| {
+                store::clear_category(tx, &cc)?;
+                Ok(vec![OpKind::CategoryAdmin {
+                    category: cc.clone(),
+                    action: "clear".to_string(),
+                }])
+            })?;
+            match cli.format {
+                Format::Json => output::ok_json(
+                    "Words have been removed",
+                    serde_json::json!({ "category": category, "snapshot": snap }),
+                ),
+                Format::Table => {
+                    println!("Words have been removed (snapshot: {})", snap.display())
+                }
+            }
+        }
+        Cmd::RemoveCategory { category, yes } => {
+            if !yes {
+                anyhow::bail!("refusing to write without --yes");
+            }
+            let root = icloud_root(&cli)?;
+            let cache = cache_dir(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let data = data_dir(&cli)?;
+            let cc = category.clone();
+            let snap = store::modify(&app, &cache, &data, Some(now_local().0), |tx| {
+                store::remove_category(tx, &cc)?;
+                Ok(vec![OpKind::CategoryAdmin {
+                    category: cc.clone(),
+                    action: "remove".to_string(),
+                }])
+            })?;
+            match cli.format {
+                Format::Json => output::ok_json(
+                    "Category has been removed",
+                    serde_json::json!({ "category": category, "snapshot": snap }),
+                ),
+                Format::Table => {
+                    println!("Category has been removed (snapshot: {})", snap.display())
+                }
+            }
+        }
+        Cmd::ResetCategory { category, yes } => {
+            if !yes {
+                anyhow::bail!("refusing to write without --yes");
+            }
+            let root = icloud_root(&cli)?;
+            let cache = cache_dir(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let data = data_dir(&cli)?;
+            let cc = category.clone();
+            let snap = store::modify(&app, &cache, &data, Some(now_local().0), |tx| {
+                store::reset_category(tx, &cc)?;
+                Ok(vec![OpKind::CategoryAdmin {
+                    category: cc.clone(),
+                    action: "reset".to_string(),
+                }])
+            })?;
+            match cli.format {
+                Format::Json => output::ok_json(
+                    "Progress has been reset",
+                    serde_json::json!({ "category": category, "snapshot": snap }),
+                ),
+                Format::Table => {
+                    println!("Progress has been reset (snapshot: {})", snap.display())
+                }
+            }
+        }
+        Cmd::Goal { set } => {
+            let root = icloud_root(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let conn = store::open_ro(&app.backup_path)?;
+            let key = chrono::Local::now().format("%Y%m%d").to_string();
+            if let Some(g) = set {
+                let cache = cache_dir(&cli)?;
+                let data = data_dir(&cli)?;
+                let keyc = key.clone();
+                let snap = store::modify(&app, &cache, &data, Some(now_local().0), |tx| {
+                    store::set_goal(tx, &keyc, *g)?;
+                    Ok(vec![OpKind::GoalSet {
+                        date: keyc.clone(),
+                        goal: *g,
+                    }])
+                })?;
+                match cli.format {
+                    Format::Json => output::ok_json(
+                        "goal set",
+                        serde_json::json!({ "goal": g, "snapshot": snap }),
+                    ),
+                    Format::Table => println!("daily goal: {g}"),
+                }
+            } else {
+                output::goal(&store::get_goal(&conn, &key)?, cli.format)?;
+            }
+        }
         Cmd::Add {
             word,
             transcription,
@@ -434,8 +1000,9 @@ fn main() -> Result<()> {
                 anyhow::bail!("--tr TEXT must not be empty");
             }
             let data = data_dir(&cli)?;
-            let snap = store::modify(&app, &cache, &data, true, |conn| {
+            let snap = store::modify(&app, &cache, &data, Some(now_local().0), |conn| {
                 let id = store::add_word(conn, word, transcription.as_deref(), &tr)?;
+                let cat = store::custom_category(conn)?;
                 let mut ops = vec![OpKind::Added {
                     id: id.0,
                     text: (*word).to_string(),
@@ -444,6 +1011,8 @@ fn main() -> Result<()> {
                         .iter()
                         .map(|(l, t)| (l.code().to_string(), t.clone()))
                         .collect(),
+                    ex: vec![],
+                    category: cat,
                 }];
                 if *enroll {
                     let now = chrono::Local::now();
@@ -561,29 +1130,52 @@ fn main() -> Result<()> {
             let data = data_dir(&cli)?;
             let app = resolve_app(&cli, &root)?;
             let ops = crate::oplog::tail(&data, 100000);
-            let conn = store::open_ro(&app.backup_path)?;
-            let mut plan: Vec<(u64, String, crate::oplog::ReplayAction)> = Vec::new();
-            for o in ops.iter().filter(|o| o.app == app.id) {
-                let a = crate::oplog::replay_decision(&conn, &app.id, o)?;
-                plan.push((o.seq, serde_json::to_string(&o.kind).unwrap_or_default(), a));
-            }
-            drop(conn);
             if !apply {
+                let sim = std::env::temp_dir().join(format!(
+                    "rwcore-replay-sim-{}-{}.db",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                ));
+                store::retry(
+                    || {
+                        std::fs::copy(&app.backup_path, &sim)
+                            .with_context(|| "cannot stage replay sim")
+                    },
+                    "stage replay sim",
+                )?;
+                let sim_conn = store::retry(
+                    || rusqlite::Connection::open(&sim).with_context(|| "cannot open replay sim"),
+                    "open replay sim",
+                )?;
+                let rep = replay_run(&sim_conn, &app.id, &ops)?;
+                std::fs::remove_file(&sim).ok();
+                let mut kinds = std::collections::HashMap::new();
+                for o in ops.iter().filter(|o| o.app == app.id) {
+                    kinds.insert(o.seq, serde_json::to_string(&o.kind).unwrap_or_default());
+                }
                 match cli.format {
                     Format::Json => println!(
                         "{}",
                         serde_json::to_string_pretty(
-                            &plan
+                            &rep.outcomes
                                 .iter()
-                                .map(|(s, k, a)| serde_json::json!({
-                                    "seq": s, "op": k, "action": format!("{a:?}")
+                                .map(|(s, a, r)| serde_json::json!({
+                                    "seq": s,
+                                    "op": kinds.get(s).cloned().unwrap_or_default(),
+                                    "action": format!("{a} {r}").trim(),
                                 }))
                                 .collect::<Vec<_>>()
                         )?
                     ),
                     Format::Table => {
-                        for (s, k, a) in &plan {
-                            println!("{s:<6} {k:<40} {a:?}");
+                        for (s, a, r) in &rep.outcomes {
+                            println!(
+                                "{s:<6} {:<40} {a} {r}",
+                                kinds.get(s).cloned().unwrap_or_default()
+                            );
                         }
                     }
                 }
@@ -591,53 +1183,12 @@ fn main() -> Result<()> {
             }
             let mut applied = 0u64;
             let mut skipped = 0u64;
-            let mut orphaned: Vec<(crate::oplog::Op, String)> = Vec::new();
             let mut outcomes: Vec<(u64, String, String)> = Vec::new();
-            store::modify(&app, &cache, &data, false, |tx| {
-                outcomes.clear();
-                for o in ops.iter().filter(|o| o.app == app.id) {
-                    let date = chrono::DateTime::from_timestamp(o.ts, 0)
-                        .context("bad op ts")?
-                        .with_timezone(&chrono::Local)
-                        .format("%F")
-                        .to_string();
-                    match crate::oplog::replay_decision(tx, &app.id, o)? {
-                        crate::oplog::ReplayAction::ApplyAdd {
-                            id,
-                            text,
-                            transcription,
-                            tr,
-                        } => {
-                            store::readd_word(tx, id, &text, transcription.as_deref(), &tr)?;
-                            outcomes.push((o.seq, "apply-add".to_string(), String::new()));
-                        }
-                        crate::oplog::ReplayAction::ApplyGrade { id, mode } => {
-                            let ok =
-                                matches!(o.kind, crate::oplog::OpKind::Graded { ok: true, .. });
-                            store::grade_review(tx, id, mode, ok, o.ts, &date)?;
-                            outcomes.push((o.seq, "apply-grade".to_string(), String::new()));
-                        }
-                        crate::oplog::ReplayAction::ApplyTriage { id, known } => {
-                            if known {
-                                store::triage_known(tx, id, o.ts, &date)?;
-                            } else {
-                                store::enroll_word(tx, id, o.ts, &date)?;
-                            }
-                            outcomes.push((o.seq, "apply-triage".to_string(), String::new()));
-                        }
-                        crate::oplog::ReplayAction::ApplyEnroll { id } => {
-                            store::enroll_word(tx, id, o.ts, &date)?;
-                            outcomes.push((o.seq, "apply-enroll".to_string(), String::new()));
-                        }
-                        crate::oplog::ReplayAction::Orphan(reason) => {
-                            orphaned.push((o.clone(), reason.clone()));
-                            outcomes.push((o.seq, "orphan".to_string(), reason));
-                        }
-                        crate::oplog::ReplayAction::Skip(reason) => {
-                            outcomes.push((o.seq, "skip".to_string(), reason));
-                        }
-                    }
-                }
+            let mut orphaned: Vec<(crate::oplog::Op, String)> = Vec::new();
+            store::modify(&app, &cache, &data, None, |tx| {
+                let rep = replay_run(tx, &app.id, &ops)?;
+                outcomes = rep.outcomes;
+                orphaned = rep.orphaned;
                 Ok(vec![])
             })?;
             for (o, reason) in &orphaned {
@@ -652,17 +1203,18 @@ fn main() -> Result<()> {
             }
             for (seq, action, reason) in &outcomes {
                 match action.as_str() {
-                    "apply-add" | "apply-grade" | "apply-triage" | "apply-enroll" => applied += 1,
+                    "apply-add" | "apply-grade" | "apply-triage" | "apply-enroll"
+                    | "apply-select" | "apply-category" | "apply-remove" | "apply-reset"
+                    | "apply-catadmin" | "apply-postpone" | "apply-goal" => applied += 1,
                     "orphan" => {}
                     _ => skipped += 1,
                 }
                 let _ = (seq, reason);
             }
-            orphaned.len();
             match cli.format {
                 Format::Json => output::ok_json(
                     "replay applied",
-                    serde_json::json!({ "applied": applied, "skipped": skipped, "orphaned": orphaned }),
+                    serde_json::json!({ "applied": applied, "skipped": skipped, "orphaned": orphaned.len() }),
                 ),
                 Format::Table => println!(
                     "applied={applied} skipped={skipped} orphaned={}",
@@ -685,11 +1237,7 @@ fn main() -> Result<()> {
             let r = match op {
                 "grade" => {
                     let mode = parse_mode(v["mode"].as_str().unwrap_or(""))?;
-                    let ok = match v["result"].as_str().unwrap_or("") {
-                        "ok" | "remembered" | "correct" => true,
-                        "fail" | "forgotten" | "missed" => false,
-                        x => anyhow::bail!("bad result '{x}'; want ok|fail"),
-                    };
+                    let ok = parse_result(v["result"].as_str().unwrap_or(""))?;
                     let word = v["word"].as_str().context("missing .word")?;
                     do_grade(&app, &cache, &data, word, mode, ok)?
                 }
@@ -719,8 +1267,9 @@ fn main() -> Result<()> {
                     }
                     let transcription = v["transcription"].as_str();
                     let enroll = v["enroll"].as_bool().unwrap_or(false);
-                    let snap = store::modify(&app, &cache, &data, true, |tx| {
+                    let snap = store::modify(&app, &cache, &data, Some(now_local().0), |tx| {
                         let id = store::add_word(tx, word, transcription, &tr)?;
+                        let cat = store::custom_category(tx)?;
                         let mut ops = vec![OpKind::Added {
                             id: id.0,
                             text: word.to_string(),
@@ -729,6 +1278,8 @@ fn main() -> Result<()> {
                                 .iter()
                                 .map(|(l, t)| (l.code().to_string(), t.clone()))
                                 .collect(),
+                            ex: vec![],
+                            category: cat,
                         }];
                         if enroll {
                             let (ts, date) = now_local();
@@ -748,7 +1299,70 @@ fn main() -> Result<()> {
                     let word = v["word"].as_str().context("missing .word")?;
                     do_triage(&app, &cache, &data, word, false)?
                 }
-                _ => anyhow::bail!("bad .op '{op}'; want grade|triage|add|enroll"),
+                "remove" => {
+                    let word = v["word"].as_str().context("missing .word")?;
+                    do_remove(&app, &cache, &data, word)?
+                }
+                "reset" => {
+                    let word = v["word"].as_str().context("missing .word")?;
+                    match store::modify(&app, &cache, &data, Some(now_local().0), |tx| {
+                        let w = store::get_word(tx, word)?
+                            .with_context(|| format!("no word '{word}'"))?;
+                        store::reset_word(tx, w.id)?;
+                        Ok(vec![OpKind::Reset { id: w.id.0 }])
+                    }) {
+                        Ok(snap) => Receipt {
+                            applied: true,
+                            orphaned: false,
+                            snapshot: Some(snap),
+                            detail: serde_json::json!({ "word": word }),
+                        },
+                        Err(e) => {
+                            let probe = store::open_ro(&app.backup_path)?;
+                            if store::get_word(&probe, word)?.is_none() {
+                                let r =
+                                    shelve_missing(&data, &app.id, "reset on missing word", word)?;
+                                print_receipt("applied", &r, cli.format);
+                                return Ok(());
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                "postpone" => {
+                    let word = v["word"].as_str().context("missing .word")?;
+                    let (ts, _) = now_local();
+                    match store::modify(&app, &cache, &data, Some(ts), |tx| {
+                        let w = store::get_word(tx, word)?
+                            .with_context(|| format!("no word '{word}'"))?;
+                        store::postpone_word(tx, w.id, ts)?;
+                        Ok(vec![OpKind::Postponed { id: w.id.0 }])
+                    }) {
+                        Ok(snap) => Receipt {
+                            applied: true,
+                            orphaned: false,
+                            snapshot: Some(snap),
+                            detail: serde_json::json!({ "word": word }),
+                        },
+                        Err(e) => {
+                            let probe = store::open_ro(&app.backup_path)?;
+                            if store::get_word(&probe, word)?.is_none() {
+                                let r = shelve_missing(
+                                    &data,
+                                    &app.id,
+                                    "postpone on missing word",
+                                    word,
+                                )?;
+                                print_receipt("applied", &r, cli.format);
+                                return Ok(());
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                _ => anyhow::bail!(
+                    "bad .op '{op}'; want grade|triage|add|enroll|remove|reset|postpone"
+                ),
             };
             print_receipt("applied", &r, cli.format);
         }
@@ -760,25 +1374,24 @@ fn main() -> Result<()> {
                 None => discover::discover(&root)?,
             };
             let mut snaps = Vec::new();
+            let mut errors = Vec::new();
             for app in &apps {
                 match store::snapshot(app, &cache) {
                     Ok(snap) => snaps.push(serde_json::json!({ "app": app.id, "snapshot": snap })),
                     Err(e) => {
-                        if cli.format == Format::Json {
-                            output::ok_json(
-                                "snapshot partial",
-                                serde_json::json!({ "done": snaps, "error": format!("{e:#}") }),
-                            );
-                        } else {
+                        errors
+                            .push(serde_json::json!({ "app": app.id, "error": format!("{e:#}") }));
+                        if cli.format != Format::Json {
                             eprintln!("{}: failed: {e:#}", app.id);
                         }
                     }
                 }
             }
             match cli.format {
-                Format::Json => {
-                    output::ok_json("snapshot", serde_json::json!({ "snapshots": snaps }))
-                }
+                Format::Json => output::ok_json(
+                    "snapshot",
+                    serde_json::json!({ "snapshots": snaps, "errors": errors }),
+                ),
                 Format::Table => {
                     for s in &snaps {
                         println!(
