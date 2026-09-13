@@ -1,0 +1,20 @@
+# Local-only knowledge (this machine's findings, not for git)
+KNOWLEDGE.md
+
+# Rust build output
+target/
+Cargo.lock.offline
+
+# Never commit real backups or scratch copies
+*.backup
+*.db
+*.db-journal
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Local working docs, not for git
+CLI.md
+DESIGN.md
