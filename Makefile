@@ -7,7 +7,7 @@ all: build
 
 build:
 	cargo build --release --manifest-path cli/Cargo.toml
-	go build -o $(TUI) .
+	go build -o $(TUI) ./cmd/reword-tui
 	cp cli/target/release/$(RWCORE) ./$(RWCORE)
 
 test:
