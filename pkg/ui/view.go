@@ -39,7 +39,7 @@ func (m Model) View() string {
 	}
 	header := col.Render(m.viewHeader(cw) + "\n" + faint.Render(strings.Repeat("─", cw)))
 	status := col.Render(m.viewStatus(cw))
-	help := col.Render(m.viewHints(cw))
+	help := col.Render(lipgloss.PlaceHorizontal(cw, lipgloss.Center, m.viewHints(cw)))
 	statusH := 0
 	if m.viewStatus(cw) != "" {
 		statusH = lipgloss.Height(status)
