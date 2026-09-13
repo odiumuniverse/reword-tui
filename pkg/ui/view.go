@@ -435,9 +435,7 @@ func (m Model) viewBody(cw, h int) string {
 }
 
 func (m Model) viewPicker(cw, h int) string {
-	var b strings.Builder
-	b.WriteString(interactive.Render("reword") + "\n")
-	b.WriteString(dim.Render("Spaced repetition in terminal") + "\n\n")
+	head := interactive.Render("reword") + "\n" + dim.Render("Spaced repetition in terminal") + "\n\n"
 	var contents []string
 	for i, a := range m.apps {
 		marker := " "
@@ -459,8 +457,7 @@ func (m Model) viewPicker(cw, h int) string {
 		contents = append(contents, fmt.Sprintf("%s %d %s\n  %s\n  %s\n%s · %s", marker, a.N, a.ID, wdLine, dueLine, size, ts))
 	}
 	if len(contents) == 0 {
-		b.WriteString(dim.Render("no ReWord apps found"))
-		return b.String()
+		return lipgloss.PlaceHorizontal(cw, lipgloss.Center, head+dim.Render("no ReWord apps found"))
 	}
 	bw := 0
 	for _, c := range contents {
@@ -474,7 +471,9 @@ func (m Model) viewPicker(cw, h int) string {
 		if i == m.appIdx {
 			style = abox
 		}
-		blocks = append(blocks, style.Width(bw).Render(c))
+		// Width covers content + padding: add padding back so the text
+		// gets the full measured bw instead of wrapping at bw-4.
+		blocks = append(blocks, style.Width(bw+4).Render(c))
 	}
 	rowW := 0
 	for _, bl := range blocks {
@@ -494,9 +493,8 @@ func (m Model) viewPicker(cw, h int) string {
 		}
 		full = lipgloss.JoinHorizontal(lipgloss.Top, spaced...)
 	}
-	if lipgloss.Height(b.String()+full) <= h {
-		b.WriteString(full)
-		return b.String()
+	if lipgloss.Height(head+full) <= h {
+		return lipgloss.PlaceHorizontal(cw, lipgloss.Center, strings.TrimRight(head+full, "\n"))
 	}
 	// Compact: single-line title + vertical stack windowed on the cursor.
 	// A block is 4 content rows + 2 border rows.
@@ -517,7 +515,7 @@ func (m Model) viewPicker(cw, h int) string {
 		}
 		c.WriteString(blocks[i])
 	}
-	return c.String()
+	return lipgloss.PlaceHorizontal(cw, lipgloss.Center, strings.TrimRight(c.String(), "\n"))
 }
 
 func (m Model) viewLearn(cw, h int) string {
@@ -958,14 +956,19 @@ func (m Model) viewVocab(cw, h int) string {
 
 // scrollFit shows an h-row window of a tall static screen, movable with
 // the screen's scroll keys. Edge rows turn into markers when More hides.
+// The exact ceiling is stored for the key handlers so scrolling stops
+// where the content ends instead of coasting past it.
 func (m Model) scrollFit(s string, h int) string {
 	lines := strings.Split(s, "\n")
 	if len(lines) <= h || h < 1 {
+		m.scrMax[m.screen] = 0
 		return s
 	}
+	maxOff := len(lines) - h
+	m.scrMax[m.screen] = maxOff
 	off := m.scrOff[m.screen]
-	if off > len(lines)-h {
-		off = len(lines) - h
+	if off > maxOff {
+		off = maxOff
 	}
 	if off < 0 {
 		off = 0
@@ -978,6 +981,15 @@ func (m Model) scrollFit(s string, h int) string {
 		win[len(win)-1] = dim.Render("↓ more")
 	}
 	return strings.Join(win, "\n")
+}
+
+// clampScroll keeps a scroll offset inside the last rendered ceiling.
+func (m *Model) clampScroll(s screen) {
+	mx, ok := m.scrMax[s]
+	if !ok {
+		return
+	}
+	m.scrOff[s] = min(max(m.scrOff[s], 0), mx)
 }
 
 func (m Model) viewWord(cw int) string {
@@ -1393,10 +1405,21 @@ func (m Model) viewOverlay(cw, h int) string {
 		lines = append(lines, strings.Split(pinned, "\n")...)
 		out = frame.Width(max(cw-2, 10)).Render(strings.Join(lines, "\n"))
 	default:
-		// No room for a frame: bare head + pins, hard-capped.
-		lines := append(head, strings.Split(pinned, "\n")...)
+		// No room for a frame: head shrinks first, pins survive to the end.
+		keep := h - pinH
+		var lines []string
+		switch {
+		case keep-1 >= len(head):
+			lines = head
+		case keep > 1:
+			lines = append(head[:keep-1],
+				dim.Render(fmt.Sprintf("… +%d more", len(head)-keep+1)))
+		case keep == 1 && len(head) > 1:
+			lines = []string{dim.Render(fmt.Sprintf("… +%d more", len(head)))}
+		}
+		lines = append(lines, strings.Split(pinned, "\n")...)
 		if len(lines) > h {
-			lines = lines[:h]
+			lines = lines[len(lines)-h:]
 		}
 		out = strings.Join(lines, "\n")
 	}

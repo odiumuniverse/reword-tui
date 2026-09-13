@@ -125,6 +125,7 @@ func (m Model) onStats(msg statsMsg) (tea.Model, tea.Cmd) {
 	m.stats = &msg.stats
 	m.today = &msg.today
 	m.due = msg.due
+	m.scrOff[sStats] = 0
 	m.maybeOnboard()
 	if m.screen == sSession && !m.sess.started && len(m.pool) == 0 {
 		return m, m.loadPool()
@@ -255,6 +256,7 @@ func (m Model) onWord(msg wordMsg) (tea.Model, tea.Cmd) {
 	m.word = &w
 	m.wordLog = msg.log
 	m.wordEx = false
+	m.scrOff[sWord] = 0
 	m.acted = map[string]bool{}
 	m.screen = sWord
 	return m, nil
@@ -269,6 +271,7 @@ func (m Model) onSync(msg syncMsg) (tea.Model, tea.Cmd) {
 	m.syncRows = msg.rows
 	m.oplog = msg.ops
 	m.orphans = msg.orph
+	m.scrOff[sSync] = 0
 	return m, nil
 }
 
@@ -920,9 +923,10 @@ func (m Model) wordKey(k string) (tea.Model, tea.Cmd) {
 	case "J", "K":
 		if k == "J" {
 			m.scrOff[sWord]++
-		} else if m.scrOff[sWord] > 0 {
+		} else {
 			m.scrOff[sWord]--
 		}
+		m.clampScroll(sWord)
 	}
 	return m, nil
 }
@@ -931,11 +935,11 @@ func (m Model) syncKey(k string) (tea.Model, tea.Cmd) {
 	switch k {
 	case "j", "down":
 		m.scrOff[sSync]++
+		m.clampScroll(sSync)
 		return m, nil
 	case "k", "up":
-		if m.scrOff[sSync] > 0 {
-			m.scrOff[sSync]--
-		}
+		m.scrOff[sSync]--
+		m.clampScroll(sSync)
 		return m, nil
 	case "p":
 		cli, app := m.cli, m.appID
@@ -1158,10 +1162,10 @@ func (m Model) statsKey(k string) (tea.Model, tea.Cmd) {
 	switch k {
 	case "j", "down":
 		m.scrOff[sStats]++
+		m.clampScroll(sStats)
 	case "k", "up":
-		if m.scrOff[sStats] > 0 {
-			m.scrOff[sStats]--
-		}
+		m.scrOff[sStats]--
+		m.clampScroll(sStats)
 	case "g":
 		m.goalTitle = "How many new words do you want to learn per day?"
 		m.goalInput = ""

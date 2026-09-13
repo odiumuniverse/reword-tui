@@ -1020,13 +1020,20 @@ func TestScrollFit(t *testing.T) {
 	if !strings.Contains(got, "↑ more") || !strings.Contains(got, "l4") {
 		t.Fatalf("scrolled window must show tail with marker: %q", got)
 	}
+	m.scrOff[sStats] = 0
 	m = press(t, m, "j")
-	if m.scrOff[sStats] != 3 {
+	if m.scrOff[sStats] != 1 {
 		t.Fatal("j must scroll down")
 	}
 	m = press(t, m, "k")
-	if m.scrOff[sStats] != 2 {
+	if m.scrOff[sStats] != 0 {
 		t.Fatal("k must scroll up")
+	}
+	// Clamp: offset must not coast past the content end.
+	m.scrOff[sStats] = 29
+	m = press(t, m, "j")
+	if m.scrOff[sStats] != 2 {
+		t.Fatalf("j must stop at content end, got %d", m.scrOff[sStats])
 	}
 }
 
@@ -1167,5 +1174,56 @@ func TestEdgeCardAndOverlayContentAfterCrop(t *testing.T) {
 	}
 	if len(fails) > 0 {
 		t.Errorf("%d crops remove content the user must see", len(fails))
+	}
+}
+
+func TestPickerCardsEqualHeight(t *testing.T) {
+	m := testModel(t)
+	m.width, m.height = 80, 24
+	m.screen = sPicker
+	m.apps = []rwcore.App{
+		{N: 1, ID: "en", SizeBytes: 60 << 20, MtimeSecs: 1789238645},
+		{N: 2, ID: "es", SizeBytes: 19 << 20, MtimeSecs: 1789246418},
+	}
+	m.appMeta = map[string]appMeta{"en": {words: 11302, due: 68}, "es": {words: 7438, due: 181}}
+	out := m.View()
+	if !strings.Contains(out, "11302 wds") {
+		t.Error("long card text must not wrap mid-phrase")
+	}
+	if tops, bottoms := strings.Count(out, "┌"), strings.Count(out, "└"); tops != 2 || bottoms != 2 {
+		t.Fatalf("want 2 intact cards, got tops=%d bottoms=%d", tops, bottoms)
+	}
+	// Both cards must start at the same column (equal width) and the row
+	// must be centered in the 76-cell column.
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.Contains(ln, "┌") {
+			lead := len(ln) - len(strings.TrimLeft(ln, " "))
+			if lead < 1 {
+				t.Fatalf("picker row must be centered, no lead: %q", ln)
+			}
+			break
+		}
+	}
+}
+
+func TestScrollResetsOnContentLoad(t *testing.T) {
+	m := testModel(t)
+	m.scrOff[sWord] = 5
+	m.scrOff[sStats] = 5
+	m.scrOff[sSync] = 5
+	next, _ := m.onWord(wordMsg{word: rwcore.Word{Text: "w"}})
+	m = next.(Model)
+	if m.scrOff[sWord] != 0 {
+		t.Fatal("opening a word must reset its scroll")
+	}
+	next, _ = m.onStats(statsMsg{})
+	m = next.(Model)
+	if m.scrOff[sStats] != 0 {
+		t.Fatal("fresh stats must reset its scroll")
+	}
+	next, _ = m.onSync(syncMsg{})
+	m = next.(Model)
+	if m.scrOff[sSync] != 0 {
+		t.Fatal("fresh sync must reset its scroll")
 	}
 }

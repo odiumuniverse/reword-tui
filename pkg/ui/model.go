@@ -82,6 +82,7 @@ type Model struct {
 	search         string
 	searchOn       bool
 	scrOff         map[screen]int
+	scrMax         map[screen]int
 	menuIdx        int
 	sess           session
 	pool           []rwcore.Word
@@ -131,6 +132,7 @@ func New(cfg Config) Model {
 		q:       queue.Load(cfg.QueuePath),
 		poolIdx: map[string]int{},
 		scrOff:  map[screen]int{},
+		scrMax:  map[screen]int{},
 		width:   80,
 		height:  24,
 	}
