@@ -917,12 +917,26 @@ func (m Model) wordKey(k string) (tea.Model, tea.Cmd) {
 		m.pendingWord = w
 	case "e":
 		m.wordEx = !m.wordEx
+	case "J", "K":
+		if k == "J" {
+			m.scrOff[sWord]++
+		} else if m.scrOff[sWord] > 0 {
+			m.scrOff[sWord]--
+		}
 	}
 	return m, nil
 }
 
 func (m Model) syncKey(k string) (tea.Model, tea.Cmd) {
 	switch k {
+	case "j", "down":
+		m.scrOff[sSync]++
+		return m, nil
+	case "k", "up":
+		if m.scrOff[sSync] > 0 {
+			m.scrOff[sSync]--
+		}
+		return m, nil
 	case "p":
 		cli, app := m.cli, m.appID
 		m.loading = "pull"
@@ -1142,6 +1156,12 @@ func (m Model) addKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) statsKey(k string) (tea.Model, tea.Cmd) {
 	switch k {
+	case "j", "down":
+		m.scrOff[sStats]++
+	case "k", "up":
+		if m.scrOff[sStats] > 0 {
+			m.scrOff[sStats]--
+		}
 	case "g":
 		m.goalTitle = "How many new words do you want to learn per day?"
 		m.goalInput = ""

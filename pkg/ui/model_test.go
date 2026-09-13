@@ -317,7 +317,7 @@ func TestViewAllCards(t *testing.T) {
 		m.sess.cur = c
 		m.sess.typing = c.kind == cR3 && !c.done
 		m.sess.input = "te"
-		if out := m.viewCard(76, 10); out == "" {
+		if out, _ := m.viewCard(76, 10); out == "" {
 			t.Fatalf("card %d renders empty", i)
 		}
 	}
@@ -998,7 +998,174 @@ func TestFrameBoxModel(t *testing.T) {
 	}
 	m := fitModel(t)
 	m.width, m.height = 80, 24
-	if _, w := measureView(m.viewCard(76, 10)); w != 76 {
+	vc, _ := m.viewCard(76, 10)
+	if _, w := measureView(vc); w != 76 {
 		t.Fatalf("viewCard(cw=76) outer=%d, want 76", w)
+	}
+}
+
+func TestScrollFit(t *testing.T) {
+	m := testModel(t)
+	m.screen = sStats
+	s := "l0\nl1\nl2\nl3\nl4"
+	if got := m.scrollFit(s, 10); got != s {
+		t.Fatal("short content must pass through")
+	}
+	got := m.scrollFit(s, 3)
+	if !strings.Contains(got, "l0") || !strings.Contains(got, "↓ more") || strings.Contains(got, "l4") {
+		t.Fatalf("top window must show head with marker: %q", got)
+	}
+	m.scrOff[sStats] = 2
+	got = m.scrollFit(s, 3)
+	if !strings.Contains(got, "↑ more") || !strings.Contains(got, "l4") {
+		t.Fatalf("scrolled window must show tail with marker: %q", got)
+	}
+	m = press(t, m, "j")
+	if m.scrOff[sStats] != 3 {
+		t.Fatal("j must scroll down")
+	}
+	m = press(t, m, "k")
+	if m.scrOff[sStats] != 2 {
+		t.Fatal("k must scroll up")
+	}
+}
+
+func TestEdgeTinySizes(t *testing.T) {
+	var fails []string
+	for _, w := range []int{1, 5, 10, 23, 24, 25, 30} {
+		for _, h := range []int{1, 3, 9, 10, 11, 12} {
+			for _, sc := range viewportScreens {
+				m := fitModel(t)
+				m.width, m.height = w, h
+				m.screen, m.vocabMode, m.ov = sc.screen, sc.mode, sc.ov
+				n, mw := measureView(m.View())
+				if n > h || mw > w {
+					fails = append(fails, fmt.Sprintf("%-14s %2dx%-2d lines=%d width=%d", sc.name, w, h, n, mw))
+				}
+			}
+		}
+	}
+	for _, f := range fails {
+		t.Log(f)
+	}
+	if len(fails) > 0 {
+		t.Errorf("%d tiny-size combos overflow", len(fails))
+	}
+}
+
+func TestEdgeFooterSurvives(t *testing.T) {
+	var fails []string
+	for _, sc := range viewportScreens {
+		m := fitModel(t)
+		m.screen, m.vocabMode, m.ov = sc.screen, sc.mode, sc.ov
+		m.width, m.height = 80, 50
+		ls := strings.Split(m.View(), "\n")
+		want := ls[len(ls)-1]
+		for _, h := range []int{10, 11, 12, 14, 16, 24} {
+			m.height = h
+			ls := strings.Split(m.View(), "\n")
+			if got := ls[len(ls)-1]; got != want {
+				fails = append(fails, fmt.Sprintf("%-14s 80x%-2d last line %q, tall view has %q", sc.name, h, got, want))
+			}
+		}
+	}
+	for _, f := range fails {
+		t.Log(f)
+	}
+	if len(fails) > 0 {
+		t.Errorf("%d footer losses", len(fails))
+	}
+}
+
+func TestEdgeCursorVisibleAfterCrop(t *testing.T) {
+	type tc struct {
+		name  string
+		setup func(m *Model)
+	}
+	cases := []tc{
+		{"settings last row", func(m *Model) { m.screen, m.ov, m.searchOn = sSettings, oNone, false; m.setIdx = 7 }},
+		{"add enroll row", func(m *Model) { m.screen, m.ov, m.searchOn = sAdd, oNone, false; m.addIdx = 4 }},
+		{"learn mixed row", func(m *Model) { m.screen, m.ov, m.searchOn = sLearn, oNone, false; m.menuIdx = 2 }},
+		{"menu about row", func(m *Model) { m.screen, m.ov, m.searchOn = sMenu, oNone, false; m.menuIdx = 4 }},
+		{"picker 5th app", func(m *Model) {
+			m.screen, m.ov, m.searchOn = sPicker, oNone, false
+			m.apps = nil
+			for i := 1; i <= 5; i++ {
+				id := fmt.Sprintf("a%d", i)
+				m.apps = append(m.apps, rwcore.App{N: i, ID: id})
+				m.appMeta[id] = appMeta{words: 10, due: 1}
+			}
+			m.appIdx = 4
+		}},
+	}
+	var fails []string
+	for _, c := range cases {
+		for _, h := range []int{10, 11, 12, 14, 16} {
+			m := fitModel(t)
+			c.setup(&m)
+			m.width, m.height = 80, h
+			if !strings.Contains(m.View(), "▸") {
+				fails = append(fails, fmt.Sprintf("%-18s 80x%-2d cursor row cropped away", c.name, h))
+			}
+		}
+	}
+	for _, f := range fails {
+		t.Log(f)
+	}
+	if len(fails) > 0 {
+		t.Errorf("%d cases hide the selected row", len(fails))
+	}
+}
+
+func TestEdgeCardAndOverlayContentAfterCrop(t *testing.T) {
+	long := longWord()
+	choices := []string{"uno largo", "dos largo", "tres largo", "cuatro largo"}
+	var fails []string
+	for _, w := range []int{40, 80} {
+		for _, h := range []int{10, 11, 12, 14, 16} {
+			m := fitModel(t)
+			m.width, m.height = w, h
+			m.screen, m.ov, m.searchOn = sSession, oNone, false
+			c := card{kind: cR2, word: long.Text, prompt: "перевод", choices: choices, answer: 1, mode: "rep"}
+			m.sess.cur = &c
+			out := m.View()
+			for i := 1; i <= 4; i++ {
+				if !strings.Contains(out, fmt.Sprintf("%d  ", i)) {
+					fails = append(fails, fmt.Sprintf("R2 %dx%-2d choice %d cropped", w, h, i))
+				}
+			}
+			if !strings.Contains(out, "["+c.hint()+"]") {
+				fails = append(fails, fmt.Sprintf("R2 %dx%-2d in-card hint cropped", w, h))
+			}
+			if strings.Count(out, "┌") != strings.Count(out, "└") {
+				fails = append(fails, fmt.Sprintf("R2 %dx%-2d card frame cut (┌=%d └=%d)", w, h, strings.Count(out, "┌"), strings.Count(out, "└")))
+			}
+			for _, ov := range []struct {
+				name string
+				o    overlay
+				need string
+			}{
+				{"confirm", oConfirm, "[y] yes"},
+				{"quit", oQuit, "[q] quit anyway"},
+				{"goal", oGoal, "[enter] save"},
+			} {
+				m := fitModel(t)
+				m.width, m.height = w, h
+				m.screen, m.ov, m.searchOn = sLearn, ov.o, false
+				out := m.View()
+				if !strings.Contains(out, ov.need) {
+					fails = append(fails, fmt.Sprintf("%-7s %dx%-2d action line %q cropped", ov.name, w, h, ov.need))
+				}
+				if strings.Count(out, "┌") != strings.Count(out, "└") {
+					fails = append(fails, fmt.Sprintf("%-7s %dx%-2d frame cut", ov.name, w, h))
+				}
+			}
+		}
+	}
+	for _, f := range fails {
+		t.Log(f)
+	}
+	if len(fails) > 0 {
+		t.Errorf("%d crops remove content the user must see", len(fails))
 	}
 }

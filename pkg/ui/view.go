@@ -33,19 +33,24 @@ func (m Model) View() string {
 	if m.screen == sSession && m.sess.cur != nil && zenOn(m) {
 		// Width first (pads and wraps strays to cw), then height:
 		// Place pads short content but never crops tall content.
-		body := fitHeight(col.Render(strings.TrimRight(m.viewCard(cw, h-2), "\n")), h)
+		card, _ := m.viewCard(cw, h-2)
+		body := fitHeight(col.Render(strings.TrimRight(card, "\n")), h)
 		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Position(0.45), body)
 	}
 	header := col.Render(m.viewHeader(cw) + "\n" + faint.Render(strings.Repeat("─", cw)))
 	status := col.Render(m.viewStatus(cw))
 	help := col.Render(m.viewHints(cw))
-	bodyH := h - lipgloss.Height(header) - lipgloss.Height(status) - lipgloss.Height(help)
+	statusH := 0
+	if m.viewStatus(cw) != "" {
+		statusH = lipgloss.Height(status)
+	}
+	bodyH := h - lipgloss.Height(header) - statusH - lipgloss.Height(help)
 	if bodyH < 1 {
 		bodyH = 1
 	}
 	var body string
 	if m.ov != oNone {
-		body = m.viewOverlay(cw)
+		body = m.viewOverlay(cw, bodyH)
 	} else {
 		body = m.viewBody(cw, bodyH)
 	}
@@ -54,12 +59,15 @@ func (m Model) View() string {
 	// col.Render also wraps overlong lines (which changes row count).
 	body = fitHeight(col.Render(strings.TrimRight(body, "\n")), bodyH)
 	mid := lipgloss.Place(w, bodyH, lipgloss.Center, lipgloss.Position(0.45), body)
-	return lipgloss.JoinVertical(lipgloss.Left,
+	parts := []string{
 		lipgloss.PlaceHorizontal(w, lipgloss.Center, header),
 		mid,
-		lipgloss.PlaceHorizontal(w, lipgloss.Center, status),
-		lipgloss.PlaceHorizontal(w, lipgloss.Center, help),
-	)
+	}
+	if statusH > 0 {
+		parts = append(parts, lipgloss.PlaceHorizontal(w, lipgloss.Center, status))
+	}
+	parts = append(parts, lipgloss.PlaceHorizontal(w, lipgloss.Center, help))
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
 func (m Model) viewStatus(cw int) string {
@@ -87,18 +95,25 @@ type kb struct{ k, d string }
 
 func hints(cw int, bs ...kb) string {
 	sep := faint.Render(" · ")
+	more := faint.Render("? more")
+	join := func(ps []string) string { return strings.Join(ps, sep) }
 	var parts []string
 	for _, b := range bs {
 		p := interactive.Render(b.k) + " " + dim.Render(b.d)
-		if lipgloss.Width(strings.Join(append(parts, p), sep)) > cw {
+		if lipgloss.Width(join(append(parts, p))) > cw {
+			// Drop trailing hints until the "? more" marker fits too:
+			// the result must stay on one row.
+			for len(parts) > 0 && lipgloss.Width(join(parts)+sep+more) > cw {
+				parts = parts[:len(parts)-1]
+			}
 			if len(parts) == 0 {
 				return p
 			}
-			return strings.Join(parts, sep) + sep + faint.Render("? more")
+			return join(parts) + sep + more
 		}
 		parts = append(parts, p)
 	}
-	return strings.Join(parts, sep)
+	return join(parts)
 }
 
 func (m Model) viewHints(cw int) string {
@@ -127,9 +142,9 @@ func (m Model) viewHints(cw int) string {
 		}
 		return hints(cw, kb{"j/k", "move"}, kb{"space", "toggle"}, kb{"enter", "words"}, kb{"/", "search"}, kb{"a", "add"}, kb{"C", "category"}, kb{"esc", "back"}, kb{"X", "remove"}, kb{"R", "reset"}, kb{"D", "clear"})
 	case sWord:
-		return hints(cw, kb{"g", "got it"}, kb{"m", "missed it"}, kb{"r", "again"}, kb{"p", "later"}, kb{"e", "examples"}, kb{"esc", "back"}, kb{"R", "reset"}, kb{"X", "remove"})
+		return hints(cw, kb{"g", "got it"}, kb{"m", "missed it"}, kb{"r", "again"}, kb{"p", "later"}, kb{"e", "examples"}, kb{"J/K", "scroll"}, kb{"esc", "back"}, kb{"R", "reset"}, kb{"X", "remove"})
 	case sStats:
-		return hints(cw, kb{"g", "goal"}, kb{"3", "menu"}, kb{"q", "back"}, kb{"s", "sync"})
+		return hints(cw, kb{"j/k", "scroll"}, kb{"g", "goal"}, kb{"3", "menu"}, kb{"q", "back"}, kb{"s", "sync"})
 	case sMenu:
 		return hints(cw, kb{"j/k", "move"}, kb{"enter", "open"}, kb{"esc", "back"}, kb{"q", "quit"})
 	case sSettings:
@@ -139,7 +154,7 @@ func (m Model) viewHints(cw int) string {
 	case sAddCat:
 		return hints(cw, kb{"tab", "field"}, kb{"enter", "add"}, kb{"esc", "cancel"})
 	case sSync:
-		return hints(cw, kb{"p", "pull"}, kb{"w", "write"}, kb{"r", "dry-run"}, kb{"R", "apply"}, kb{"o", "orphans"}, kb{"a", "abort"}, kb{"esc", "back"}, kb{"D", "drop"})
+		return hints(cw, kb{"j/k", "scroll"}, kb{"p", "pull"}, kb{"w", "write"}, kb{"r", "dry-run"}, kb{"R", "apply"}, kb{"o", "orphans"}, kb{"a", "abort"}, kb{"esc", "back"}, kb{"D", "drop"})
 	case sAdd:
 		return hints(cw, kb{"tab", "field"}, kb{"space", "toggle"}, kb{"enter", "submit"}, kb{"esc", "cancel"})
 	}
@@ -198,6 +213,44 @@ func truncateCell(s string, w int) string {
 	return string(r) + "…"
 }
 
+// wrapLine splits s to width w. Plain text breaks on spaces first, then
+// hard-splits spaceless overflow so row counts stay exact. Styled lines
+// break on spaces only: SGR sequences contain no spaces, so a break never
+// cuts an escape sequence (a spaceless styled token is left whole).
+func wrapLine(s string, w int) []string {
+	if w < 4 {
+		w = 4
+	}
+	if lipgloss.Width(s) <= w {
+		return []string{s}
+	}
+	if strings.Contains(s, "\x1b") {
+		return wrapStyled(s, w)
+	}
+	var out []string
+	for _, ln := range wrapStyled(s, w) {
+		for lipgloss.Width(ln) > w {
+			cut := len(ln)
+			cells := 0
+			for i, r := range ln {
+				rw := lipgloss.Width(string(r))
+				if cells+rw > w {
+					cut = i
+					break
+				}
+				cells += rw
+			}
+			if cut <= 0 {
+				cut = len(ln)
+			}
+			out = append(out, ln[:cut])
+			ln = ln[cut:]
+		}
+		out = append(out, ln)
+	}
+	return out
+}
+
 // wrapStyled splits an already-styled line into lines of at most w cells,
 // breaking on spaces only. Safe for ANSI: SGR sequences contain no spaces,
 // so a break never cuts an escape sequence. Spaceless overlong words are
@@ -239,36 +292,60 @@ func wrapStyled(line string, w int) []string {
 	return out
 }
 
-// fitBox wraps every line of a box body to inner width and frames it at cw.
-// lipgloss Width covers content + padding; the border adds 2 outside.
-func fitBox(body string, w, cw int, frame lipgloss.Style) string {
-	var lines []string
-	for _, ln := range strings.Split(body, "\n") {
-		lines = append(lines, wrapStyled(ln, w)...)
-	}
-	return frame.Width(max(cw-2, 10)).Render(strings.Join(lines, "\n"))
-}
-
-func windowed(items []string, cur, h int) string {
+// windowedCursor shows a cursor list in h rows: the cursor row is never
+// replaced by a counter; markers take their own rows.
+func windowedCursor(rows []string, cur, h int) string {
+	n := len(rows)
 	if h < 1 {
 		h = 1
 	}
-	n := len(items)
-	if n == 0 {
-		return dim.Render("nothing here")
-	}
 	if n <= h {
-		return strings.Join(items, "\n")
+		return strings.Join(rows, "\n")
+	}
+	if cur < 0 {
+		cur = 0
+	}
+	if cur >= n {
+		cur = n - 1
 	}
 	from, to := window(n, cur, h)
-	seg := append([]string{}, items[from:to]...)
-	if from > 0 {
-		seg[0] = faint.Render(fmt.Sprintf("↑ %d more", from))
+	for {
+		top := boolInt(from > 0)
+		bot := boolInt(to < n)
+		if to-from+top+bot <= h {
+			break
+		}
+		if to-from <= 1 {
+			break
+		}
+		if to-1-cur >= cur-from && to > cur+1 {
+			to--
+		} else if from < cur {
+			from++
+		} else {
+			to--
+		}
 	}
+	var seg []string
+	if from > 0 {
+		seg = append(seg, faint.Render(fmt.Sprintf("↑ %d more", from)))
+	}
+	seg = append(seg, rows[from:to]...)
 	if to < n {
-		seg[len(seg)-1] = faint.Render(fmt.Sprintf("↓ %d more", n-to))
+		seg = append(seg, faint.Render(fmt.Sprintf("↓ %d more", n-to)))
+	}
+	if len(seg) > h {
+		// Degenerate height: the cursor row alone outranks markers.
+		return rows[cur]
 	}
 	return strings.Join(seg, "\n")
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func (m Model) viewHeader(cw int) string {
@@ -330,25 +407,25 @@ func (m Model) viewHeader(cw int) string {
 func (m Model) viewBody(cw, h int) string {
 	switch m.screen {
 	case sPicker:
-		return m.viewPicker(cw)
+		return m.viewPicker(cw, h)
 	case sLearn:
-		return m.viewLearn(cw)
+		return m.viewLearn(cw, h)
 	case sSession:
 		return m.viewSession(cw, h)
 	case sVocab:
 		return m.viewVocab(cw, h)
 	case sWord:
-		return m.viewWord(cw)
+		return m.scrollFit(m.viewWord(cw), h)
 	case sStats:
-		return m.viewStats(cw)
+		return m.scrollFit(m.viewStats(cw), h)
 	case sSync:
-		return m.viewSync(cw)
+		return m.scrollFit(m.viewSync(cw), h)
 	case sAdd:
-		return m.viewAdd()
+		return m.viewAdd(h)
 	case sMenu:
-		return m.viewMenu()
+		return m.viewMenu(h)
 	case sSettings:
-		return m.viewSettings()
+		return m.viewSettings(h)
 	case sImport:
 		return m.viewImport()
 	case sAddCat:
@@ -357,7 +434,7 @@ func (m Model) viewBody(cw, h int) string {
 	return ""
 }
 
-func (m Model) viewPicker(cw int) string {
+func (m Model) viewPicker(cw, h int) string {
 	var b strings.Builder
 	b.WriteString(interactive.Render("reword") + "\n")
 	b.WriteString(dim.Render("Spaced repetition in terminal") + "\n\n")
@@ -404,8 +481,9 @@ func (m Model) viewPicker(cw int) string {
 		rowW += lipgloss.Width(strings.Split(bl, "\n")[0])
 	}
 	rowW += 2 * (len(blocks) - 1)
+	var full string
 	if len(blocks) > 3 || rowW > cw {
-		b.WriteString(strings.Join(blocks, "\n"))
+		full = strings.Join(blocks, "\n")
 	} else {
 		spaced := make([]string, 0, len(blocks)*2-1)
 		for i, bl := range blocks {
@@ -414,15 +492,38 @@ func (m Model) viewPicker(cw int) string {
 			}
 			spaced = append(spaced, bl)
 		}
-		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, spaced...))
+		full = lipgloss.JoinHorizontal(lipgloss.Top, spaced...)
 	}
-	return b.String()
+	if lipgloss.Height(b.String()+full) <= h {
+		b.WriteString(full)
+		return b.String()
+	}
+	// Compact: single-line title + vertical stack windowed on the cursor.
+	// A block is 4 content rows + 2 border rows.
+	capApps := max(1, (h-1)/6)
+	title := 1
+	if title+6*capApps > h {
+		title = 0
+		capApps = max(1, h/6)
+	}
+	from, to := window(len(blocks), m.appIdx, capApps)
+	var c strings.Builder
+	if title > 0 {
+		c.WriteString(interactive.Render("reword") + "\n")
+	}
+	for i := from; i < to; i++ {
+		if i > from {
+			c.WriteString("\n")
+		}
+		c.WriteString(blocks[i])
+	}
+	return c.String()
 }
 
-func (m Model) viewLearn(cw int) string {
+func (m Model) viewLearn(cw, h int) string {
 	var b strings.Builder
 	b.WriteString(interactive.Render("reword") + "\n")
-	b.WriteString(dim.Render("Spaced repetition") + "\n\n")
+	b.WriteString(dim.Render("Spaced repetition") + "\n")
 	chosen := 0
 	names := []string{}
 	for _, c := range m.cats {
@@ -440,8 +541,8 @@ func (m Model) viewLearn(cw int) string {
 			catLine += "…"
 		}
 	}
-	b.WriteString(dim.Render(truncateCell(catLine, cw-13)) + "  [c] change\n")
-	b.WriteString(faint.Render(strings.Repeat("─", cw)) + "\n")
+	catBlock := dim.Render(truncateCell(catLine, cw-13)) + "  [c] change\n" +
+		faint.Render(strings.Repeat("─", cw)) + "\n"
 	learned := int64(0)
 	goal := ""
 	if m.today != nil {
@@ -469,7 +570,8 @@ func (m Model) viewLearn(cw int) string {
 		{"Mixed mode", "new + review interleaved", "—"},
 	}
 	badgeW := lipgloss.NewStyle().Width(8)
-	for i, r := range rows {
+	item := func(i int) []string {
+		r := rows[i]
 		var badge string
 		switch i {
 		case 0:
@@ -492,11 +594,27 @@ func (m Model) viewLearn(cw int) string {
 		} else {
 			line = fg.Render(line)
 		}
-		b.WriteString(line + "\n")
-		b.WriteString("  " + dim.Render(r.desc) + "\n")
+		return []string{line, "  " + dim.Render(r.desc)}
 	}
-	b.WriteString(faint.Render(strings.Repeat("─", cw)) + "\n")
-	b.WriteString(m.viewDots() + "\n")
+	// Budget: title(2) fixed; catline+sep(2) and dots+sep(2) join when fit.
+	// Items window around the cursor so it is never cropped away.
+	k := max(1, min(3, (h-2)/2))
+	from, to := window(len(rows), m.menuIdx, k)
+	used := 2
+	if used+2+2*(to-from) <= h {
+		b.WriteString(catBlock)
+		used += 2
+	}
+	for i := from; i < to; i++ {
+		for _, ln := range item(i) {
+			b.WriteString(ln + "\n")
+		}
+	}
+	used += 2 * (to - from)
+	if used+2 <= h {
+		b.WriteString(faint.Render(strings.Repeat("─", cw)) + "\n")
+		b.WriteString(m.viewDots() + "\n")
+	}
 	return b.String()
 }
 
@@ -527,9 +645,6 @@ func (m Model) viewSession(cw, h int) string {
 		}
 		return dim.Render("There are no words for review in the chosen categories")
 	}
-	var b strings.Builder
-	b.WriteString(m.viewModeline())
-	b.WriteString("\n")
 	total := len(m.sess.units) + m.sess.ok + m.sess.fail
 	if m.sess.mode == 1 {
 		total = len(m.sess.learn)
@@ -544,13 +659,21 @@ func (m Model) viewSession(cw, h int) string {
 		filled = done * barW / total
 	}
 	bar := prog.Render(strings.Repeat("━", filled)) + faint.Render(strings.Repeat("━", barW-filled))
-	b.WriteString(fmt.Sprintf("%s %d/%d · ✓%d ✗%d", bar, done, total, m.sess.ok, m.sess.fail))
+	barLine := fmt.Sprintf("%s %d/%d · ✓%d ✗%d", bar, done, total, m.sess.ok, m.sess.fail)
 	if len(m.q.Items) > 0 {
-		b.WriteString(dim.Render(fmt.Sprintf(" · +%d queued", len(m.q.Items))))
+		barLine += dim.Render(fmt.Sprintf(" · +%d queued", len(m.q.Items)))
 	}
-	b.WriteString("\n\n")
-	b.WriteString(m.viewCard(cw, h-4))
-	return b.String()
+	// The bar can wrap on narrow screens (queue suffix): measure, don't assume.
+	barLines := wrapLine(barLine, cw)
+	ml := m.viewModeline()
+	headH := lipgloss.Height(ml) + len(barLines)
+	card, cut := m.viewCard(cw, h-headH-1)
+	if !cut && headH+1+lipgloss.Height(card) <= h {
+		return ml + "\n" + strings.Join(barLines, "\n") + "\n\n" + card
+	}
+	// Tight screen: the card alone outranks modeline and progress bar.
+	compact, _ := m.viewCard(cw, h)
+	return compact
 }
 
 func (m Model) viewModeline() string {
@@ -586,62 +709,91 @@ func (m Model) viewModeline() string {
 	return rev + "  " + lrn + up
 }
 
-func (m Model) viewCard(cw, maxH int) string {
+// cardLine is one card body line: drop priority (higher drops first)
+// and a choice flag for the inline-choices fallback.
+type cardLine struct {
+	s      string
+	pri    int
+	choice bool
+}
+
+func countCardChoices(lines []cardLine) int {
+	n := 0
+	for _, ln := range lines {
+		if ln.choice {
+			n++
+		}
+	}
+	return n
+}
+
+func (m Model) viewCard(cw, maxH int) (string, bool) {
 	c := m.sess.cur
 	if c == nil {
-		return ""
+		return "", false
 	}
 	inner := cw - 6 // abox border + padding
 	if inner < 10 {
 		inner = 10
 	}
+	// priorities: 0 must-keep, 1 feedback, 2 title/result,
+	// 3 label/transcription/example (drop first).
+	var raw []cardLine
+	add := func(pri int, s string) { raw = append(raw, cardLine{s, pri, false}) }
+	addChoice := func(s string) { raw = append(raw, cardLine{s, 0, true}) }
 	stage := ""
 	if w, found := m.poolWord(c.word); found {
 		stage = " " + wordStage(w.Recognition.Step, w.Reproduction.Step)
 	}
-	var b strings.Builder
-	b.WriteString(dim.Render(cardTitle(c)) + stage + "\n")
-	switch c.kind {
-	case cR1:
-		b.WriteString(bold.Render(c.prompt) + "\n")
-		if c.tr != "" {
-			b.WriteString(dim.Render(c.tr) + "\n")
-		}
-		if c.reveal || c.done {
-			b.WriteString(content.Render(c.native) + "\n")
-			if c.example != "" {
-				b.WriteString(dim.Render(c.example) + "\n")
-			}
-		}
-		if c.done {
-			if c.wasOk {
-				b.WriteString(okStyle.Render("✓ Got it") + "\n")
-			} else {
-				b.WriteString(badStyle.Render("✗ Missed it") + "\n")
-			}
-		}
-	case cR2:
-		b.WriteString(dim.Render("how do you say:") + "\n")
-		b.WriteString(bold.Render(c.prompt) + "\n")
+	add(2, dim.Render(cardTitle(c))+stage)
+	choicesBlock := func() {
 		for i, ch := range c.choices {
-			line := fmt.Sprintf("  %d  %s", i+1, ch)
+			line := fmt.Sprintf("%d  %s", i+1, ch)
 			if c.done && i == c.answer {
 				line = okStyle.Render("▸ " + line)
 			} else if c.done {
 				line = dim.Render(line)
 			}
-			b.WriteString(line + "\n")
+			addChoice(line)
 		}
+	}
+	resultBlock := func(okText, badText string) {
+		if !c.done {
+			return
+		}
+		if c.wasOk {
+			add(2, okStyle.Render(okText))
+		} else {
+			add(2, badStyle.Render(badText))
+		}
+	}
+	switch c.kind {
+	case cR1:
+		add(0, bold.Render(c.prompt))
+		if c.tr != "" {
+			add(3, dim.Render(c.tr))
+		}
+		if c.reveal || c.done {
+			add(0, content.Render(c.native))
+			if c.example != "" {
+				add(3, dim.Render(c.example))
+			}
+		}
+		resultBlock("✓ Got it", "✗ Missed it")
+	case cR2:
+		add(3, dim.Render("how do you say:"))
+		add(0, bold.Render(c.prompt))
+		choicesBlock()
 		if c.done {
 			if c.wasOk {
-				b.WriteString(okStyle.Render("✓") + "\n")
+				add(2, okStyle.Render("✓"))
 			} else {
-				b.WriteString(badStyle.Render("✗ answer: "+c.choices[c.answer]) + "\n")
+				add(2, badStyle.Render("✗ answer: "+c.choices[c.answer]))
 			}
 		}
 	case cR3:
-		b.WriteString(dim.Render("type in the target language:") + "\n")
-		b.WriteString(bold.Render(c.prompt) + "\n")
+		add(3, dim.Render("type in the target language:"))
+		add(0, bold.Render(c.prompt))
 		if m.sess.typing || c.done {
 			in := m.sess.input
 			for lipgloss.Width(in) > inner-4 && len(in) > 0 {
@@ -651,56 +803,106 @@ func (m Model) viewCard(cw, maxH int) string {
 			if in != m.sess.input {
 				in = "…" + in
 			}
-			b.WriteString("› " + in + "▌\n")
+			add(0, "› "+in+"▌")
 		}
 		if !c.done {
-			b.WriteString(faint.Render(fmt.Sprintf("attempts left: %d", c.attempts)) + "\n")
+			add(1, faint.Render(fmt.Sprintf("attempts left: %d", c.attempts)))
 		} else if c.wasOk {
-			b.WriteString(okStyle.Render("✓ Got it") + "\n")
+			add(2, okStyle.Render("✓ Got it"))
 		} else {
-			b.WriteString(badStyle.Render("✗ Missed it") + "\n")
+			add(2, badStyle.Render("✗ Missed it"))
 		}
 	case cL1, cL1b:
-		b.WriteString(bold.Render(c.prompt) + "\n")
+		add(0, bold.Render(c.prompt))
 		if c.tr != "" {
-			b.WriteString(dim.Render(c.tr) + "\n")
+			add(3, dim.Render(c.tr))
 		}
 		if c.native != "" {
-			b.WriteString(c.native + "\n")
+			add(0, c.native)
 		}
 		if c.example != "" {
-			b.WriteString(dim.Render(c.example) + "\n")
+			add(3, dim.Render(c.example))
 		}
 		if c.done {
-			b.WriteString(okStyle.Render("✓ queued") + "\n")
+			add(2, okStyle.Render("✓ queued"))
 		}
 	case cL2:
-		b.WriteString(bold.Render(c.prompt) + " → choose translation\n")
-		for i, ch := range c.choices {
-			line := fmt.Sprintf("  %d  %s", i+1, ch)
-			if c.done && i == c.answer {
-				line = okStyle.Render("▸ " + line)
-			} else if c.done {
-				line = dim.Render(line)
-			}
-			b.WriteString(line + "\n")
-		}
+		add(0, bold.Render(c.prompt)+" → choose translation")
+		choicesBlock()
 		if c.done {
 			if c.wasOk {
-				b.WriteString(okStyle.Render("✓") + "\n")
+				add(2, okStyle.Render("✓"))
 			} else {
-				b.WriteString(badStyle.Render("✗ answer: "+c.choices[c.answer]) + "\n")
+				add(2, badStyle.Render("✗ answer: "+c.choices[c.answer]))
 			}
 		}
 	}
-	b.WriteString(faint.Render("[" + c.hint() + "]"))
-	var lines []string
-	for _, ln := range strings.Split(strings.TrimRight(b.String(), "\n"), "\n") {
-		lines = append(lines, wrapStyled(ln, inner)...)
+	add(1, faint.Render("["+c.hint()+"]"))
+	// Wrap, preserving priority and choice flags.
+	var lines []cardLine
+	for _, cl := range raw {
+		for _, wln := range wrapStyled(cl.s, inner) {
+			lines = append(lines, cardLine{wln, cl.pri, cl.choice})
+		}
 	}
-	cardH := min(10, max(4, maxH))
+	budget := maxH - 2 // frame border
+	if budget < 1 {
+		budget = 1
+	}
+	// Drop expendable lines (highest priority number, last first).
+	for len(lines) > budget {
+		idx, best := -1, 2
+		for i, ln := range lines {
+			if ln.pri >= best {
+				best, idx = ln.pri, i
+			}
+		}
+		if idx < 0 {
+			break
+		}
+		lines = append(lines[:idx], lines[idx+1:]...)
+	}
+	// Merge choices into one inline row as a last resort before cropping.
+	if n := countCardChoices(lines); len(lines) > budget && n > 1 {
+		var merged []cardLine
+		var acc []string
+		flush := func() {
+			if len(acc) == 0 {
+				return
+			}
+			for _, wln := range wrapStyled(strings.Join(acc, " · "), inner) {
+				merged = append(merged, cardLine{wln, 0, false})
+			}
+			acc = nil
+		}
+		for _, ln := range lines {
+			if ln.choice {
+				acc = append(acc, ln.s)
+				continue
+			}
+			flush()
+			merged = append(merged, ln)
+		}
+		flush()
+		lines = merged
+	}
+	cropped := false
+	for len(lines) > budget {
+		lines = lines[:len(lines)-1]
+		cropped = true
+	}
+	var out []string
+	for _, ln := range lines {
+		out = append(out, ln.s)
+	}
+	// Pad up to 10 content rows only when the budget allows: Height is a
+	// minimum and padding past maxH would push the frame out of view.
+	cardH := min(10, maxH-2)
+	if cardH < 1 {
+		cardH = 1
+	}
 	// lipgloss Width covers content + padding; the border adds 2 outside.
-	return abox.Width(max(cw-2, 10)).Height(cardH).Render(strings.Join(lines, "\n"))
+	return abox.Width(max(cw-2, 10)).Height(cardH).Render(strings.Join(out, "\n")), cropped
 }
 
 func (m Model) viewVocab(cw, h int) string {
@@ -725,7 +927,7 @@ func (m Model) viewVocab(cw, h int) string {
 				rows = append(rows, "  "+line)
 			}
 		}
-		b.WriteString(windowed(rows, m.wlIdx, h-2))
+		b.WriteString(windowedCursor(rows, m.wlIdx, h-2))
 		return b.String()
 	}
 	if m.obStep == 1 {
@@ -750,8 +952,32 @@ func (m Model) viewVocab(cw, h int) string {
 	if m.obStep == 1 {
 		used = 2
 	}
-	b.WriteString(windowed(rows, m.vocabIdx, h-used))
+	b.WriteString(windowedCursor(rows, m.vocabIdx, h-used))
 	return b.String()
+}
+
+// scrollFit shows an h-row window of a tall static screen, movable with
+// the screen's scroll keys. Edge rows turn into markers when More hides.
+func (m Model) scrollFit(s string, h int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) <= h || h < 1 {
+		return s
+	}
+	off := m.scrOff[m.screen]
+	if off > len(lines)-h {
+		off = len(lines) - h
+	}
+	if off < 0 {
+		off = 0
+	}
+	win := append([]string{}, lines[off:off+h]...)
+	if off > 0 {
+		win[0] = dim.Render("↑ more")
+	}
+	if off+h < len(lines) {
+		win[len(win)-1] = dim.Render("↓ more")
+	}
+	return strings.Join(win, "\n")
 }
 
 func (m Model) viewWord(cw int) string {
@@ -966,18 +1192,17 @@ func shortPath(p string, w int) string {
 	return "…" + string(r)
 }
 
-func (m Model) viewMenu() string {
+func (m Model) viewMenu(h int) string {
 	rows := []string{"Statistics", "Settings", "Import words", "Help", "About"}
-	var b strings.Builder
-	b.WriteString(bold.Render("Menu") + "\n")
+	var marked []string
 	for i, r := range rows {
 		if i == m.menuIdx {
-			b.WriteString(sel.Render("▸ "+r) + "\n")
+			marked = append(marked, sel.Render("▸ "+r))
 		} else {
-			b.WriteString("  " + r + "\n")
+			marked = append(marked, "  "+r)
 		}
 	}
-	return b.String()
+	return bold.Render("Menu") + "\n" + windowedCursor(marked, m.menuIdx, max(h-1, 1))
 }
 
 func onoff(v bool) string {
@@ -987,7 +1212,7 @@ func onoff(v bool) string {
 	return faint.Render("off")
 }
 
-func (m Model) viewSettings() string {
+func (m Model) viewSettings(h int) string {
 	goal := "Not set"
 	if m.today != nil && m.today.Goal != nil {
 		goal = fmt.Sprint(*m.today.Goal)
@@ -1004,17 +1229,16 @@ func (m Model) viewSettings() string {
 		{"Review words from", m.prefs.ReviewFrom},
 		{"Daily goal", goal + dim.Render("  [g] adjust")},
 	}
-	var b strings.Builder
-	b.WriteString(bold.Render("Settings") + "\n")
+	var marked []string
 	for i, r := range rows {
 		line := fmt.Sprintf("%s: %s", r.label, r.value)
 		if i == m.setIdx {
-			b.WriteString(sel.Render("▸ "+line) + "\n")
+			marked = append(marked, sel.Render("▸ "+line))
 		} else {
-			b.WriteString("  " + line + "\n")
+			marked = append(marked, "  "+line)
 		}
 	}
-	return b.String()
+	return bold.Render("Settings") + "\n" + windowedCursor(marked, m.setIdx, max(h-1, 1))
 }
 
 func (m Model) viewImport() string {
@@ -1054,10 +1278,9 @@ func (m Model) viewAddCat() string {
 	return b.String()
 }
 
-func (m Model) viewAdd() string {
+func (m Model) viewAdd(h int) string {
 	labels := []string{"word", "transcription", "RUS", "ENG"}
-	var b strings.Builder
-	b.WriteString(bold.Render("Add word → My words (custom)") + "\n")
+	var rows []string
 	for i, l := range labels {
 		val := ""
 		if i < len(m.addF) {
@@ -1065,9 +1288,9 @@ func (m Model) viewAdd() string {
 		}
 		if m.addIdx == i {
 			val += "▌"
-			b.WriteString(sel.Render("▸ "+l+": "+val) + "\n")
+			rows = append(rows, sel.Render("▸ "+l+": "+val))
 		} else {
-			b.WriteString(fmt.Sprintf("  %s: %s\n", dim.Render(l), val))
+			rows = append(rows, fmt.Sprintf("  %s: %s", dim.Render(l), val))
 		}
 	}
 	mark := "○"
@@ -1075,62 +1298,109 @@ func (m Model) viewAdd() string {
 		mark = okStyle.Render("◉")
 	}
 	if m.addIdx == 4 {
-		b.WriteString(sel.Render("▸ ["+mark+"] enroll immediately") + "\n")
+		rows = append(rows, sel.Render("▸ ["+mark+"] enroll immediately"))
 	} else {
-		b.WriteString(fmt.Sprintf("  [%s] enroll immediately\n", mark))
+		rows = append(rows, fmt.Sprintf("  [%s] enroll immediately", mark))
 	}
-	return b.String()
+	return bold.Render("Add word → My words (custom)") + "\n" + windowedCursor(rows, m.addIdx, max(h-1, 1))
 }
 
-func (m Model) viewOverlay(cw int) string {
+func (m Model) viewOverlay(cw, h int) string {
 	inner := cw - 6 // box border + padding
 	if inner < 10 {
 		inner = 10
 	}
+	// Each overlay is head (title + text) + pin (never dropped: input,
+	// buttons) — the middle is what shrinks on short screens.
+	var head, pin []string
+	var frame lipgloss.Style
+	wrap := func(s string) []string { return wrapLine(s, inner) }
 	switch m.ov {
 	case oQuit:
-		var b strings.Builder
-		b.WriteString(bold.Render("Quit") + "\n")
-		b.WriteString("Your phone will NOT pick up the progress by itself.\n")
-		b.WriteString("Open ReWord → Restore, or your study stays here.\n\n")
-		b.WriteString(fmt.Sprintf("Queued intents: %d (not written) · Written: %d\n\n", len(m.q.Items), m.written))
-		b.WriteString("[w] write queue + quit   [q] quit anyway   [esc] stay")
-		return fitBox(strings.TrimRight(b.String(), "\n"), inner, cw, ybox)
+		head = []string{bold.Render("Quit"),
+			"Your phone will NOT pick up the progress by itself.",
+			"Open ReWord → Restore, or your study stays here.",
+			"",
+			fmt.Sprintf("Queued intents: %d (not written) · Written: %d", len(m.q.Items), m.written),
+			""}
+		pin = []string{"[w] write queue + quit", "[q] quit anyway   [esc] stay"}
+		frame = ybox
 	case oConfirm:
-		return fitBox(bold.Render("Confirm")+"\n"+m.confirmT+"\n\n[y] yes   [n] no", inner, cw, ybox)
+		head = append([]string{bold.Render("Confirm")}, wrap(m.confirmT)...)
+		pin = []string{"[y] yes   [n] no"}
+		frame = ybox
 	case oHelp:
-		return fitBox(m.helpText(), inner, cw, abox)
+		head = wrap(m.helpText())
+		frame = abox
 	case oGoal:
+		head = []string{bold.Render(m.goalTitle)}
 		in := m.goalInput
-		for lipgloss.Width(in) > inner-4 && len(in) > 0 {
+		for lipgloss.Width(in) > inner-2 && len(in) > 0 {
 			_, size := utf8.DecodeRuneInString(in)
 			in = in[size:]
 		}
 		if in != m.goalInput {
 			in = "…" + in
 		}
-		return fitBox(bold.Render(m.goalTitle)+"\n› "+in+"▌\n\n[enter] save   [esc] cancel", inner, cw, ybox)
+		pin = []string{"› " + in + "▌", "[enter] save   [esc] cancel"}
+		frame = ybox
 	case oAbout:
-		return fitBox(m.aboutText(), inner, cw, abox)
+		head = wrap(m.aboutText())
+		frame = abox
 	case oOrphans:
-		var b strings.Builder
-		b.WriteString(bold.Render("Orphans") + "\n")
+		head = []string{bold.Render("Orphans")}
 		if len(m.orphans) == 0 {
-			b.WriteString(dim.Render("shelf empty") + "\n")
+			head = append(head, dim.Render("shelf empty"))
 		}
 		for i, o := range m.orphans {
 			q := ""
 			if o.WordQuery != nil {
 				q = *o.WordQuery
 			}
-			b.WriteString(truncateCell(fmt.Sprintf("%d  %s  %s", i+1, o.App, q), inner) + "\n")
+			head = append(head, truncateCell(fmt.Sprintf("%d  %s  %s", i+1, o.App, q), inner))
 			if i > 9 {
 				break
 			}
 		}
-		return fitBox(strings.TrimRight(b.String(), "\n"), inner, cw, abox)
+		frame = abox
+	default:
+		return ""
 	}
-	return ""
+	for i, ln := range pin {
+		pin[i] = strings.Join(wrap(ln), "\n")
+	}
+	pinned := strings.Join(pin, "\n")
+	pinH := len(strings.Split(pinned, "\n"))
+	wrapLines := func(ls []string) []string {
+		var out []string
+		for _, ln := range ls {
+			out = append(out, wrapLine(ln, inner)...)
+		}
+		return out
+	}
+	head = wrapLines(head)
+	avail := h - pinH
+	var out string
+	switch {
+	case avail-2 >= len(head):
+		// Everything fits: frame the whole thing.
+		out = frame.Width(max(cw-2, 10)).Render(strings.Join(append(head, strings.Split(pinned, "\n")...), "\n"))
+	case avail >= 4:
+		// Framed, but the head shrinks to one title block + marker.
+		keep := avail - 2 - 1 // frame + … marker
+		lines := append(head[:min(keep, len(head))],
+			dim.Render(fmt.Sprintf("… +%d more", len(head)-min(keep, len(head)))))
+		lines = append(lines, strings.Split(pinned, "\n")...)
+		out = frame.Width(max(cw-2, 10)).Render(strings.Join(lines, "\n"))
+	default:
+		// No room for a frame: bare head + pins, hard-capped.
+		lines := append(head, strings.Split(pinned, "\n")...)
+		if len(lines) > h {
+			lines = lines[:h]
+		}
+		out = strings.Join(lines, "\n")
+	}
+	return out
 }
 
 func (m Model) aboutText() string {
