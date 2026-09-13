@@ -20,39 +20,49 @@ func (m Model) View() string {
 	cw := min(max(w-4, 20), 76)
 	var b strings.Builder
 	if m.screen == sSession && m.sess.cur != nil && zenOn(m) {
-		b.WriteString(center(cw, m.viewCard()))
+		b.WriteString(m.center(w, cw, m.viewCard()))
 	} else {
-		b.WriteString(center(cw, m.viewHeader(cw)))
+		b.WriteString(m.center(w, cw, m.viewHeader(cw)))
 		b.WriteString("\n")
-		b.WriteString(center(cw, faint.Render(strings.Repeat("─", cw))))
+		b.WriteString(m.center(w, cw, faint.Render(strings.Repeat("─", cw))))
 		b.WriteString("\n")
-		b.WriteString(center(cw, m.viewBody(cw)))
+		b.WriteString(m.center(w, cw, m.viewBody(cw)))
 		b.WriteString("\n")
-		b.WriteString(center(cw, faint.Render(strings.Repeat("─", cw))))
+		b.WriteString(m.center(w, cw, faint.Render(strings.Repeat("─", cw))))
 		b.WriteString("\n")
-		b.WriteString(center(cw, m.viewFooter()))
+		b.WriteString(m.center(w, cw, m.viewFooter()))
 	}
 	out := b.String()
 	if m.ov != oNone {
-		out += "\n" + center(cw, m.viewOverlay(cw))
+		out += "\n" + m.center(w, cw, m.viewOverlay(cw))
 	}
 	if m.err != "" {
-		out += "\n" + center(cw, red.Render("! "+m.err))
+		out += "\n" + m.center(w, cw, red.Render("! "+m.err))
 	} else if m.notice != "" {
-		out += "\n" + center(cw, green.Render(m.notice))
+		out += "\n" + m.center(w, cw, green.Render(m.notice))
 	} else if m.loading != "" {
-		out += "\n" + center(cw, dim.Render("… "+m.loading))
+		out += "\n" + m.center(w, cw, dim.Render("… "+m.loading))
 	}
 	return out
 }
 
 func zenOn(m Model) bool { return m.sess.zen }
 
-func center(cw int, s string) string {
+func (m Model) center(termW, cw int, s string) string {
+	pad := (termW - cw) / 2
+	if pad < 0 {
+		pad = 0
+	}
+	prefix := strings.Repeat(" ", pad)
 	var out []string
 	for _, line := range strings.Split(s, "\n") {
-		if n := lipgloss.Width(line); n < cw {
-			line = strings.Repeat(" ", (cw-n)/2) + line
+		if !strings.ContainsRune(line, 0x1b) {
+			if r := []rune(line); len(r) > cw {
+				line = string(r[:cw-1]) + "…"
+			}
+		}
+		if lipgloss.Width(line) <= cw {
+			line = prefix + line
 		}
 		out = append(out, line)
 	}
@@ -93,11 +103,24 @@ func (m Model) viewHeader(cw int) string {
 	if len(m.q.Items) > 0 {
 		right += fmt.Sprintf(" · +%d queued", len(m.q.Items))
 	}
-	gap := cw - lipgloss.Width(left+"  "+right) - 4
+	leftFull := left + " " + dot
+	gap := cw - lipgloss.Width(leftFull) - lipgloss.Width(stale) - lipgloss.Width(right)
+	if gap < 1 && stale != "" {
+		stale = ""
+		gap = cw - lipgloss.Width(leftFull) - lipgloss.Width(right)
+	}
 	if gap < 1 {
 		gap = 1
 	}
-	return left + " " + dot + stale + strings.Repeat(" ", gap) + right
+	line := leftFull + stale + strings.Repeat(" ", gap) + right
+	for lipgloss.Width(line) > cw && len(right) > 0 {
+		right = string([]rune(right)[:len([]rune(right))-1])
+		line = leftFull + stale + strings.Repeat(" ", gap) + right
+	}
+	if lipgloss.Width(line) > cw {
+		line = left + " " + dot
+	}
+	return line
 }
 
 func (m Model) viewFooter() string {
@@ -177,8 +200,9 @@ func (m Model) viewBody(cw int) string {
 
 func (m Model) viewPicker() string {
 	var b strings.Builder
-	b.WriteString(center(76, accent.Render("reword")) + "\n")
-	b.WriteString(center(76, dim.Render("Spaced repetition in terminal")) + "\n\n")
+	b.WriteString(accent.Render("reword") + "\n")
+	b.WriteString(dim.Render("Spaced repetition in terminal") + "\n\n")
+	var blocks []string
 	for i, a := range m.apps {
 		marker := " "
 		style := box
@@ -196,16 +220,29 @@ func (m Model) viewPicker() string {
 		ts := time.Unix(int64(a.MtimeSecs), 0).Format("2 Jan")
 		size := fmt.Sprintf("%d MB", a.SizeBytes/1048576)
 		block := fmt.Sprintf("%s %d %s\n  %s\n  %s\n%s · %s", marker, a.N, a.ID, wdLine, dueLine, size, ts)
-		b.WriteString(style.Render(block) + "  ")
+		blocks = append(blocks, style.Render(block))
 	}
-	b.WriteString("\n\nh/l move · 1-9 pick · enter open")
+	if len(blocks) == 0 {
+		b.WriteString(dim.Render("no ReWord apps found"))
+	} else if len(blocks) > 3 {
+		b.WriteString(strings.Join(blocks, "\n"))
+	} else {
+		spaced := make([]string, 0, len(blocks)*2-1)
+		for i, bl := range blocks {
+			if i > 0 {
+				spaced = append(spaced, "  ")
+			}
+			spaced = append(spaced, bl)
+		}
+		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, spaced...))
+	}
 	return b.String()
 }
 
 func (m Model) viewLearn() string {
 	var b strings.Builder
-	b.WriteString(center(76, accent.Render("reword")) + "\n")
-	b.WriteString(center(76, dim.Render("Spaced repetition")) + "\n\n")
+	b.WriteString(accent.Render("reword") + "\n")
+	b.WriteString(dim.Render("Spaced repetition") + "\n\n")
 	chosen, total := 0, len(m.cats)
 	names := []string{}
 	for _, c := range m.cats {

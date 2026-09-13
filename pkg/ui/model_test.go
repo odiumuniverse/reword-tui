@@ -2,9 +2,11 @@ package ui
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"reword-tui/pkg/queue"
 	"reword-tui/pkg/rwcore"
 )
@@ -331,6 +333,56 @@ func TestQuitWriteConfirm(t *testing.T) {
 		t.Fatal("w must ask confirm first")
 	}
 }
+
+func TestLayoutFitsWidth(t *testing.T) {
+	for _, w := range []int{40, 80, 200} {
+		m := testModel(t)
+		m.width = w
+		m.screen = sPicker
+		m.apps = []rwcore.App{
+			{N: 1, ID: "en", SizeBytes: 60 << 20, MtimeSecs: 1789238645},
+			{N: 2, ID: "es", SizeBytes: 19 << 20, MtimeSecs: 1789246418},
+		}
+		m.appMeta = map[string]appMeta{"en": {words: 11302, due: 68}, "es": {words: 7438, due: 181}}
+		for _, line := range strings.Split(m.View(), "\n") {
+			if got := lipgloss.Width(line); got > w {
+				t.Fatalf("width %d: line overflows (%d): %q", w, got, line)
+			}
+		}
+		m.screen = sLearn
+		m.appID = "es"
+		m.menuIdx = 0
+		m.cats = []rwcore.Category{{ID: "custom", NameEn: strp("My words"), Words: 252}}
+		m.catSel = map[string]bool{"custom": true}
+		for _, line := range strings.Split(m.View(), "\n") {
+			if got := lipgloss.Width(line); got > w {
+				t.Fatalf("width %d learn overflows (%d): %q", w, got, line)
+			}
+		}
+	}
+}
+
+func TestLayoutCentered(t *testing.T) {
+	m := testModel(t)
+	m.width = 200
+	m.screen = sLearn
+	m.appID = "es"
+	m.menuIdx = 0
+	out := m.View()
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimLeft(line, " ")
+		if trimmed == "" || strings.HasPrefix(trimmed, "─") {
+			continue
+		}
+		lead := len(line) - len(trimmed)
+		if lead < 40 {
+			t.Fatalf("wide terminal: content not centered, lead=%d: %q", lead, line)
+		}
+		break
+	}
+}
+
+func strp(s string) *string { return &s }
 
 func TestQuitGuard(t *testing.T) {
 	m := testModel(t)
