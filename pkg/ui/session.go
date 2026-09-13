@@ -157,7 +157,7 @@ func parseExamples(raw string) []string {
 	for _, it := range decodeExamples(raw) {
 		o := stripHashes(it.O)
 		if it.T != "" {
-			out = append(out, o+" — "+it.T)
+			out = append(out, o+" — "+stripHashes(it.T))
 		} else {
 			out = append(out, o)
 		}
@@ -168,7 +168,7 @@ func parseExamples(raw string) []string {
 func parseExamplesFull(raw string) [][2]string {
 	var out [][2]string
 	for _, it := range decodeExamples(raw) {
-		out = append(out, [2]string{stripHashes(it.O), it.T})
+		out = append(out, [2]string{stripHashes(it.O), stripHashes(it.T)})
 	}
 	return out
 }

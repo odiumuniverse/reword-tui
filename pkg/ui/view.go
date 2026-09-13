@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -25,7 +27,7 @@ func (m Model) View() string {
 	cw := min(max(w-4, 20), 76)
 	col := lipgloss.NewStyle().Width(cw)
 	if m.screen == sSession && m.sess.cur != nil && zenOn(m) {
-		body := col.Render(strings.TrimRight(m.viewCard(), "\n"))
+		body := col.Render(strings.TrimRight(m.viewCard(cw, h-2), "\n"))
 		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Position(0.45), body)
 	}
 	header := col.Render(m.viewHeader(cw) + "\n" + faint.Render(strings.Repeat("─", cw)))
@@ -55,9 +57,13 @@ func (m Model) viewStatus(cw int) string {
 	var s string
 	switch {
 	case m.err != "":
-		s = bad.Render("! " + m.err)
+		s = badStyle.Render("! " + m.err)
 	case m.notice != "":
-		s = ok.Render(m.notice)
+		if m.noticeWarn {
+			s = attn.Render(m.notice)
+		} else {
+			s = fg.Render(m.notice)
+		}
 	case m.loading != "":
 		s = dim.Render("… " + m.loading)
 	default:
@@ -139,6 +145,142 @@ func window(n, cur, h int) (from, to int) {
 	return from, from + h
 }
 
+// pctBar renders a 5-cell pink mini-bar from a "12%" string, "—" when empty.
+func pctBar(pct string) string {
+	n, err := strconv.Atoi(strings.TrimSuffix(pct, "%"))
+	if err != nil || n < 0 {
+		return faint.Render("—")
+	}
+	if n > 100 {
+		n = 100
+	}
+	filled := n * 5 / 100
+	return prog.Render(strings.Repeat("▰", filled)) + faint.Render(strings.Repeat("▱", 5-filled)) + " " + pct
+}
+
+// truncateCell cuts s to w cells with an ellipsis. Width is display-based.
+func truncateCell(s string, w int) string {
+	if w < 1 {
+		w = 1
+	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	r := []rune(s)
+	for len(r) > 0 && lipgloss.Width(string(r)+"…") > w {
+		r = r[:len(r)-1]
+	}
+	return string(r) + "…"
+}
+
+// wrapCell splits plain text into lines of at most w cells, breaking on
+// spaces and hard-splitting overlong words. Wrap before styling.
+func wrapCell(s string, w int) []string {
+	if w < 4 {
+		w = 4
+	}
+	var lines []string
+	for _, para := range strings.Split(s, "\n") {
+		cur := ""
+		flush := func() {
+			if cur != "" {
+				lines = append(lines, cur)
+				cur = ""
+			}
+		}
+		for _, word := range strings.Fields(para) {
+			if cur == "" {
+				cur = word
+				continue
+			}
+			if lipgloss.Width(cur+" "+word) <= w {
+				cur += " " + word
+				continue
+			}
+			flush()
+			cur = word
+		}
+		for lipgloss.Width(cur) > w {
+			cut := splitAt(cur, w)
+			lines = append(lines, cur[:cut])
+			cur = cur[cut:]
+		}
+		flush()
+	}
+	if len(lines) == 0 {
+		return []string{""}
+	}
+	return lines
+}
+
+// wrapStyled splits an already-styled line into lines of at most w cells,
+// breaking on spaces only. Safe for ANSI: SGR sequences contain no spaces,
+// so a break never cuts an escape sequence. Spaceless overlong words are
+// left as-is (same as before, no panic).
+func wrapStyled(line string, w int) []string {
+	if w < 4 {
+		w = 4
+	}
+	if lipgloss.Width(line) <= w {
+		return []string{line}
+	}
+	var out []string
+	cur := ""
+	for _, word := range strings.Split(line, " ") {
+		cand := word
+		if cur != "" {
+			cand = cur + " " + word
+		}
+		if lipgloss.Width(cand) <= w {
+			cur = cand
+			continue
+		}
+		if cur != "" {
+			out = append(out, cur)
+			cur = ""
+		}
+		if lipgloss.Width(word) <= w {
+			cur = word
+		} else {
+			out = append(out, word)
+		}
+	}
+	if cur != "" {
+		out = append(out, cur)
+	}
+	if len(out) == 0 {
+		return []string{line}
+	}
+	return out
+}
+
+// fitBox wraps every line of a box body to inner width and frames it at cw.
+func fitBox(body string, w, cw int, frame lipgloss.Style) string {
+	var lines []string
+	for _, ln := range strings.Split(body, "\n") {
+		lines = append(lines, wrapStyled(ln, w)...)
+	}
+	return frame.Width(cw).Render(strings.Join(lines, "\n"))
+}
+
+// splitAt returns a byte index in s holding at most w cells.
+func splitAt(s string, w int) int {
+	cells := 0
+	for i, r := range s {
+		rw := lipgloss.Width(string(r))
+		if cells+rw > w {
+			if i == 0 {
+				// one wide rune: still consume it to make progress
+				_, size := utf8.DecodeRuneInString(s)
+				return size
+			}
+			return i
+		}
+		cells += rw
+	}
+	return len(s)
+}
+
 func windowed(items []string, cur, h int) string {
 	if h < 1 {
 		h = 1
@@ -171,9 +313,9 @@ func (m Model) viewHeader(cw int) string {
 		if r.App == m.appID || m.appID == "" {
 			switch r.State {
 			case "clean":
-				dot = ok.Render("●")
+				dot = okStyle.Render("●")
 			case "dirty":
-				dot = bad.Render("●")
+				dot = badStyle.Render("●")
 			default:
 				dot = attn.Render("●")
 			}
@@ -188,10 +330,14 @@ func (m Model) viewHeader(cw int) string {
 		learned = fmt.Sprint(m.today.Learned)
 	}
 	if m.stats != nil && m.stats.Settings.DailyGoal != nil {
-		goal = "/" + *m.stats.Settings.DailyGoal
+		goal = prog.Render("/" + *m.stats.Settings.DailyGoal)
 	}
 	due = len(m.due)
-	right := fmt.Sprintf("%s%s · due %d", learned, goal, due)
+	duePart := fmt.Sprintf("due %d", due)
+	if due > 0 {
+		duePart = attn.Render(duePart)
+	}
+	right := learned + goal + " · " + duePart
 	if len(m.q.Items) > 0 {
 		right += fmt.Sprintf(" · +%d queued", len(m.q.Items))
 	}
@@ -205,20 +351,10 @@ func (m Model) viewHeader(cw int) string {
 		gap = 1
 	}
 	line := leftFull + stale + strings.Repeat(" ", gap) + right
-	for lipgloss.Width(line) > cw && len(right) > 0 {
-		right = string([]rune(right)[:len([]rune(right))-1])
-		line = leftFull + stale + strings.Repeat(" ", gap) + right
-	}
+	// ansi.Truncate is width- and escape-aware, unlike rune slicing.
+	line = ansi.Truncate(line, cw, "…")
 	if lipgloss.Width(line) > cw {
 		line = left + " " + dot
-	}
-	// Colorize after truncation: styles are width-neutral, and if the
-	// line was cut the tokens below simply won't match (stays plain).
-	if due > 0 {
-		line = strings.Replace(line, fmt.Sprintf("due %d", due), attn.Render(fmt.Sprintf("due %d", due)), 1)
-	}
-	if goal != "" {
-		line = strings.Replace(line, learned+goal, learned+prog.Render(goal), 1)
 	}
 	return line
 }
@@ -230,7 +366,7 @@ func (m Model) viewBody(cw, h int) string {
 	case sLearn:
 		return m.viewLearn(cw)
 	case sSession:
-		return m.viewSession()
+		return m.viewSession(cw, h)
 	case sVocab:
 		return m.viewVocab(cw, h)
 	case sWord:
@@ -336,7 +472,7 @@ func (m Model) viewLearn(cw int) string {
 			catLine += "…"
 		}
 	}
-	b.WriteString(dim.Render(catLine) + "  [c] change\n")
+	b.WriteString(dim.Render(truncateCell(catLine, cw-13)) + "  [c] change\n")
 	b.WriteString(faint.Render(strings.Repeat("─", cw)) + "\n")
 	learned := int64(0)
 	goal := ""
@@ -382,7 +518,7 @@ func (m Model) viewLearn(cw int) string {
 		if i == m.menuIdx {
 			title = "▸ " + r.title
 		}
-		line := lipgloss.NewStyle().Width(cw-8).Render(title) + badgeW.Render(badge)
+		line := lipgloss.NewStyle().Width(cw-8).Render(truncateCell(title, cw-10)) + badgeW.Render(badge)
 		if i == m.menuIdx {
 			line = sel.Render(line)
 		} else {
@@ -413,7 +549,7 @@ func (m Model) viewDots() string {
 	return strings.Join(dots, " ── ") + dim.Render("   Current ") + prog.Render(fmt.Sprint(m.today.StreakCur)) + dim.Render(" · Best ") + prog.Render(fmt.Sprint(m.today.StreakBest))
 }
 
-func (m Model) viewSession() string {
+func (m Model) viewSession(cw, h int) string {
 	if m.loading != "" && m.sess.cur == nil {
 		return dim.Render("loading session…")
 	}
@@ -445,7 +581,7 @@ func (m Model) viewSession() string {
 		b.WriteString(dim.Render(fmt.Sprintf(" · +%d queued", len(m.q.Items))))
 	}
 	b.WriteString("\n\n")
-	b.WriteString(m.viewCard())
+	b.WriteString(m.viewCard(cw, h-4))
 	return b.String()
 }
 
@@ -457,7 +593,7 @@ func (m Model) viewModeline() string {
 	} else if m.sess.mode == 1 {
 		lrn = sel.Render(fmt.Sprintf("▸ Learning (%d)", len(m.sess.learn)))
 	} else {
-		rev = attn.Render("≋ Mixed")
+		rev = sel.Render("≋ Mixed")
 	}
 	up := ""
 	seen := map[string]bool{}
@@ -479,22 +615,24 @@ func (m Model) viewModeline() string {
 	if up != "" {
 		up = dim.Render("\nnext up") + up
 	}
-	out := rev + "  " + lrn + up
-	if c := m.sess.cur; c != nil {
-		if w, found := m.poolWord(c.word); found {
-			out += "  " + wordStage(w.Recognition.Step, w.Reproduction.Step)
-		}
-	}
-	return out
+	return rev + "  " + lrn + up
 }
 
-func (m Model) viewCard() string {
+func (m Model) viewCard(cw, maxH int) string {
 	c := m.sess.cur
 	if c == nil {
 		return ""
 	}
+	inner := cw - 6 // abox border + padding
+	if inner < 10 {
+		inner = 10
+	}
+	stage := ""
+	if w, found := m.poolWord(c.word); found {
+		stage = " " + wordStage(w.Recognition.Step, w.Reproduction.Step)
+	}
 	var b strings.Builder
-	b.WriteString(dim.Render(cardTitle(c)) + "\n")
+	b.WriteString(dim.Render(cardTitle(c)) + stage + "\n")
 	switch c.kind {
 	case cR1:
 		b.WriteString(bold.Render(c.prompt) + "\n")
@@ -509,9 +647,9 @@ func (m Model) viewCard() string {
 		}
 		if c.done {
 			if c.wasOk {
-				b.WriteString(ok.Render("✓ Got it") + "\n")
+				b.WriteString(okStyle.Render("✓ Got it") + "\n")
 			} else {
-				b.WriteString(bad.Render("✗ Missed it") + "\n")
+				b.WriteString(badStyle.Render("✗ Missed it") + "\n")
 			}
 		}
 	case cR2:
@@ -520,7 +658,7 @@ func (m Model) viewCard() string {
 		for i, ch := range c.choices {
 			line := fmt.Sprintf("  %d  %s", i+1, ch)
 			if c.done && i == c.answer {
-				line = ok.Render("▸ " + line)
+				line = okStyle.Render("▸ " + line)
 			} else if c.done {
 				line = dim.Render(line)
 			}
@@ -528,23 +666,31 @@ func (m Model) viewCard() string {
 		}
 		if c.done {
 			if c.wasOk {
-				b.WriteString(ok.Render("✓") + "\n")
+				b.WriteString(okStyle.Render("✓") + "\n")
 			} else {
-				b.WriteString(bad.Render("✗ answer: "+c.choices[c.answer]) + "\n")
+				b.WriteString(badStyle.Render("✗ answer: "+c.choices[c.answer]) + "\n")
 			}
 		}
 	case cR3:
 		b.WriteString(dim.Render("type in the target language:") + "\n")
 		b.WriteString(bold.Render(c.prompt) + "\n")
 		if m.sess.typing || c.done {
-			b.WriteString("› " + m.sess.input + "▌\n")
+			in := m.sess.input
+			for lipgloss.Width(in) > inner-4 && len(in) > 0 {
+				_, size := utf8.DecodeRuneInString(in)
+				in = in[size:]
+			}
+			if in != m.sess.input {
+				in = "…" + in
+			}
+			b.WriteString("› " + in + "▌\n")
 		}
 		if !c.done {
 			b.WriteString(faint.Render(fmt.Sprintf("attempts left: %d", c.attempts)) + "\n")
 		} else if c.wasOk {
-			b.WriteString(ok.Render("✓ Got it") + "\n")
+			b.WriteString(okStyle.Render("✓ Got it") + "\n")
 		} else {
-			b.WriteString(bad.Render("✗ Missed it") + "\n")
+			b.WriteString(badStyle.Render("✗ Missed it") + "\n")
 		}
 	case cL1, cL1b:
 		b.WriteString(bold.Render(c.prompt) + "\n")
@@ -558,14 +704,14 @@ func (m Model) viewCard() string {
 			b.WriteString(dim.Render(c.example) + "\n")
 		}
 		if c.done {
-			b.WriteString(ok.Render("✓ queued") + "\n")
+			b.WriteString(okStyle.Render("✓ queued") + "\n")
 		}
 	case cL2:
 		b.WriteString(bold.Render(c.prompt) + " → choose translation\n")
 		for i, ch := range c.choices {
 			line := fmt.Sprintf("  %d  %s", i+1, ch)
 			if c.done && i == c.answer {
-				line = ok.Render("▸ " + line)
+				line = okStyle.Render("▸ " + line)
 			} else if c.done {
 				line = dim.Render(line)
 			}
@@ -573,14 +719,19 @@ func (m Model) viewCard() string {
 		}
 		if c.done {
 			if c.wasOk {
-				b.WriteString(ok.Render("✓") + "\n")
+				b.WriteString(okStyle.Render("✓") + "\n")
 			} else {
-				b.WriteString(bad.Render("✗ answer: "+c.choices[c.answer]) + "\n")
+				b.WriteString(badStyle.Render("✗ answer: "+c.choices[c.answer]) + "\n")
 			}
 		}
 	}
 	b.WriteString(faint.Render("[" + c.hint() + "]"))
-	return abox.Height(10).Render(b.String())
+	var lines []string
+	for _, ln := range strings.Split(strings.TrimRight(b.String(), "\n"), "\n") {
+		lines = append(lines, wrapStyled(ln, inner)...)
+	}
+	cardH := min(10, max(4, maxH))
+	return abox.Width(cw).Height(cardH).Render(strings.Join(lines, "\n"))
 }
 
 func (m Model) viewVocab(cw, h int) string {
@@ -597,7 +748,8 @@ func (m Model) viewVocab(cw, h int) string {
 		b.WriteString(dim.Render(m.wordListTitle) + "\n")
 		rows := make([]string, 0, len(m.vocabWords))
 		for i, w := range m.vocabWords {
-			line := fmt.Sprintf("%s %s — %s · S%d/S%d", wordStage(w.Recognition.Step, w.Reproduction.Step), w.Text, pickNative(w, m.nativeLang()), w.Recognition.Step, w.Reproduction.Step)
+			rest := truncateCell(fmt.Sprintf("%s — %s · S%d/S%d", w.Text, pickNative(w, m.nativeLang()), w.Recognition.Step, w.Reproduction.Step), cw-4)
+			line := wordStage(w.Recognition.Step, w.Reproduction.Step) + " " + rest
 			if i == m.wlIdx {
 				rows = append(rows, sel.Render("▸ "+line))
 			} else {
@@ -614,13 +766,11 @@ func (m Model) viewVocab(cw, h int) string {
 	for i, c := range m.cats {
 		mark := faint.Render("○")
 		if m.catSel[c.ID] {
-			mark = ok.Render("●")
+			mark = okStyle.Render("●")
 		}
-		pct := m.catPct[c.ID]
-		if pct == "" {
-			pct = "—"
-		}
-		line := fmt.Sprintf("%s %s · %d · %s", mark, c.DisplayName(), c.Words, pct)
+		pct := pctBar(m.catPct[c.ID])
+		name := truncateCell(c.DisplayName(), max(cw-26, 1))
+		line := fmt.Sprintf("%s %s · %d · %s", mark, name, c.Words, pct)
 		if i == m.vocabIdx {
 			rows = append(rows, sel.Render("▸ "+line))
 		} else {
@@ -648,7 +798,7 @@ func (m Model) viewWord(cw int) string {
 	b.WriteString(bold.Render(w.Text) + dim.Render(tr) + "\n")
 	nat := m.nativeLang()
 	if v, present := w.Translations[nat]; present {
-		b.WriteString(ok.Render(firstLine(v)) + "\n")
+		b.WriteString(content.Render(firstLine(v)) + "\n")
 	}
 	for _, k := range slices.Sorted(maps.Keys(w.Translations)) {
 		if k == nat {
@@ -686,9 +836,9 @@ func (m Model) viewWord(cw int) string {
 	}
 	b.WriteString(faint.Render(strings.Repeat("─", cw)) + "\n")
 	b.WriteString(fmt.Sprintf("%s recognition (%s→%s):  S%d · E%.2f · F%d",
-		wordStage(w.Recognition.Step, w.Reproduction.Step), strings.ToUpper(m.appID), m.nativeLang(), w.Recognition.Step, w.Recognition.Easiness, w.Recognition.Fails) + "  [g]ot-it [m]issed\n")
+		stageMark(w.Recognition.Step), strings.ToUpper(m.appID), m.nativeLang(), w.Recognition.Step, w.Recognition.Easiness, w.Recognition.Fails) + "  [g]ot-it [m]issed\n")
 	b.WriteString(fmt.Sprintf("%s reproduction (%s→%s): S%d · E%.2f · F%d",
-		wordStage(w.Recognition.Step, w.Reproduction.Step), m.nativeLang(), strings.ToUpper(m.appID), w.Reproduction.Step, w.Reproduction.Easiness, w.Reproduction.Fails) + "  [1-4] quiz\n")
+		stageMark(w.Reproduction.Step), m.nativeLang(), strings.ToUpper(m.appID), w.Reproduction.Step, w.Reproduction.Easiness, w.Reproduction.Fails) + "  [1-4] quiz\n")
 	b.WriteString(faint.Render(strings.Repeat("─", cw)) + "\n")
 	b.WriteString(dim.Render("history") + "\n")
 	for _, e := range m.wordLog {
@@ -696,13 +846,17 @@ func (m Model) viewWord(cw int) string {
 		if e.Mode == 2 {
 			kind = "tested"
 		}
-		mark := bad.Render("✗")
+		mark := badStyle.Render("✗")
 		if e.Queue == 2 {
-			mark = ok.Render("✓")
+			mark = okStyle.Render("✓")
 		}
 		b.WriteString(fmt.Sprintf(" %s  %s %s · %dth review\n", e.Date, kind, mark, e.Step+1))
 	}
-	return b.String()
+	var lines []string
+	for _, ln := range strings.Split(strings.TrimRight(b.String(), "\n"), "\n") {
+		lines = append(lines, wrapStyled(ln, cw)...)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) viewStats(cw int) string {
@@ -734,7 +888,7 @@ func (m Model) viewStats(cw int) string {
 	}
 	b.WriteString(dueLeft)
 	b.WriteString(fmt.Sprintf("Already known: %d\n", known))
-	b.WriteString(fmt.Sprintf("%s Mastered: %d\n", ok.Render("✦"), mastered))
+	b.WriteString(fmt.Sprintf("%s Mastered: %d\n", okStyle.Render("✦"), mastered))
 	if goal != nil {
 		b.WriteString(dim.Render("[g] adjust daily goal") + "\n")
 	}
@@ -778,13 +932,13 @@ func (m Model) viewSync(cw int) string {
 	var b strings.Builder
 	b.WriteString(bold.Render("Sync · "+m.appID) + "\n")
 	for _, r := range m.syncRows {
-		state := ok.Render("● match (clean)")
+		state := okStyle.Render("● match (clean)")
 		if r.State == "dirty" {
-			state = bad.Render("✖ drift (DIRTY_SOURCE)")
+			state = badStyle.Render("✖ drift (DIRTY_SOURCE)")
 		} else if r.State == "untracked" {
 			state = attn.Render("? untracked")
 		}
-		b.WriteString(fmt.Sprintf("iCloud file  %s\nfingerprint  %s\n", dim.Render(shortPath(r.Backup)), state))
+		b.WriteString(fmt.Sprintf("iCloud file  %s\nfingerprint  %s\n", dim.Render(shortPath(r.Backup, cw-15)), state))
 	}
 	b.WriteString(fmt.Sprintf("op-queue     %d intents queued · oplog tail %d\n", len(m.q.Items), len(m.oplog)))
 	b.WriteString(fmt.Sprintf("orphans      %d shelved\n", len(m.orphans)))
@@ -795,12 +949,19 @@ func (m Model) viewSync(cw int) string {
 		if len(lines) > 10 {
 			lines = append(lines[:10], "…")
 		}
-		out := strings.Join(lines, "\n")
-		if len(out) > 800 {
-			out = out[:800] + "…"
+		var shown []string
+		chars := 0
+		for _, ln := range lines {
+			ln = truncateCell(ln, cw)
+			chars += len(ln)
+			if chars > 800 {
+				shown = append(shown, "…")
+				break
+			}
+			shown = append(shown, ln)
 		}
 		b.WriteString(faint.Render(strings.Repeat("─", cw)) + "\n")
-		b.WriteString(dim.Render(out) + "\n")
+		b.WriteString(dim.Render(strings.Join(shown, "\n")) + "\n")
 	}
 	if len(m.q.Items) > 0 {
 		b.WriteString(faint.Render(strings.Repeat("─", cw)) + "\n")
@@ -814,11 +975,18 @@ func (m Model) viewSync(cw int) string {
 	return b.String()
 }
 
-func shortPath(p string) string {
-	if len(p) > 55 {
-		return "…" + p[len(p)-54:]
+func shortPath(p string, w int) string {
+	if w < 8 {
+		w = 8
 	}
-	return p
+	if lipgloss.Width(p) <= w {
+		return p
+	}
+	r := []rune(p)
+	for len(r) > 0 && lipgloss.Width("…"+string(r)) > w {
+		r = r[1:]
+	}
+	return "…" + string(r)
 }
 
 func (m Model) viewMenu() string {
@@ -837,7 +1005,7 @@ func (m Model) viewMenu() string {
 
 func onoff(v bool) string {
 	if v {
-		return ok.Render("on")
+		return okStyle.Render("on")
 	}
 	return faint.Render("off")
 }
@@ -927,7 +1095,7 @@ func (m Model) viewAdd() string {
 	}
 	mark := "○"
 	if m.addEnroll {
-		mark = ok.Render("◉")
+		mark = okStyle.Render("◉")
 	}
 	if m.addIdx == 4 {
 		b.WriteString(sel.Render("▸ ["+mark+"] enroll immediately") + "\n")
@@ -938,6 +1106,10 @@ func (m Model) viewAdd() string {
 }
 
 func (m Model) viewOverlay(cw int) string {
+	inner := cw - 6 // box border + padding
+	if inner < 10 {
+		inner = 10
+	}
 	switch m.ov {
 	case oQuit:
 		var b strings.Builder
@@ -946,15 +1118,23 @@ func (m Model) viewOverlay(cw int) string {
 		b.WriteString("Open ReWord → Restore, or your study stays here.\n\n")
 		b.WriteString(fmt.Sprintf("Queued intents: %d (not written) · Written: %d\n\n", len(m.q.Items), m.written))
 		b.WriteString("[w] write queue + quit   [q] quit anyway   [esc] stay")
-		return ybox.Render(b.String())
+		return fitBox(strings.TrimRight(b.String(), "\n"), inner, cw, ybox)
 	case oConfirm:
-		return ybox.Render(bold.Render("Confirm") + "\n" + m.confirmT + "\n\n[y] yes   [n] no")
+		return fitBox(bold.Render("Confirm")+"\n"+m.confirmT+"\n\n[y] yes   [n] no", inner, cw, ybox)
 	case oHelp:
-		return abox.Render(m.helpText())
+		return fitBox(m.helpText(), inner, cw, abox)
 	case oGoal:
-		return ybox.Render(bold.Render(m.goalTitle) + "\n› " + m.goalInput + "▌\n\n[enter] save   [esc] cancel")
+		in := m.goalInput
+		for lipgloss.Width(in) > inner-4 && len(in) > 0 {
+			_, size := utf8.DecodeRuneInString(in)
+			in = in[size:]
+		}
+		if in != m.goalInput {
+			in = "…" + in
+		}
+		return fitBox(bold.Render(m.goalTitle)+"\n› "+in+"▌\n\n[enter] save   [esc] cancel", inner, cw, ybox)
 	case oAbout:
-		return abox.Render(m.aboutText())
+		return fitBox(m.aboutText(), inner, cw, abox)
 	case oOrphans:
 		var b strings.Builder
 		b.WriteString(bold.Render("Orphans") + "\n")
@@ -966,14 +1146,13 @@ func (m Model) viewOverlay(cw int) string {
 			if o.WordQuery != nil {
 				q = *o.WordQuery
 			}
-			b.WriteString(fmt.Sprintf("%d  %s  %s\n", i+1, o.App, q))
+			b.WriteString(truncateCell(fmt.Sprintf("%d  %s  %s", i+1, o.App, q), inner) + "\n")
 			if i > 9 {
 				break
 			}
 		}
-		return abox.Render(b.String())
+		return fitBox(strings.TrimRight(b.String(), "\n"), inner, cw, abox)
 	}
-	_ = cw
 	return ""
 }
 

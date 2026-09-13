@@ -2,12 +2,16 @@ package ui
 
 import (
 	"errors"
+	"io"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 	"reword-tui/pkg/queue"
 	"reword-tui/pkg/rwcore"
 )
@@ -312,7 +316,7 @@ func TestViewAllCards(t *testing.T) {
 		m.sess.cur = c
 		m.sess.typing = c.kind == cR3 && !c.done
 		m.sess.input = "te"
-		if out := m.viewCard(); out == "" {
+		if out := m.viewCard(76, 10); out == "" {
 			t.Fatalf("card %d renders empty", i)
 		}
 	}
@@ -455,6 +459,13 @@ func TestEmptyStatesNoPanic(t *testing.T) {
 	}
 	if m.wlIdx != 0 {
 		t.Fatalf("wlIdx must stay 0 on empty word list, got %d", m.wlIdx)
+	}
+}
+
+func TestParseExamplesStripsHashes(t *testing.T) {
+	got := parseExamples(`[{"o":"Como #pescado#","t":"ем #рыбу#"}]`)
+	if len(got) != 1 || strings.Contains(got[0], "#") {
+		t.Fatalf("hashes must go: %v", got)
 	}
 }
 
@@ -666,5 +677,184 @@ func TestPullClearsDirtyError(t *testing.T) {
 	m = next.(Model)
 	if m.err != "" {
 		t.Errorf("stale error still shown after successful pull + clean sync: %q", m.err)
+	}
+}
+
+var sgrRe = regexp.MustCompile("\x1b\\[([0-9;]+)m")
+
+func sgrIndexes(s string) []string {
+	var out []string
+	for _, m := range sgrRe.FindAllStringSubmatch(s, -1) {
+		for _, p := range strings.Split(m[1], ";") {
+			n, err := strconv.Atoi(p)
+			if err != nil {
+				continue
+			}
+			switch {
+			case n >= 30 && n <= 37:
+				out = append(out, strconv.Itoa(n-30))
+			case n >= 90 && n <= 97:
+				out = append(out, strconv.Itoa(n-90+8))
+			}
+		}
+	}
+	return out
+}
+
+func withProfile(p termenv.Profile, fn func()) {
+	defer lipgloss.SetColorProfile(lipgloss.ColorProfile())
+	lipgloss.SetColorProfile(p)
+	fn()
+}
+
+func TestRoleANSIDegradation(t *testing.T) {
+	withProfile(termenv.ANSI, func() {
+		for _, r := range roleStyles {
+			got := sgrIndexes(r.style.Render("x"))
+			if len(got) != 1 || got[0] != r.want {
+				t.Errorf("role %s degrades to %v, want ANSI %s", r.name, got, r.want)
+			}
+		}
+	})
+}
+
+func TestElementRoles(t *testing.T) {
+	withProfile(termenv.TrueColor, func() {
+		m := testModel(t)
+		m.screen = sWord
+		m.word = &rwcore.Word{Text: "w", Translations: map[string]string{"RUS": "родной"}}
+		out := m.View()
+		if !strings.Contains(out, content.Render("родной")) {
+			t.Error("native translation must use the content role")
+		}
+		if strings.Contains(out, okStyle.Render("родной")) {
+			t.Error("native translation must not use the ok role")
+		}
+
+		m = testModel(t)
+		m.screen = sLearn
+		m.setNotice("queue empty", false)
+		out = m.View()
+		if !strings.Contains(out, fg.Render("queue empty")) {
+			t.Error("info notice must be neutral")
+		}
+		if strings.Contains(out, attn.Render("queue empty")) {
+			t.Error("info notice must not warn")
+		}
+		m.setNotice("You have 2 attempts.", true)
+		if out = m.View(); !strings.Contains(out, attn.Render("You have 2 attempts.")) {
+			t.Error("attempts notice must use the warning role")
+		}
+	})
+}
+
+func TestNoColorContract(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	o := termenv.NewOutput(io.Discard)
+	if got := o.EnvColorProfile(); got != termenv.Ascii {
+		t.Fatalf("NO_COLOR=1 must degrade to Ascii, got %d", got)
+	}
+}
+
+func longWord() rwcore.Word {
+	return rwcore.Word{
+		ID:   7,
+		Text: "supercalifragilisticexpialidociousness",
+		Translations: map[string]string{
+			"RUS": "очень длинный перевод который точно не влезет в узкую колонку терминала",
+			"ENG": "a very long translation that will not fit a narrow terminal column",
+		},
+		Examples: map[string]string{
+			"RUS": `[{"o":"A very long example sentence that keeps going and going","t":"Очень длинный #пример# который всё продолжается"}]`,
+		},
+		Recognition:  rwcore.ModeState{Level: 4, Step: 4},
+		Reproduction: rwcore.ModeState{Level: 2, Step: 2},
+	}
+}
+
+func fitModel(t *testing.T) Model {
+	t.Helper()
+	m := testModel(t)
+	m.appID = "es"
+	g := int64(30)
+	m.today = &rwcore.Today{Learned: 10, Goal: &g, StreakCur: 2, StreakBest: 6, ActiveDates: []string{"2026-09-13"}}
+	m.stats = &rwcore.Stats{Settings: rwcore.Settings{DailyGoal: strp("30"), NativeLanguage: strp("RUS")}}
+	m.due = []rwcore.DueItem{{Word: "x", Modes: []int64{1}, OverdueSecs: 100}}
+	m.cats = []rwcore.Category{{ID: "custom", NameEn: strp("My words"), Words: 5}, {ID: "averylongcategorynamewithoutanyspacesinit", Words: 3}}
+	m.catSel = map[string]bool{"custom": true}
+	m.catPct = map[string]string{"custom": "12%"}
+	m.pool = []rwcore.Word{longWord()}
+	m.poolIdx = map[string]int{longWord().Text: 0}
+	m.vocabWords = []rwcore.Word{longWord()}
+	m.word = &rwcore.Word{Text: longWord().Text, Translations: longWord().Translations, Examples: longWord().Examples,
+		Recognition: longWord().Recognition, Reproduction: longWord().Reproduction}
+	m.wordLog = []rwcore.LogEntry{{Date: "2026-09-13", Mode: 1, Queue: 2}}
+	m.apps = []rwcore.App{{N: 1, ID: "es"}}
+	m.appMeta = map[string]appMeta{"es": {words: 100, due: 5}}
+	m.syncRows = []rwcore.StatusRow{{App: "es", State: "dirty"}}
+	m.replayPlan = "a very long replay plan line that should be truncated to fit the column width on narrow screens"
+	m.q.Items = []queue.Intent{{Op: "grade", Word: "w", Mode: "rec", Result: "ok"}}
+	m.orphans = []rwcore.OrphanEntry{{App: "es"}}
+	m.sess = session{mode: 2, learn: []rwcore.Word{longWord()}, lpos: 1, started: true}
+	m.sess.cur = m.learnCard(longWord())
+	m.confirmT = "Remove 'averylongcategorynamewithoutanyspacesinit' with all of its 99999 words?"
+	m.goalInput = "123456789012345678901234567890"
+	m.impF = []string{"averylongfilenamewithoutanyspaces.csv", "cat"}
+	m.addF = []string{"supercalifragilisticexpialidociousness", "[tr]", "RUS-translation", "ENG-translation"}
+	m.search = "supercalifragilistic"
+	m.searchOn = true
+	return m
+}
+
+func TestLayoutFitsEverywhere(t *testing.T) {
+	screens := []struct {
+		name   string
+		screen screen
+		mode   int
+		ov     overlay
+		typing bool
+	}{
+		{"picker", sPicker, 0, oNone, false},
+		{"learn", sLearn, 0, oNone, false},
+		{"session", sSession, 0, oNone, false},
+		{"session-typing", sSession, 0, oNone, true},
+		{"vocab-cats", sVocab, 0, oNone, false},
+		{"vocab-words", sVocab, 1, oNone, false},
+		{"word", sWord, 0, oNone, false},
+		{"stats", sStats, 0, oNone, false},
+		{"sync", sSync, 0, oNone, false},
+		{"menu", sMenu, 0, oNone, false},
+		{"settings", sSettings, 0, oNone, false},
+		{"import", sImport, 0, oNone, false},
+		{"add", sAdd, 0, oNone, false},
+		{"addcat", sAddCat, 0, oNone, false},
+		{"ov-quit", sLearn, 0, oQuit, false},
+		{"ov-confirm", sVocab, 0, oConfirm, false},
+		{"ov-help", sSession, 0, oHelp, false},
+		{"ov-goal", sLearn, 0, oGoal, false},
+		{"ov-about", sLearn, 0, oAbout, false},
+		{"ov-orphans", sSync, 0, oOrphans, false},
+	}
+	for _, w := range []int{40, 60, 80, 120, 200} {
+		for _, h := range []int{12, 24, 50} {
+			for _, sc := range screens {
+				m := fitModel(t)
+				m.width, m.height = w, h
+				m.screen, m.vocabMode, m.ov = sc.screen, sc.mode, sc.ov
+				if sc.typing && m.sess.cur != nil {
+					m.sess.typing = true
+					m.sess.input = "supercalifragilisticexpialidocious input typing"
+				}
+				out := m.View()
+				if out == "" {
+					t.Fatalf("%s %dx%d renders empty", sc.name, w, h)
+				}
+				for _, line := range strings.Split(out, "\n") {
+					if got := lipgloss.Width(line); got > w {
+						t.Fatalf("%s %dx%d overflows (%d): %q", sc.name, w, h, got, line)
+					}
+				}
+			}
+		}
 	}
 }

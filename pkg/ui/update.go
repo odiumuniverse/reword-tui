@@ -60,7 +60,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.loading = ""
 		if msg.err == nil && msg.out == "pulled" {
-			m.notice = "pulled"
+			m.setNotice("pulled", false)
 			m.err = ""
 			m.loading = "sync"
 			return m, m.loadSync()
@@ -82,7 +82,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err.Error()
 			return m, nil
 		}
-		m.notice = "The words have been successfully imported"
+		m.setNotice("The words have been successfully imported", false)
 		m.screen = sVocab
 		return m, m.loadCats()
 	case pickerMetaMsg:
@@ -197,7 +197,7 @@ func (m *Model) maybeOnboard() {
 		m.obStep = 1
 		m.screen = sVocab
 		m.vocabMode = 0
-		m.notice = "Choose some categories to start learning"
+		m.setNotice("Choose some categories to start learning", false)
 		return
 	}
 	if _, ok := m.knownGoal(); !ok {
@@ -296,10 +296,10 @@ func (m Model) onWrite(msg writeMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	if msg.orphaned > 0 {
-		m.notice = fmt.Sprintf("written %d · orphaned %d", msg.written, msg.orphaned)
+		m.setNotice(fmt.Sprintf("written %d · orphaned %d", msg.written, msg.orphaned), false)
 		return m, m.loadSync()
 	}
-	m.notice = fmt.Sprintf("written %d", msg.written)
+	m.setNotice(fmt.Sprintf("written %d", msg.written), false)
 	return m, tea.Batch(m.loadMain(), m.loadSync())
 }
 
@@ -382,7 +382,7 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) refresh() (tea.Model, tea.Cmd) {
-	m.err, m.notice = "", ""
+	m.err, m.notice, m.noticeWarn = "", "", false
 	switch m.screen {
 	case sLearn, sStats:
 		m.loading = "load"
@@ -713,7 +713,7 @@ func (m Model) typeKey(k string) (tea.Model, tea.Cmd) {
 				s.typing = false
 				m.gradeCurrent(false)
 			} else {
-				m.notice = fmt.Sprintf("You have %d attempts.", c.attempts)
+				m.setNotice(fmt.Sprintf("You have %d attempts.", c.attempts), true)
 			}
 		}
 	default:
@@ -882,7 +882,7 @@ func (m Model) wordKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "g", "m", "t", "r", "p":
 		if m.acted[act] {
-			m.notice = "already queued for this word"
+			m.setNotice("already queued for this word", false)
 			return m, nil
 		}
 		m.acted[act] = true
@@ -895,10 +895,10 @@ func (m Model) wordKey(k string) (tea.Model, tea.Cmd) {
 			m.enqueue(queue.Intent{Op: "triage", Word: w, Decision: "learn"})
 		case "r":
 			m.enqueue(queue.Intent{Op: "enroll", Word: w})
-			m.notice = "Memorize this word again: queued"
+			m.setNotice("Memorize this word again: queued", false)
 		case "p":
 			m.enqueue(queue.Intent{Op: "postpone", Word: w})
-			m.notice = "Show this word later: queued"
+			m.setNotice("Show this word later: queued", false)
 		}
 	case "k":
 		m.ov = oConfirm
@@ -936,7 +936,7 @@ func (m Model) syncKey(k string) (tea.Model, tea.Cmd) {
 		}
 	case "w":
 		if len(m.q.Items) == 0 {
-			m.notice = "queue empty"
+			m.setNotice("queue empty", false)
 			return m, nil
 		}
 		dirty := slices.ContainsFunc(m.syncRows, func(r rwcore.StatusRow) bool {
@@ -966,12 +966,12 @@ func (m Model) syncKey(k string) (tea.Model, tea.Cmd) {
 	case "a":
 		_ = m.q.Clear()
 		m.q = queue.Load(m.cfg.QueuePath)
-		m.notice = "queue aborted"
+		m.setNotice("queue aborted", false)
 	case "o":
 		m.ov = oOrphans
 	case "D":
 		if len(m.orphans) == 0 {
-			m.notice = "shelf empty"
+			m.setNotice("shelf empty", false)
 			return m, nil
 		}
 		m.ov = oConfirm
@@ -1043,7 +1043,7 @@ func (m Model) overlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case "drop-orphans":
 				m.orphans = nil
 				_ = os.Remove(orphanPath(m.cfg.DataDir))
-				m.notice = "orphan shelf discarded"
+				m.setNotice("orphan shelf discarded", false)
 			case "replay":
 				cli, app := m.cli, m.appID
 				m.loading = "replay"

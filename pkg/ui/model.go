@@ -104,6 +104,7 @@ type Model struct {
 	written        int
 	err            string
 	notice         string
+	noticeWarn     bool
 	loading        string
 	width          int
 	height         int
@@ -339,7 +340,11 @@ func (m *Model) enqueue(it queue.Intent) {
 		m.err = err.Error()
 		return
 	}
-	m.notice = "queued: " + it.Label()
+	m.setNotice("queued: "+it.Label(), false)
+}
+
+func (m *Model) setNotice(s string, warn bool) {
+	m.notice, m.noticeWarn = s, warn
 }
 
 func overdueStr(s int64) string {
