@@ -255,12 +255,13 @@ func wrapStyled(line string, w int) []string {
 }
 
 // fitBox wraps every line of a box body to inner width and frames it at cw.
+// lipgloss Width is content-box: padding + border add 6 on top.
 func fitBox(body string, w, cw int, frame lipgloss.Style) string {
 	var lines []string
 	for _, ln := range strings.Split(body, "\n") {
 		lines = append(lines, wrapStyled(ln, w)...)
 	}
-	return frame.Width(cw).Render(strings.Join(lines, "\n"))
+	return frame.Width(max(cw-6, 10)).Render(strings.Join(lines, "\n"))
 }
 
 // splitAt returns a byte index in s holding at most w cells.
@@ -731,7 +732,8 @@ func (m Model) viewCard(cw, maxH int) string {
 		lines = append(lines, wrapStyled(ln, inner)...)
 	}
 	cardH := min(10, max(4, maxH))
-	return abox.Width(cw).Height(cardH).Render(strings.Join(lines, "\n"))
+	// lipgloss Width is content-box: padding + border add 6 on top.
+	return abox.Width(max(cw-6, 10)).Height(cardH).Render(strings.Join(lines, "\n"))
 }
 
 func (m Model) viewVocab(cw, h int) string {
