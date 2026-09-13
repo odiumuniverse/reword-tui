@@ -324,6 +324,11 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.sessionKey(msg.String())
 	}
 	k := msg.String()
+	if m.screen == sPicker {
+		// The picker owns every key: global 1/2/3 must select apps,
+		// not jump to Learn/Vocab/Menu with no app chosen.
+		return m.pickerKey(k)
+	}
 	switch k {
 	case "q", "ctrl+c":
 		m.ov = oQuit
@@ -348,6 +353,9 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.menuIdx = 0
 		return m, nil
 	case "s":
+		if m.appID == "" {
+			return m, nil
+		}
 		m.screen = sSync
 		m.loading = "sync"
 		return m, m.loadSync()
@@ -401,6 +409,14 @@ func (m Model) refresh() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) pickerKey(k string) (tea.Model, tea.Cmd) {
+	switch k {
+	case "q", "ctrl+c":
+		m.ov = oQuit
+		return m, nil
+	case "?":
+		m.ov = oHelp
+		return m, nil
+	}
 	if len(m.apps) == 0 {
 		if k == "esc" {
 			return m, tea.Quit

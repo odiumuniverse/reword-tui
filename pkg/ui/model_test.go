@@ -1227,3 +1227,36 @@ func TestScrollResetsOnContentLoad(t *testing.T) {
 		t.Fatal("fresh sync must reset its scroll")
 	}
 }
+
+func TestPickerDigitsSelectApp(t *testing.T) {
+	mk := func(t *testing.T) Model {
+		m := testModel(t)
+		m.appID = ""
+		m.screen = sPicker
+		m.apps = []rwcore.App{{N: 1, ID: "en"}, {N: 2, ID: "es"}, {N: 3, ID: "fr"}}
+		return m
+	}
+	// 1/2/3 on the picker must select the app, not jump to Learn/Vocab/Menu.
+	for _, tc := range []struct {
+		key string
+		id  string
+	}{
+		{"1", "en"},
+		{"2", "es"},
+		{"3", "fr"},
+	} {
+		m := press(t, mk(t), tc.key)
+		if m.appID != tc.id || m.screen != sLearn {
+			t.Fatalf("picker %q: appID=%q screen=%v, want %q sLearn", tc.key, m.appID, m.screen, tc.id)
+		}
+	}
+	// q and ? keep working on the picker.
+	m := press(t, mk(t), "q")
+	if m.ov != oQuit {
+		t.Fatal("q on picker must open the quit guard")
+	}
+	m = press(t, mk(t), "?")
+	if m.ov != oHelp {
+		t.Fatal("? on picker must open help")
+	}
+}
