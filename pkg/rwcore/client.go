@@ -14,6 +14,16 @@ type Client struct {
 	IcloudRoot string
 	CacheDir   string
 	DataDir    string
+	// DB is a working copy of the app's backup: reads come from it and
+	// Apply writes straight into it. Empty means the backup in iCloud.
+	DB string
+}
+
+// Remote is the client for the app's backup in iCloud itself, for writes,
+// sync and anything that must not read the working copy.
+func (c Client) Remote() Client {
+	c.DB = ""
+	return c
 }
 
 func (c Client) baseArgs(app string) []string {
@@ -26,6 +36,9 @@ func (c Client) baseArgs(app string) []string {
 	}
 	if c.DataDir != "" {
 		a = append(a, "--data-dir", c.DataDir)
+	}
+	if c.DB != "" {
+		a = append(a, "--db", c.DB)
 	}
 	a = append(a, "--format", "json")
 	if app != "" {
@@ -294,6 +307,64 @@ func (c Client) Goal(app string, set *int64) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+// Work copies the app's backup to out as a fresh working copy.
+func (c Client) Work(app, out string) error {
+	_, err := c.Remote().run(app, "", "work", "--out", out)
+	return err
+}
+
+// Next deals the next card of a session — smart, review or new — the way
+// the phone deals it, keeping exclude (the card just answered) out.
+func (c Client) Next(app, session string, exclude int64) (Deal, error) {
+	args := []string{"next", "--session", session}
+	if exclude != 0 {
+		args = append(args, "--exclude", strconv.FormatInt(exclude, 10))
+	}
+	b, err := c.run(app, "", args...)
+	if err != nil {
+		return Deal{}, err
+	}
+	return decode[Deal](b)
+}
+
+// Check grades a typed answer to one side ("rec" or "rep") of a word the way
+// the phone's keyboard block does.
+func (c Client) Check(app string, word int64, side, typed string) (Check, error) {
+	// "=" keeps an answer that starts with a dash from reading as a flag.
+	b, err := c.run(app, "", "check", "--word", strconv.FormatInt(word, 10), "--side", side, "--typed="+typed)
+	if err != nil {
+		return Check{}, err
+	}
+	return decode[Check](b)
+}
+
+// Settings reads the settings the phone shares through the backup.
+func (c Client) Settings(app string) (Synced, error) {
+	b, err := c.run(app, "", "settings")
+	if err != nil {
+		return Synced{}, err
+	}
+	return decode[Synced](b)
+}
+
+// Card deals one word's card again with the choose-from-4 it showed, as the
+// phone does after an undo. side is 1 for recognition, 2 for reproduction.
+func (c Client) Card(app string, word, side int64, variants []int64) (Deal, error) {
+	args := []string{"card", "--word", strconv.FormatInt(word, 10), "--side", strconv.FormatInt(side, 10)}
+	if len(variants) > 0 {
+		ids := make([]string, len(variants))
+		for i, v := range variants {
+			ids[i] = strconv.FormatInt(v, 10)
+		}
+		args = append(args, "--variants", strings.Join(ids, ","))
+	}
+	b, err := c.run(app, "", args...)
+	if err != nil {
+		return Deal{}, err
+	}
+	return decode[Deal](b)
 }
 
 func IsDirty(err error) bool {

@@ -8,7 +8,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"reword-tui/pkg/queue"
@@ -29,7 +28,7 @@ func orphanPath(dataDir string) string {
 
 func (m Model) Init() tea.Cmd {
 	if m.appID != "" {
-		return tea.Batch(m.loadMain(), m.loadCats())
+		return m.loadWork()
 	}
 	return m.loadApps()
 }
@@ -69,19 +68,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case writeMsg:
 		return m.onWrite(msg)
-	case autoNextMsg:
-		if m.screen == sSession && m.sess.seq == msg.seq && m.sess.cur != nil && m.sess.cur.done {
-			m.advance()
-		}
-		return m, nil
+	case dealMsg:
+		return m.onDeal(msg)
+	case checkMsg:
+		return m.onCheck(msg)
+	case syncedMsg:
+		return m.onSynced(msg)
+	case workMsg:
+		return m.onWork(msg)
 	case selectAllMsg:
 		if msg.err != nil {
 			m.err = msg.err.Error()
 			m.screen = sLearn
 			return m, nil
 		}
-		m.pool = nil
-		return m, tea.Batch(m.loadMain(), m.loadCats())
+		return m, m.loadWork()
 	case importMsg:
 		m.loading = ""
 		if msg.err != nil {
@@ -111,9 +112,7 @@ func (m Model) onApps(msg appsMsg) (tea.Model, tea.Cmd) {
 		m.appIdx = max(len(m.apps)-1, 0)
 	}
 	if len(m.apps) == 1 {
-		m.appID = m.apps[0].ID
-		m.screen = sLearn
-		return m, tea.Batch(m.loadMain(), m.loadCats())
+		return m.openApp(m.apps[0].ID)
 	}
 	m.screen = sPicker
 	cmds := make([]tea.Cmd, 0, len(m.apps))
@@ -134,9 +133,6 @@ func (m Model) onStats(msg statsMsg) (tea.Model, tea.Cmd) {
 	m.due = msg.due
 	m.scrOff[sStats] = 0
 	m.maybeOnboard()
-	if m.screen == sSession && !m.sess.started && len(m.pool) == 0 {
-		return m, m.loadPool()
-	}
 	return m, nil
 }
 
@@ -231,18 +227,6 @@ func (m Model) onWords(msg wordsMsg) (tea.Model, tea.Cmd) {
 		m.err = msg.err.Error()
 		return m, nil
 	}
-	if msg.key == "pool" {
-		m.pool = msg.words
-		m.poolIdx = make(map[int64]int, len(msg.words))
-		for i, w := range msg.words {
-			m.poolIdx[w.ID] = i
-		}
-		m.menuIdx = 0
-		m.buildLearnQueue()
-		m.buildReview()
-		m.advance()
-		return m, nil
-	}
 	m.vocabWords = msg.words
 	if m.wlIdx >= len(m.vocabWords) {
 		m.wlIdx = max(len(m.vocabWords)-1, 0)
@@ -308,7 +292,8 @@ func (m Model) onWrite(msg writeMsg) (tea.Model, tea.Cmd) {
 		return m, m.loadSync()
 	}
 	m.setNotice(fmt.Sprintf("written %d", msg.written), false)
-	return m, tea.Batch(m.loadMain(), m.loadSync())
+	// With the queue drained the working copy starts over from the backup.
+	return m, tea.Batch(m.loadWork(), m.loadSync())
 }
 
 func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -443,9 +428,7 @@ func (m Model) pickerKey(k string) (tea.Model, tea.Cmd) {
 	if n, err := strconv.Atoi(k); err == nil {
 		if i := slices.IndexFunc(m.apps, func(a rwcore.App) bool { return a.N == n }); i >= 0 {
 			m.appIdx = i
-			m.appID = m.apps[i].ID
-			m.screen = sLearn
-			return m, tea.Batch(m.loadMain(), m.loadCats())
+			return m.openApp(m.apps[i].ID)
 		}
 		return m, nil
 	}
@@ -456,9 +439,7 @@ func (m Model) pickerKey(k string) (tea.Model, tea.Cmd) {
 		m.appIdx = min(m.appIdx+1, len(m.apps)-1)
 	case "enter":
 		if m.appIdx < len(m.apps) {
-			m.appID = m.apps[m.appIdx].ID
-			m.screen = sLearn
-			return m, tea.Batch(m.loadMain(), m.loadCats())
+			return m.openApp(m.apps[m.appIdx].ID)
 		}
 	case "esc":
 		return m, tea.Quit
@@ -484,66 +465,6 @@ func (m Model) learnKey(k string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) startSession(mode int) (tea.Model, tea.Cmd) {
-	m.sess = session{mode: mode}
-	m.screen = sSession
-	m.notice, m.noticeWarn = "", false
-	if m.prefs.ReviewFrom == "all" {
-		m.ov = oConfirm
-		m.confirmT = "review from all categories? (selects all)"
-		m.pending = "selectall"
-		m.loading = ""
-		return m, nil
-	}
-	m.loading = "session"
-	return m, m.loadPool()
-}
-
-func (m Model) loadPool() tea.Cmd {
-	cli, app := m.cli, m.appID
-	cats := m.chosenCats()
-	return func() tea.Msg {
-		if cats == nil {
-			pool, err := cli.Words(app, "", "", 20000)
-			if err != nil {
-				return wordsMsg{key: "pool", err: err}
-			}
-			return wordsMsg{key: "pool", words: pool}
-		}
-		var pool []rwcore.Word
-		seen := map[int64]bool{}
-		for _, c := range cats {
-			words, err := cli.Words(app, "", c, 20000)
-			if err != nil {
-				return wordsMsg{key: "pool", err: err}
-			}
-			for _, w := range words {
-				if !seen[w.ID] {
-					seen[w.ID] = true
-					pool = append(pool, w)
-				}
-			}
-		}
-		return wordsMsg{key: "pool", words: pool}
-	}
-}
-
-// chosenCats lists the categories a session draws its words from. It reads
-// the local selection, since toggles only reach the backup on the next
-// write. nil means the whole app: categories unknown or review-from-all.
-func (m Model) chosenCats() []string {
-	if m.prefs.ReviewFrom == "all" || len(m.cats) == 0 {
-		return nil
-	}
-	cats := []string{}
-	for _, c := range m.cats {
-		if m.catSel[c.ID] {
-			cats = append(cats, c.ID)
-		}
-	}
-	return cats
-}
-
 // wordRef names a word for rwcore: its id when known, since texts repeat
 // across categories, else the text.
 func wordRef(id int64, text string) string {
@@ -553,87 +474,65 @@ func wordRef(id int64, text string) string {
 	return text
 }
 
-func (m Model) switchMode(mode int) (tea.Model, tea.Cmd) {
-	if mode == m.sess.mode {
-		return m, nil
+// pickKey reads a choose-from-4 key: 1-4, or h j k l in the same order.
+func pickKey(k string) int {
+	if i := slices.Index([]string{"h", "j", "k", "l"}, k); i >= 0 {
+		return i + 1
 	}
-	m.putBack()
-	m.sess.mode = mode
-	m.advance()
-	return m, nil
-}
-
-// putBack returns an unanswered current card to the queue it came from, so
-// switching modes never drops or double-counts a word.
-func (m *Model) putBack() {
-	c := m.sess.cur
-	m.sess.cur = nil
-	if c == nil || c.done {
-		return
+	if n, err := strconv.Atoi(k); err == nil && n >= 1 && n <= 4 {
+		return n
 	}
-	if c.fromLearn {
-		m.sess.lpos = max(m.sess.lpos-1, 0)
-		return
-	}
-	if c.unit.word != "" {
-		m.sess.units = append([]reviewUnit{c.unit}, m.sess.units...)
-	}
-}
-
-// autoNext moves a review session on by itself once the answer has been
-// shown; learning always waits for the user.
-func (m *Model) autoNext() tea.Cmd {
-	c := m.sess.cur
-	if m.sess.mode != modeReview || c == nil || !c.done {
-		return nil
-	}
-	delay := 700 * time.Millisecond
-	if !c.wasOk {
-		delay = 1500 * time.Millisecond
-	}
-	seq := m.sess.seq
-	return tea.Tick(delay, func(time.Time) tea.Msg { return autoNextMsg{seq: seq} })
-}
-
-func (m *Model) advance() {
-	m.sess.seq++
-	m.sess.cur = m.nextCard()
-	m.sess.started = true
-	m.sess.typing = false
-	m.sess.input = ""
-	if m.sess.cur != nil && m.sess.cur.kind == cR3 && !m.sess.cur.done {
-		m.sess.typing = true
-	}
+	return 0
 }
 
 func (m Model) sessionKey(k string) (tea.Model, tea.Cmd) {
+	s := &m.sess
 	if k == "tab" {
 		next := modeReview
-		if m.sess.mode == modeReview {
+		if s.mode == modeReview {
 			next = modeLearn
 		}
 		return m.switchMode(next)
 	}
-	s := &m.sess
 	if s.cur == nil {
-		m.advance()
-		if m.sess.cur == nil {
-			switch k {
-			case "esc":
-				m.screen = sLearn
-				return m, m.loadMain()
-			case "q", "ctrl+c":
-				m.ov = oQuit
+		switch k {
+		case "esc":
+			m.screen = sLearn
+			return m, m.loadMain()
+		case "q", "ctrl+c":
+			m.ov = oQuit
+		case "u":
+			return m.undo()
+		case "c":
+			if m.goalScreen() {
+				// "Continue · add more new words", as the phone's dialog.
+				m.numFor = "raise"
+				m.goalTitle = "Add more new words for today"
+				m.goalInput = strconv.FormatInt(day(s.day).raiseStart(), 10)
+				m.ov = oGoal
 			}
-			return m, nil
+		case "r":
+			if m.goalScreen() {
+				return m.switchMode(modeReview)
+			}
+			if !s.dealing {
+				s.dealing = true
+				return m, m.deal(0)
+			}
 		}
-		s = &m.sess
+		return m, nil
 	}
 	if s.typing {
 		return m.typeKey(k)
 	}
+	c := s.cur
+	// Arrows answer at once, like a swipe, whenever the card offers one.
 	if k == "left" || k == "right" {
-		k = s.cur.swipeKey(k == "left")
+		if _, _, ok := c.swipe(); ok {
+			// With inverted swipes the positive answer sits on →.
+			return m.answer((k == "left") != m.prefs.InvertedSwipes)
+		}
+		return m, nil
 	}
 	switch k {
 	case "q", "ctrl+c":
@@ -646,148 +545,71 @@ func (m Model) sessionKey(k string) (tea.Model, tea.Cmd) {
 		m.screen = sSync
 		m.loading = "sync"
 		return m, m.loadSync()
-	case "r":
-		return m, m.loadMain()
-	}
-	c := s.cur
-	if c.done {
-		switch k {
-		case "enter", " ":
-			m.advance()
-		case "e":
-			m.wordReturn = sSession
-			return m, m.loadWord(wordRef(c.wordID, c.word))
-		case "esc":
-			m.screen = sLearn
-			return m, m.loadMain()
-		}
+	case "e":
+		m.wordReturn = sSession
+		return m, m.loadWord(wordRef(c.wordID, c.word))
+	case "z":
+		s.zen = !s.zen
 		return m, nil
+	case "u":
+		return m.undo()
 	}
-	switch c.kind {
-	case cR1:
-		switch k {
-		case " ":
-			c.reveal = true
-		case "g", "m":
-			m.gradeCurrent(k == "g")
-			if m.sess.mode == modeReview {
-				m.advance()
-			}
-		case "e":
-			m.wordReturn = sSession
-			return m, m.loadWord(wordRef(c.wordID, c.word))
-		case "z":
-			s.zen = !s.zen
-		case "esc":
-			m.screen = sLearn
-			return m, m.loadMain()
-		case "1":
-			return m.switchMode(modeReview)
-		case "2":
-			return m.switchMode(modeLearn)
-		}
-	case cR2, cL2:
-		if n, err := strconv.Atoi(k); err == nil && n >= 1 && n <= len(c.choices) {
-			if c.kind == cR2 {
-				m.gradeCurrent(n-1 == c.answer)
-				return m, m.autoNext()
-			}
-			c.done, c.wasOk = true, n-1 == c.answer
-			if c.wasOk {
-				s.ok++
-			} else {
-				s.fail++
+	// An open choose block takes 1-4 or hjkl once — the pick is final, and
+	// those keys never fall through to the card's own letters; esc goes
+	// back to the blocks until something is picked.
+	if c.pane == paneChoose {
+		if n := pickKey(k); n > 0 {
+			if c.pick == 0 && n <= len(c.choices) {
+				c.pick, c.reveal = n, true
 			}
 			return m, nil
 		}
-		switch k {
-		case "e":
-			m.wordReturn = sSession
-			return m, m.loadWord(wordRef(c.wordID, c.word))
-		case "z":
-			s.zen = !s.zen
-		case "esc":
-			m.screen = sLearn
-			return m, m.loadMain()
-		case "1":
-			return m.switchMode(modeReview)
-		case "2":
-			return m.switchMode(modeLearn)
-		}
-	case cR3:
-		switch k {
-		case "e":
-			m.wordReturn = sSession
-			return m, m.loadWord(wordRef(c.wordID, c.word))
-		case "z":
-			s.zen = !s.zen
-		case "esc":
-			m.screen = sLearn
-			return m, m.loadMain()
-		default:
-			if isRuneKey(k) || k == "backspace" || k == "enter" || k == " " {
-				s.typing = true
-				return m.typeKey(k)
+		if c.pick == 0 {
+			if k == "esc" {
+				c.pane = paneNone
 			}
-		}
-	case cL1:
-		switch k {
-		case " ":
-			c.reveal = true
-		case "k":
-			m.enqueue(queue.Intent{Op: "triage", Word: c.word, ID: c.wordID, Decision: "known"})
-			c.done, c.wasOk, c.verdict = true, true, "already known"
-		case "l":
-			m.enqueue(queue.Intent{Op: "triage", Word: c.word, ID: c.wordID, Decision: "learn"})
-			c.done, c.wasOk, c.verdict = true, true, "learning started"
-		case "e":
-			m.wordReturn = sSession
-			return m, m.loadWord(wordRef(c.wordID, c.word))
-		case "esc":
-			m.screen = sLearn
-			return m, m.loadMain()
-		}
-	case cL1b:
-		switch k {
-		case "k":
-			m.enqueue(queue.Intent{Op: "triage", Word: c.word, ID: c.wordID, Decision: "known"})
-			c.done, c.wasOk, c.verdict = true, true, "already known"
-		case "l":
-			m.enqueue(queue.Intent{Op: "triage", Word: c.word, ID: c.wordID, Decision: "learn"})
-			nc := *c
-			nc.kind = cL2
-			if w, ok := m.poolWord(c.wordID); ok {
-				if choices, ans, ok := m.makeChoices(w); ok {
-					nc.choices, nc.answer = choices, ans
-					m.sess.cur = &nc
-					return m, nil
-				}
-			} else if w, err := m.cli.Show(m.appID, wordRef(c.wordID, c.word)); err == nil {
-				if choices, ans, ok := m.makeChoices(w); ok {
-					nc.choices, nc.answer = choices, ans
-					m.sess.cur = &nc
-					return m, nil
-				}
-			}
-			c.done, c.wasOk, c.verdict = true, true, "memorized"
-		case " ", "enter":
-			if k == " " && !c.reveal {
-				c.reveal = true
-			} else {
-				c.done, c.wasOk, c.verdict = true, true, "keep showing"
-			}
-		case "keep":
-			c.done, c.wasOk, c.verdict = true, true, "keep showing"
-		case "e":
-			m.wordReturn = sSession
-			return m, m.loadWord(wordRef(c.wordID, c.word))
-		case "esc":
-			m.screen = sLearn
-			return m, m.loadMain()
+			return m, nil
 		}
 	}
-	if k == "enter" && c.done {
-		m.advance()
+	if c.pane == paneNone && !c.reveal {
+		switch {
+		case k == "i" && c.keyboard:
+			c.pane, s.typing = paneType, true
+			return m, nil
+		case k == "c" && len(c.choices) > 0:
+			c.pane = paneChoose
+			return m, nil
+		}
+	}
+	// Letters name the answers too: g/m got it or missed it, k/l a new
+	// word's already known or start learning, l a learning word memorized.
+	var left, right string
+	switch c.kind {
+	case cR1:
+		left, right = "g", "m"
+	case cL1:
+		left, right = "k", "l"
+	case cL1b:
+		left = "l"
+	}
+	if _, _, ok := c.swipe(); ok && k != "" {
+		switch k {
+		case left:
+			return m.answer(true)
+		case right:
+			return m.answer(false)
+		}
+	}
+	switch k {
+	case " ":
+		c.reveal = true
+	case "esc":
+		m.screen = sLearn
+		return m, m.loadMain()
+	case "1":
+		return m.switchMode(modeReview)
+	case "2":
+		return m.switchMode(modeLearn)
 	}
 	return m, nil
 }
@@ -809,8 +631,11 @@ func (m Model) typeKey(k string) (tea.Model, tea.Cmd) {
 	c := s.cur
 	switch k {
 	case "esc":
+		// Back to the three blocks; the card is still open.
 		s.typing = false
 		s.input = ""
+		c.pane = paneNone
+		m.setNotice("", false)
 		return m, nil
 	case "backspace":
 		s.input = chop(s.input)
@@ -819,42 +644,22 @@ func (m Model) typeKey(k string) (tea.Model, tea.Cmd) {
 			s.input += " "
 			return m, nil
 		}
-		got := normalizeAnswer(s.input)
-		ok := slices.ContainsFunc(c.expected, func(e string) bool {
-			return got == normalizeAnswer(e)
-		})
-		if ok {
-			s.typing = false
-			s.input = ""
-			m.gradeCurrent(true)
-			return m, m.autoNext()
+		// rwcore grades it; a resolved answer opens the card and the swipe
+		// grades the word, as on the phone.
+		if s.checking {
+			return m, nil
 		}
-		c.attempts--
-		s.input = ""
-		if c.attempts <= 0 {
-			s.typing = false
-			m.gradeCurrent(false)
-			return m, m.autoNext()
-		}
-		m.setNotice(fmt.Sprintf("You have %d attempts.", c.attempts), true)
+		s.checking = true
+		return m, m.check(c, s.input)
+	case "ctrl+c":
+		m.ov = oQuit
 	default:
-		switch {
-		case isRuneKey(k):
+		// Cursor and other special keys have nothing to do in a one-line answer.
+		if isRuneKey(k) {
 			s.input += k
-		case k == "left", k == "right", k == "up", k == "down":
-			// A one-line answer has nothing for cursor keys to move.
-		default:
-			s.typing = false
 		}
 	}
 	return m, nil
-}
-
-func pickNativeOf(m Model, word string) string {
-	if i := slices.IndexFunc(m.pool, func(w rwcore.Word) bool { return w.Text == word }); i >= 0 {
-		return pickNative(m.pool[i], m.nativeLang())
-	}
-	return word
 }
 
 func (m Model) vocabKey(k string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1006,7 +811,7 @@ func (m Model) wordKey(k string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "g", "m", "t", "r", "p":
 		if m.acted[act] {
-			m.setNotice("already queued for this word", false)
+			m.setNotice("already done for this word", false)
 			return m, nil
 		}
 		m.acted[act] = true
@@ -1019,10 +824,10 @@ func (m Model) wordKey(k string) (tea.Model, tea.Cmd) {
 			m.enqueue(queue.Intent{Op: "triage", Word: w, ID: m.word.ID, Decision: "learn"})
 		case "r":
 			m.enqueue(queue.Intent{Op: "enroll", Word: w, ID: m.word.ID})
-			m.setNotice("Memorize this word again: queued", false)
+			m.setNotice("Memorize this word again: done", false)
 		case "p":
 			m.enqueue(queue.Intent{Op: "postpone", Word: w, ID: m.word.ID})
-			m.setNotice("Show this word later: queued", false)
+			m.setNotice("Show this word later: done", false)
 		}
 	case "k":
 		m.ov = oConfirm
@@ -1104,7 +909,7 @@ func (m Model) syncKey(k string) (tea.Model, tea.Cmd) {
 		m.pending = "replay"
 	case "a":
 		_ = m.q.Clear()
-		m.q = queue.Load(m.cfg.QueuePath)
+		m.q = queue.Load(m.appQueuePath())
 		m.setNotice("queue aborted", false)
 	case "o":
 		m.ov = oOrphans
@@ -1160,7 +965,8 @@ func (m Model) overlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case "triage-known":
 				m.enqueue(queue.Intent{Op: "triage", Word: word, ID: pid, Decision: "known"})
 				if m.screen == sSession {
-					m.advance()
+					m.sess.cur, m.sess.dealing = nil, true
+					return m, m.deal(pid)
 				}
 			case "word-remove":
 				m.enqueue(queue.Intent{Op: "remove", Word: word, ID: pid})
@@ -1334,17 +1140,15 @@ func (m Model) menuKey(k string) (tea.Model, tea.Cmd) {
 
 func (m Model) settingsKey(k string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	_ = msg
-	rows := 8
 	switch k {
 	case "j", "down":
-		m.setIdx = min(m.setIdx+1, rows-1)
+		m.setIdx = min(m.setIdx+1, len(settingRows)-1)
 		return m, nil
 	case "k", "up":
 		m.setIdx = max(m.setIdx-1, 0)
 		return m, nil
 	case " ", "enter":
-		m.toggleSetting()
-		return m, nil
+		return m.changeSetting()
 	case "g":
 		m.goalTitle = "How many new words do you want to learn per day?"
 		m.goalInput = ""
@@ -1356,45 +1160,6 @@ func (m Model) settingsKey(k string, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, nil
-}
-
-func (m *Model) toggleSetting() {
-	switch m.setIdx {
-	case 0:
-		m.prefs.ShowTranscription = !m.prefs.ShowTranscription
-	case 1:
-		m.prefs.NewFirst = cycleLang(m.prefs.NewFirst)
-	case 2:
-		m.prefs.ReviewFirst = cycleLang(m.prefs.ReviewFirst)
-	case 3:
-		m.prefs.Guess = !m.prefs.Guess
-	case 4:
-		m.prefs.Keyboard = !m.prefs.Keyboard
-	case 5:
-		m.prefs.RevealAtOnce = !m.prefs.RevealAtOnce
-	case 6:
-		if m.prefs.ReviewFrom == "chosen" {
-			m.prefs.ReviewFrom = "all"
-		} else {
-			m.prefs.ReviewFrom = "chosen"
-		}
-	case 7:
-		return
-	}
-	if err := m.prefs.Save(); err != nil {
-		m.err = err.Error()
-	}
-}
-
-func cycleLang(v string) string {
-	switch v {
-	case "target":
-		return "native"
-	case "native":
-		return "random"
-	default:
-		return "target"
-	}
 }
 
 func (m Model) importKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1492,6 +1257,7 @@ func (m Model) goalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.ov = oNone
 		m.goalInput = ""
+		m.numFor = ""
 		if m.obStep == 2 {
 			m.finishOnboarding()
 			m.screen = sLearn
@@ -1510,24 +1276,47 @@ func (m Model) goalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) submitGoal() (tea.Model, tea.Cmd) {
+	if m.numFor == "mastered" {
+		// The phone's picker takes 1 to 999 days.
+		d, err := strconv.ParseInt(m.goalInput, 10, 64)
+		if err != nil || d < 1 || d > 999 {
+			m.err = "the interval is 1 to 999 days"
+			return m, nil
+		}
+		m.numFor, m.ov, m.goalInput = "", oNone, ""
+		return m.setSynced(masteredKey, strconv.FormatInt(d, 10))
+	}
+	if m.numFor == "raise" {
+		// The phone's dialog keeps the raised goal above what is learned.
+		n, err := strconv.ParseInt(m.goalInput, 10, 64)
+		if lo := day(m.sess.day).raiseMin(); err != nil || n < lo || n > 999 {
+			m.err = fmt.Sprintf("add %d to 999 words", lo)
+			return m, nil
+		}
+		m.numFor, m.ov, m.goalInput = "", oNone, ""
+		m.enqueue(queue.Intent{Op: "raise_goal", By: n})
+		m.sess.dealing = true
+		return m, m.deal(0)
+	}
 	g, _ := strconv.ParseInt(m.goalInput, 10, 64)
 	if g <= 0 {
 		m.err = "goal must be a positive number"
 		return m, nil
 	}
-	cli, app := m.cli, m.appID
 	m.ov = oNone
 	m.goalInput = ""
-	m.loading = "goal"
 	if m.obStep == 2 {
 		m.finishOnboarding()
 	}
-	return m, func() tea.Msg {
-		if _, err := cli.Goal(app, &g); err != nil {
-			return statsMsg{err: err}
-		}
-		return m.loadMain()()
+	// Like the phone's settings: today's goal and the setting for the days
+	// to come, queued for iCloud and taken by the working copy at once.
+	m.enqueue(queue.Intent{Op: "goal", Goal: g})
+	if m.synced != nil {
+		s := *m.synced
+		s.DailyGoal = &g
+		m.synced = &s
 	}
+	return m, m.loadMain()
 }
 
 func (m Model) submitAdd() (tea.Model, tea.Cmd) {

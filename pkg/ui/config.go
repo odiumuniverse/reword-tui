@@ -6,28 +6,20 @@ import (
 	"path/filepath"
 )
 
+// Prefs are this computer's own settings. The learning settings live in
+// the backup's SETTINGS and are shared with the phone (rwcore.Synced).
 type Prefs struct {
-	NewFirst          string `json:"new_first"`
-	ReviewFirst       string `json:"review_first"`
-	Guess             bool   `json:"guess"`
-	Keyboard          bool   `json:"keyboard"`
-	ShowTranscription bool   `json:"show_transcription"`
-	RevealAtOnce      bool   `json:"reveal_at_once"`
-	ReviewFrom        string `json:"review_from"`
-	Onboarded         bool   `json:"onboarded"`
+	RevealAtOnce bool `json:"reveal_at_once"`
+	// InvertedSwipes puts the positive answer on → and the negative on ←,
+	// like the phone's setting of the same name, which it keeps per device.
+	InvertedSwipes bool `json:"inverted_swipes"`
+	Onboarded      bool `json:"onboarded"`
+	// ShowTranscription mirrors the synced show_transcription setting.
+	ShowTranscription bool `json:"-"`
 }
 
 func DefaultPrefs() Prefs {
-	return Prefs{
-		NewFirst:          "target",
-		ReviewFirst:       "target",
-		Guess:             true,
-		Keyboard:          true,
-		ShowTranscription: true,
-		RevealAtOnce:      false,
-		ReviewFrom:        "chosen",
-		Onboarded:         false,
-	}
+	return Prefs{ShowTranscription: true}
 }
 
 func prefsPath() string {
@@ -53,25 +45,10 @@ func LoadPrefs() Prefs {
 			json.Unmarshal(b, dst)
 		}
 	}
-	q := DefaultPrefs()
-	get("new_first", &q.NewFirst)
-	get("review_first", &q.ReviewFirst)
-	get("guess", &q.Guess)
-	get("keyboard", &q.Keyboard)
-	get("show_transcription", &q.ShowTranscription)
-	get("reveal_at_once", &q.RevealAtOnce)
-	get("review_from", &q.ReviewFrom)
-	get("onboarded", &q.Onboarded)
-	if q.NewFirst == "" {
-		q.NewFirst = p.NewFirst
-	}
-	if q.ReviewFirst == "" {
-		q.ReviewFirst = p.ReviewFirst
-	}
-	if q.ReviewFrom == "" {
-		q.ReviewFrom = p.ReviewFrom
-	}
-	return q
+	get("reveal_at_once", &p.RevealAtOnce)
+	get("inverted_swipes", &p.InvertedSwipes)
+	get("onboarded", &p.Onboarded)
+	return p
 }
 
 func (p Prefs) Save() error {

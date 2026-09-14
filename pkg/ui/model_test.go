@@ -6,9 +6,11 @@ import (
 	"io"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -26,6 +28,7 @@ func testModel(t *testing.T) Model {
 	cfg := Config{QueuePath: filepath.Join(dir, "q.jsonl")}
 	m := New(cfg)
 	m.appID = "es"
+	m.q = queue.Load(m.appQueuePath())
 	return m
 }
 
@@ -63,6 +66,14 @@ func press(t *testing.T, m Model, k string) Model {
 	return next.(Model)
 }
 
+// graded answers the pending typed check the way rwcore would.
+func graded(t *testing.T, m Model, verdict string) Model {
+	t.Helper()
+	c := m.sess.cur
+	next, _ := m.Update(checkMsg{wordID: c.wordID, mode: c.mode, res: rwcore.Check{Verdict: verdict, Accepted: verdict != "wrong"}})
+	return next.(Model)
+}
+
 func TestOverdueStr(t *testing.T) {
 	cases := map[int64]string{45: "45s", 120: "2m", 7200: "2h", 90000: "25h", 200000: "2d"}
 	for in, want := range cases {
@@ -83,57 +94,78 @@ func TestParseExamples(t *testing.T) {
 	}
 }
 
-func TestR1Flow(t *testing.T) {
-	m := testModel(t)
+// dealt puts a card on screen the way a deal from rwcore lands.
+func dealt(t *testing.T, m Model, rc rwcore.Card) Model {
+	t.Helper()
 	m.screen = sSession
-	m.sess.cur = &card{kind: cR1, word: "el pan", mode: "rec", prompt: "el pan"}
+	next, _ := m.onDeal(dealMsg{mode: m.sess.mode, deal: rwcore.Deal{
+		Card: &rc,
+		Day:  rwcore.Day{Due: 3, Learning: 2},
+		Now:  1000,
+	}})
+	return next.(Model)
+}
+
+// rcard is a card rwcore could deal: side 1 asks for the translation and
+// 2 for the word; status 0 new, 1 learning, 2 review.
+func rcard(id int64, text, rus string, side, status int64) rwcore.Card {
+	lvl := rwcore.ModeState{Level: status}
+	return rwcore.Card{
+		Word: rwcore.Word{ID: id, Text: text, Translations: map[string]string{"RUS": rus},
+			Recognition: lvl, Reproduction: lvl},
+		Side:   side,
+		Status: status,
+		Queue:  status,
+	}
+}
+
+// answered is the swipe the session queued last.
+func answered(t *testing.T, m Model) queue.Intent {
+	t.Helper()
+	if len(m.q.Items) == 0 {
+		t.Fatal("no answer queued")
+	}
+	return m.q.Items[len(m.q.Items)-1]
+}
+
+func TestR1Flow(t *testing.T) {
+	m := dealt(t, testModel(t), rcard(1, "el pan", "хлеб", 1, 2))
 	m = press(t, m, " ")
 	if !m.sess.cur.reveal {
 		t.Fatal("space must reveal")
 	}
-	m = press(t, m, "g")
-	if len(m.q.Items) != 1 {
-		t.Fatalf("want 1 queued, got %d", len(m.q.Items))
-	}
-	it := m.q.Items[0]
-	if it.Op != "grade" || it.Mode != "rec" || it.Result != "ok" {
-		t.Fatalf("bad intent: %+v", it)
+	next, cmd := m.Update(key("g"))
+	m = next.(Model)
+	it := answered(t, m)
+	if it.Op != "answer" || it.Mode != "rec" || !it.Positive || it.ID != 1 || it.TS == 0 {
+		t.Fatalf("got it must queue the left answer on the card's side: %+v", it)
 	}
 	if m.sess.ok != 1 {
 		t.Fatal("got it must count as correct")
 	}
-	if m.sess.cur != nil {
-		t.Fatal("review must move on to the next card by itself")
+	if m.sess.cur != nil || !m.sess.dealing || cmd == nil {
+		t.Fatal("an answer must ask rwcore for the next card")
 	}
 }
 
 func TestR1Missed(t *testing.T) {
-	m := testModel(t)
-	m.screen = sSession
-	m.sess.cur = &card{kind: cR1, word: "el pan", mode: "rec"}
+	m := dealt(t, testModel(t), rcard(1, "el pan", "хлеб", 2, 2))
 	m = press(t, m, "m")
-	if m.q.Items[0].Result != "fail" || m.sess.fail != 1 {
-		t.Fatal("missed must queue fail")
+	if it := answered(t, m); it.Positive || it.Mode != "rep" || m.sess.fail != 1 {
+		t.Fatalf("missed it must queue the right answer: %+v", it)
 	}
 }
 
-func TestL1LearnQueues(t *testing.T) {
+func TestNewWordAnswers(t *testing.T) {
 	m := testModel(t)
-	m.screen = sSession
-	m.pool = []rwcore.Word{
-		{Text: "a", Translations: map[string]string{"RUS": "а"}},
-		{Text: "b", Translations: map[string]string{"RUS": "б"}},
-		{Text: "c", Translations: map[string]string{"RUS": "в"}},
-		{Text: "d", Translations: map[string]string{"RUS": "г"}},
-		{Text: "e", Translations: map[string]string{"RUS": "д"}},
-	}
-	m.sess.cur = &card{kind: cL1, word: "a"}
+	m.sess.mode = modeLearn
+	m = dealt(t, m, rcard(4, "a", "а", 1, 0))
 	m = press(t, m, "l")
-	if len(m.q.Items) != 1 || m.q.Items[0].Decision != "learn" {
-		t.Fatalf("bad triage intent: %+v", m.q.Items)
+	if it := answered(t, m); it.Positive {
+		t.Fatalf("l on a new word starts learning, the right answer: %+v", it)
 	}
-	if !m.sess.cur.done {
-		t.Fatal("L1 learn must resolve the card")
+	if m.sess.cur != nil || m.sess.ok != 0 {
+		t.Fatal("a learning decision moves on and is not a correct answer")
 	}
 	m = press(t, m, "esc")
 	if m.screen != sLearn {
@@ -141,72 +173,101 @@ func TestL1LearnQueues(t *testing.T) {
 	}
 }
 
-func TestMakeChoices(t *testing.T) {
-	m := testModel(t)
-	m.pool = []rwcore.Word{
-		{Text: "a", Translations: map[string]string{"RUS": "а"}, Pos: i64p(1)},
-		{Text: "b", Translations: map[string]string{"RUS": "б"}, Pos: i64p(1)},
-		{Text: "c", Translations: map[string]string{"RUS": "в"}, Pos: i64p(1)},
-		{Text: "d", Translations: map[string]string{"RUS": "г"}, Pos: i64p(1)},
+func TestCardReadsItsSide(t *testing.T) {
+	prefs := DefaultPrefs()
+	other := func(id int64, text string) rwcore.Word {
+		return rwcore.Word{ID: id, Text: text, Translations: map[string]string{"RUS": "п-" + text}}
 	}
-	w := rwcore.Word{Text: "a", Translations: map[string]string{"RUS": "а"}, Pos: i64p(1)}
-	choices, ans, ok := m.makeChoices(w)
-	if !ok || len(choices) != 4 || choices[ans] != "а" {
-		t.Fatalf("bad choices: %v ans %d ok %v", choices, ans, ok)
+	rc := rcard(1, "casa", "дом", 2, 2)
+	rc.Keyboard, rc.Choose = true, true
+	rc.Variants = []rwcore.Word{other(10, "mesa"), rc.Word, other(11, "sala"), other(12, "cama")}
+	c := cardFrom(&rc, "RUS", prefs)
+	if c.prompt != "дом" || c.native != "casa" || c.mode != "rep" {
+		t.Fatalf("reproduction shows the translation and asks for the word: %+v", c)
+	}
+	if !slices.Equal(c.choices, []string{"mesa", "casa", "sala", "cama"}) || c.answer != 1 || !c.keyboard {
+		t.Fatalf("its blocks answer with words: %v %d %v", c.choices, c.answer, c.keyboard)
+	}
+	rc.Side = 1
+	rc.Word.Translations = map[string]string{"RUS": "дом, жилище"}
+	rc.Variants[1] = rc.Word
+	c = cardFrom(&rc, "RUS", prefs)
+	if c.prompt != "casa" || c.native != "дом, жилище" || c.mode != "rec" {
+		t.Fatalf("recognition shows the word: %+v", c)
+	}
+	if c.choices[1] != "дом, жилище" || !c.keyboard {
+		t.Fatalf("its blocks answer with translations: %v %v", c.choices, c.keyboard)
+	}
+	if cardFrom(nil, "RUS", prefs) != nil {
+		t.Fatal("no card, no layout")
 	}
 }
 
 func i64p(v int64) *int64 { return &v }
 
 func TestTypedFlow(t *testing.T) {
-	m := testModel(t)
-	m.screen = sSession
-	m.sess.cur = &card{kind: cR3, word: "el pan", mode: "rep", prompt: "хлеб", expected: []string{"el pan"}, attempts: 3}
-	m.sess.typing = true
-	m = press(t, m, "e")
-	m = press(t, m, "l")
-	m = press(t, m, " ")
-	m = press(t, m, "p")
-	m = press(t, m, "a")
-	m = press(t, m, "n")
-	m = press(t, m, "enter")
-	if len(m.q.Items) != 1 || m.q.Items[0].Result != "ok" {
-		t.Fatalf("typed correct must grade ok: %+v", m.q.Items)
+	rc := rcard(1, "el pan", "хлеб", 2, 2)
+	rc.Keyboard = true
+	m := dealt(t, testModel(t), rc)
+	m = press(t, m, "i")
+	if !m.sess.typing || m.sess.cur.pane != paneType {
+		t.Fatal("i must open the keyboard block")
 	}
-	m2 := testModel(t)
-	m2.screen = sSession
-	m2.sess.cur = &card{kind: cR3, word: "x", mode: "rep", expected: []string{"y"}, attempts: 3}
-	for i := 0; i < 3; i++ {
+	for _, k := range []string{"e", "l", " ", "p", "a", "n"} {
+		m = press(t, m, k)
+	}
+	next, cmd := m.Update(key("enter"))
+	if m = next.(Model); cmd == nil || !m.sess.checking {
+		t.Fatal("enter must hand the answer to rwcore")
+	}
+	if m = press(t, m, "enter"); m.sess.cur.attempts != 3 {
+		t.Fatal("a second enter must wait for the grade, not spend an attempt")
+	}
+	m = graded(t, m, "correct")
+	if c := m.sess.cur; len(m.q.Items) != 0 || c.typed != vRight || !c.reveal || m.sess.typing || m.sess.checking {
+		t.Fatalf("a right answer must open the card and leave the grade to the swipe: %+v", m.q.Items)
+	}
+	m = press(t, m, "left")
+	if it := answered(t, m); !it.Positive {
+		t.Fatalf("← after the answer means got it: %+v", it)
+	}
+	rc = rcard(2, "x", "y", 2, 2)
+	rc.Keyboard = true
+	m2 := dealt(t, testModel(t), rc)
+	m2 = press(t, m2, "i")
+	for range 3 {
 		m2 = press(t, m2, "z")
 		m2 = press(t, m2, "enter")
+		m2 = graded(t, m2, "wrong")
 	}
-	if len(m2.q.Items) != 1 || m2.q.Items[0].Result != "fail" {
-		t.Fatalf("3 wrong attempts must grade fail: %+v", m2.q.Items)
+	if c := m2.sess.cur; c.typed != vWrong || !c.reveal || m2.sess.typing || len(m2.q.Items) != 0 {
+		t.Fatalf("3 wrong attempts must end typing as missed, ungraded: %+v", m2.q.Items)
 	}
-}
-
-func TestNormalize(t *testing.T) {
-	if normalizeAnswer("El Pan!") == normalizeAnswer("el  pan!") {
-	} else {
-		t.Fatal("case/space folding broken")
-	}
-	if normalizeAnswer("a‐b") != "a b" {
-		t.Fatalf("dash folding broken: %q", normalizeAnswer("a‐b"))
+	m2 = press(t, m2, "right")
+	if it := answered(t, m2); it.Positive {
+		t.Fatalf("→ after a miss means missed it: %+v", it)
 	}
 }
 
-func TestBuildReviewNativeFirst(t *testing.T) {
-	m := testModel(t)
-	m.prefs.ReviewFirst = "native"
-	m.due = []rwcore.DueItem{{ID: 1, Word: "w", Modes: []int64{1, 2}, OverdueSecs: 5}}
-	m.buildReview()
-	if len(m.sess.units) != 2 || m.sess.units[0].mode != 2 || m.sess.units[1].mode != 1 {
-		t.Fatalf("native-first must order rep,rec: %+v", m.sess.units)
+func TestPartialAnswerOpensInYellow(t *testing.T) {
+	rc := rcard(1, "canción", "песня", 2, 2)
+	rc.Keyboard = true
+	m := dealt(t, testModel(t), rc)
+	m = press(t, m, "i")
+	for _, k := range []string{"c", "a", "n", "c", "i", "o", "n", "enter"} {
+		m = press(t, m, k)
 	}
-	m.prefs.ReviewFirst = "target"
-	m.buildReview()
-	if m.sess.units[0].mode != 1 {
-		t.Fatalf("target-first must order rec first: %+v", m.sess.units)
+	stale := m
+	next, _ := stale.Update(checkMsg{wordID: 99, mode: "rep", res: rwcore.Check{Verdict: "correct", Accepted: true}})
+	if c := next.(Model).sess.cur; c.typed != vNone || !next.(Model).sess.typing {
+		t.Fatal("a grade for another card must not touch this one")
+	}
+	m = graded(t, m, "partial")
+	if c := m.sess.cur; c.typed != vPartial || !c.reveal || m.sess.typing || c.attempts != 3 {
+		t.Fatalf("a partial answer is accepted, as on the phone: %+v", c)
+	}
+	if out := sgrRe.ReplaceAllString(m.View(), ""); !strings.Contains(out, "✓ nearly right") {
+		t.Fatalf("a partial answer must say so:\n%s", out)
 	}
 }
 
@@ -250,70 +311,140 @@ func TestOnboardingAsksGoalOnly(t *testing.T) {
 func TestSettingsPersist(t *testing.T) {
 	m := testModel(t)
 	m.screen = sSettings
-	m.setIdx = 3
+	m.setIdx = len(settingRows) - 1
 	m = press(t, m, " ")
-	if m.prefs.Guess {
-		t.Fatal("guess must toggle off")
+	if !m.prefs.InvertedSwipes || !LoadPrefs().InvertedSwipes {
+		t.Fatal("inverted swipes must toggle on and persist on this computer")
 	}
-	reread := LoadPrefs()
-	if reread.Guess {
-		t.Fatal("prefs must persist")
+	if len(m.q.Items) != 0 {
+		t.Fatal("a setting of this computer must not go to iCloud")
 	}
 }
 
-func TestFullSessionFlow(t *testing.T) {
+func TestSharedSettingsGoThroughTheBackup(t *testing.T) {
 	m := testModel(t)
-	m.prefs.ReviewFirst = "target"
-	m.prefs.Keyboard = false
-	m.due = []rwcore.DueItem{
-		{ID: 1, Word: "w1", Modes: []int64{1, 2}, OverdueSecs: 90},
-		{ID: 2, Word: "w2", Modes: []int64{2}, OverdueSecs: 10},
+	m.width, m.height = 100, 40
+	m.screen = sSettings
+	m.synced = &rwcore.Synced{NewWords: "recognition", Learning: "reproduction", Review: "random",
+		Keyboard: "foreign", Guessing: "both", ReviewFrom: "selected", MasteredDays: 60, Transcription: true}
+	m = press(t, m, " ")
+	m = press(t, press(t, m, "j"), " ")
+	m = press(t, press(t, m, "j"), " ")
+	var got []string
+	for _, it := range m.q.Items {
+		got = append(got, it.Op+" "+it.Name+"="+it.Value)
 	}
-	m.pool = []rwcore.Word{
-		{Text: "w1", Translations: map[string]string{"RUS": "п1"}, Recognition: rwcore.ModeState{Level: 2}, Reproduction: rwcore.ModeState{Level: 2}},
-		{Text: "w2", Translations: map[string]string{"RUS": "п2"}, Recognition: rwcore.ModeState{Level: 2}, Reproduction: rwcore.ModeState{Level: 2}},
-		{Text: "n1", Translations: map[string]string{"RUS": "н1"}},
-		{Text: "n2", Translations: map[string]string{"RUS": "н2"}},
-		{Text: "n3", Translations: map[string]string{"RUS": "н3"}},
-		{Text: "n4", Translations: map[string]string{"RUS": "н4"}},
+	want := []string{
+		"setting new_words_card_mode=reproduction",
+		"setting word_learning_card_mode=recognition_or_reproduction",
+		"setting word_review_card_mode=recognition",
 	}
-	m.buildReview()
-	if len(m.sess.units) != 3 {
-		t.Fatalf("want 3 review units, got %d", len(m.sess.units))
+	if !slices.Equal(got, want) {
+		t.Fatalf("each change cycles to the phone's next value and queues for iCloud:\n%v", got)
 	}
-	m.sess.mode = 2
-	m.buildLearnQueue()
-	seen := map[cardKind]int{}
-	for i := 0; i < 40 && (len(m.sess.units) > 0 || m.sess.lpos < len(m.sess.learn)); i++ {
-		c := m.nextCard()
-		if c == nil {
-			break
-		}
-		seen[c.kind]++
-		m.sess.cur = c
-		switch c.kind {
-		case cR1:
-			mm := m
-			mm.sess.cur.reveal = true
-			mm.gradeCurrent(true)
-		case cR2:
-			m.gradeCurrent(true)
-		case cL1:
-			m.enqueue(queue.Intent{Op: "triage", Word: c.word, Decision: "learn"})
-			c.done = true
-		case cL1b:
-			c.done, c.wasOk = true, true
-		case cL2:
-			c.done, c.wasOk = true, true
-		case cR3:
-			m.gradeCurrent(true)
+	out := sgrRe.ReplaceAllString(m.View(), "")
+	for _, s := range []string{"Shared with the phone", "This computer", "New words first: translation → word", "Review mode: word → translation"} {
+		if !strings.Contains(out, s) {
+			t.Fatalf("settings screen lacks %q:\n%s", s, out)
 		}
 	}
-	if len(m.sess.units) != 0 {
-		t.Fatalf("review units must drain, left %d", len(m.sess.units))
+	m.setIdx = 7
+	if m = press(t, m, " "); m.prefs.ShowTranscription || m.q.Items[len(m.q.Items)-1].Value != "0" {
+		t.Fatal("transcription is shared with the phone and follows it here")
 	}
-	if seen[cR1] == 0 || seen[cL1] == 0 && seen[cL1b] == 0 {
-		t.Fatalf("must cover review and learning cards: %v", seen)
+	m.setIdx = 6
+	if m = press(t, m, "enter"); m.ov != oGoal || m.numFor != "mastered" || m.goalInput != "60" {
+		t.Fatalf("the mastered interval asks for a number: ov=%v for=%q in=%q", m.ov, m.numFor, m.goalInput)
+	}
+	for _, k := range []string{"backspace", "backspace", "0", "enter"} {
+		m = press(t, m, k)
+	}
+	if m.ov != oGoal || m.err == "" {
+		t.Fatal("0 days is outside the phone's 1–999")
+	}
+	for _, k := range []string{"backspace", "9", "0", "enter"} {
+		m = press(t, m, k)
+	}
+	if last := m.q.Items[len(m.q.Items)-1]; m.ov != oNone || m.numFor != "" || last.Name != masteredKey || last.Value != "90" || m.synced.MasteredDays != 90 {
+		t.Fatalf("90 days must be written: %+v", last)
+	}
+}
+
+func TestInvertedSwipesSwapTheArrows(t *testing.T) {
+	m := testModel(t)
+	m.width, m.height = 100, 30
+	m.prefs.InvertedSwipes = true
+	m = dealt(t, m, rcard(1, "el pan", "хлеб", 2, 2))
+	out := sgrRe.ReplaceAllString(m.View(), "")
+	if !strings.Contains(out, "← Missed it") || !strings.Contains(out, "Got it →") {
+		t.Fatalf("inverted swipes put got it on the right:\n%s", out)
+	}
+	m = press(t, m, "right")
+	if it := answered(t, m); !it.Positive {
+		t.Fatal("→ answers got it with inverted swipes")
+	}
+}
+
+func TestUndoTakesTheLastAnswerBack(t *testing.T) {
+	m := dealt(t, testModel(t), rcard(7, "la foca", "тюлень", 2, 2))
+	m = press(t, m, "left")
+	if len(m.sess.undo) != 0 {
+		t.Fatal("without a working copy there is no row to put back")
+	}
+	if next, _ := m.Update(key("u")); !next.(Model).sess.dealing || len(next.(Model).q.Items) != 1 {
+		t.Fatal("nothing to take back while the next card is on its way")
+	}
+	m = dealt(t, m, rcard(8, "el oso", "медведь", 2, 2))
+	c := &card{kind: cR1, wordID: 7, word: "la foca", mode: "rep", variantIDs: []int64{3, 7, 5, 9}}
+	receipt := rwcore.Receipt{Detail: rwcore.ReceiptDetail{Detail: map[string]any{"pre": map[string]any{"q_rec": 2.0}, "at": 1000.0}}}
+	m.sess.pushUndo(c, receipt, 1)
+	if !slices.Contains(m.sessionHints(), kb{"u", "undo"}) {
+		t.Fatal("the footer offers the undo")
+	}
+	next, cmd := m.Update(key("u"))
+	m = next.(Model)
+	it := m.q.Items[len(m.q.Items)-1]
+	if cmd == nil || !m.sess.dealing || m.sess.cur != nil || m.sess.ok != 0 || len(m.sess.undo) != 0 {
+		t.Fatalf("undo takes the answer back and deals the word again: ok=%d undo=%d", m.sess.ok, len(m.sess.undo))
+	}
+	if it.Op != "restore" || it.ID != 7 || it.At != 1000 || string(it.Row) != `{"q_rec":2}` {
+		t.Fatalf("undo queues the row from before the answer: %+v", it)
+	}
+	for range undoDepth + 1 {
+		m.sess.pushUndo(c, receipt, 0)
+	}
+	if len(m.sess.undo) != undoDepth {
+		t.Fatalf("the phone keeps %d answers, got %d", undoDepth, len(m.sess.undo))
+	}
+}
+
+func TestSessionDealsThroughRwcore(t *testing.T) {
+	m := testModel(t)
+	m.width, m.height = 100, 30
+	next, cmd := m.startSession(modeReview)
+	m = next.(Model)
+	if cmd == nil || !m.sess.dealing || m.sess.cur != nil || m.screen != sSession {
+		t.Fatal("a session starts by asking rwcore for a card")
+	}
+	if !strings.Contains(m.View(), "dealing") {
+		t.Fatal("the screen must say a card is on its way")
+	}
+	nr := int64(1000 + 7200)
+	next, _ = m.onDeal(dealMsg{mode: modeReview, deal: rwcore.Deal{Day: rwcore.Day{NextReview: &nr}, Now: 1000}})
+	m = next.(Model)
+	if out := sgrRe.ReplaceAllString(m.View(), ""); !strings.Contains(out, "Words for review will show up in 2 hours") {
+		t.Fatalf("no card: say when the next review falls due, as the phone does:\n%s", out)
+	}
+	g := int64(5)
+	m.sess.mode = modeLearn
+	next, _ = m.onDeal(dealMsg{mode: modeLearn, deal: rwcore.Deal{Day: rwcore.Day{Goal: &g, LearnedToday: 5, GoalReached: true}}})
+	m = next.(Model)
+	if out := sgrRe.ReplaceAllString(m.View(), ""); !strings.Contains(out, "Today you've learned 5 new words") {
+		t.Fatalf("a met goal stops learning with the phone's goal screen:\n%s", out)
+	}
+	next, _ = m.onDeal(dealMsg{mode: modeReview, deal: rwcore.Deal{Card: new(rcard(1, "a", "б", 1, 2))}})
+	if next.(Model).sess.cur != nil {
+		t.Fatal("a deal for a mode left meanwhile must not land")
 	}
 }
 
@@ -324,17 +455,18 @@ func TestViewAllCards(t *testing.T) {
 		{kind: cR1, prompt: "w", native: "н", reveal: true, example: "ex"},
 		{kind: cR1, prompt: "w", native: "н", done: true, wasOk: true},
 		{kind: cR1, prompt: "w", native: "н", done: true},
-		{kind: cR2, prompt: "н", choices: []string{"a", "b", "c", "d"}, answer: 1},
-		{kind: cR2, prompt: "н", choices: []string{"a", "b", "c", "d"}, answer: 1, done: true},
-		{kind: cR3, prompt: "н", attempts: 3},
-		{kind: cR3, prompt: "н", done: true, wasOk: true},
+		{kind: cR1, prompt: "н", native: "w", choices: []string{"a", "b", "c", "d"}, keyboard: true, attempts: 3},
+		{kind: cR1, prompt: "н", choices: []string{"a", "b", "c", "d"}, answer: 1, pane: paneChoose},
+		{kind: cR1, prompt: "н", choices: []string{"a", "b", "c", "d"}, answer: 1, pane: paneChoose, pick: 3, reveal: true},
+		{kind: cR1, prompt: "н", native: "w", keyboard: true, attempts: 3, pane: paneType},
+		{kind: cR1, prompt: "н", native: "w", keyboard: true, pane: paneType, typed: vRight, reveal: true},
 		{kind: cL1, prompt: "w", native: "н", tr: "t", example: "ex"},
 		{kind: cL1b, prompt: "w", native: "н", done: true, wasOk: true},
-		{kind: cL2, prompt: "w", choices: []string{"a", "b"}, answer: 0, done: true},
+		{kind: cL1b, prompt: "w", native: "н", choices: []string{"a", "b", "c", "d"}},
 	}
 	for i, c := range cards {
 		m.sess.cur = c
-		m.sess.typing = c.kind == cR3 && !c.done
+		m.sess.typing = c.pane == paneType && c.typed == vNone
 		m.sess.input = "te"
 		if out, _ := m.viewCard(76, 10); out == "" {
 			t.Fatalf("card %d renders empty", i)
@@ -600,21 +732,6 @@ func TestCatStatsFillsPct(t *testing.T) {
 	}
 }
 
-func TestReviewCardUsesPool(t *testing.T) {
-	m := testModel(t)
-	next, _ := m.onWords(wordsMsg{key: "pool", words: []rwcore.Word{
-		{ID: 1, Text: "el pan", Translations: map[string]string{"RUS": "хлеб"}},
-	}})
-	m = next.(Model)
-	c := m.reviewCard(1, "el pan", 1)
-	if c.done || c.native != "хлеб" {
-		t.Fatalf("card must come from pool without backend: %+v", c)
-	}
-	if _, ok := m.poolWord(999); ok {
-		t.Fatal("unknown word must miss pool index")
-	}
-}
-
 func TestOnboardingPersists(t *testing.T) {
 	m := testModel(t)
 	g := int64(10)
@@ -640,7 +757,7 @@ func TestOnboardingPersists(t *testing.T) {
 	}
 
 	m.screen = sSettings
-	m.setIdx = 0
+	m.setIdx = sharedRows
 	m = press(t, m, "enter")
 	if !LoadPrefs().Onboarded {
 		t.Error("settings toggle overwrote onboarded=true on disk with false")
@@ -659,20 +776,8 @@ func proofWord(id int64, text, rus string, lvl int64) rwcore.Word {
 
 func TestLearnProgressBarNoPanic(t *testing.T) {
 	m := testModel(t)
-	pool := []rwcore.Word{
-		proofWord(1, "uno", "один", 1),
-		proofWord(2, "dos", "два", 0),
-		proofWord(3, "tres", "три", 0),
-		proofWord(4, "cuatro", "четыре", 0),
-	}
-	m.pool = pool
-	m.poolIdx = map[int64]int{}
-	for i, w := range pool {
-		m.poolIdx[w.ID] = i
-	}
-	m.screen = sSession
-	m.sess = session{mode: 1, learn: []rwcore.Word{pool[0]}, lpos: 1, started: true}
-	m.sess.cur = m.learnCard(pool[0])
+	m.sess.mode = modeLearn
+	m = dealt(t, m, rcard(1, "uno", "один", 2, 1))
 	if m.sess.cur.kind != cL1b {
 		t.Fatalf("setup: want cL1b card, got %v", m.sess.cur.kind)
 	}
@@ -797,14 +902,16 @@ func fitModel(t *testing.T) Model {
 	m := testModel(t)
 	m.appID = "es"
 	g := int64(30)
-	m.today = &rwcore.Today{Learned: 10, Goal: &g, StreakCur: 2, StreakBest: 6, ActiveDates: []string{"2026-09-13"}}
+	week := make([]rwcore.WeekDay, 7)
+	for i := range week {
+		week[i] = rwcore.WeekDay{Date: time.Now().AddDate(0, 0, i-6).Format("2006-01-02"), Learned: int64(i * 7)}
+	}
+	m.today = &rwcore.Today{Learned: 10, Goal: &g, StreakCur: 2, StreakBest: 6, ActiveDates: []string{"2026-09-13"}, Week: week, WeekGoal: &g}
 	m.stats = &rwcore.Stats{Settings: rwcore.Settings{DailyGoal: strp("30"), NativeLanguage: strp("RUS")}}
 	m.due = []rwcore.DueItem{{Word: "x", Modes: []int64{1}, OverdueSecs: 100}}
 	m.cats = []rwcore.Category{{ID: "custom", NameEn: strp("My words"), Words: 5}, {ID: "averylongcategorynamewithoutanyspacesinit", Words: 3}}
 	m.catSel = map[string]bool{"custom": true}
 	m.catPct = map[string]string{"custom": "12%"}
-	m.pool = []rwcore.Word{longWord()}
-	m.poolIdx = map[int64]int{longWord().ID: 0}
 	m.vocabWords = []rwcore.Word{longWord()}
 	m.word = &rwcore.Word{Text: longWord().Text, Translations: longWord().Translations, Examples: longWord().Examples,
 		Recognition: longWord().Recognition, Reproduction: longWord().Reproduction}
@@ -815,8 +922,9 @@ func fitModel(t *testing.T) Model {
 	m.replayPlan = "a very long replay plan line that should be truncated to fit the column width on narrow screens"
 	m.q.Items = []queue.Intent{{Op: "grade", Word: "w", Mode: "rec", Result: "ok"}}
 	m.orphans = []rwcore.OrphanEntry{{App: "es"}}
-	m.sess = session{mode: 2, learn: []rwcore.Word{longWord()}, lpos: 1, started: true}
-	m.sess.cur = m.learnCard(longWord())
+	g2 := int64(30)
+	m.sess = session{mode: 2, started: true, day: rwcore.Day{Due: 182, Learning: 6, LearnedToday: 4, Goal: &g2}}
+	m.sess.cur = cardFrom(&rwcore.Card{Word: longWord(), Side: 1, Status: 1, Queue: 1}, "RUS", m.prefs)
 	m.confirmT = "Remove 'averylongcategorynamewithoutanyspacesinit' with all of its 99999 words?"
 	m.goalInput = "123456789012345678901234567890"
 	m.impF = []string{"averylongfilenamewithoutanyspaces.csv", "cat"}
@@ -959,12 +1067,12 @@ func TestCardKindsFitViewport(t *testing.T) {
 	}{
 		{"R1-reveal", card{kind: cR1, word: long.Text, prompt: long.Text, native: nat, tr: "[tr]", example: ex, reveal: true, mode: "rec"}},
 		{"R1-done", card{kind: cR1, word: long.Text, prompt: long.Text, native: nat, example: ex, reveal: true, done: true, mode: "rec"}},
-		{"R2", card{kind: cR2, word: long.Text, prompt: nat, choices: choices, answer: 1, mode: "rep"}},
-		{"R2-done-wrong", card{kind: cR2, word: long.Text, prompt: nat, choices: choices, answer: 1, done: true, mode: "rep"}},
-		{"R3-typing", card{kind: cR3, word: long.Text, prompt: nat, expected: []string{long.Text}, attempts: 3, mode: "rep"}},
+		{"R1-blocks", card{kind: cR1, word: long.Text, prompt: nat, native: long.Text, choices: choices, keyboard: true, attempts: 3, mode: "rep"}},
+		{"R1-choose", card{kind: cR1, word: long.Text, prompt: nat, choices: choices, answer: 1, pane: paneChoose, mode: "rep"}},
+		{"R1-choose-miss", card{kind: cR1, word: long.Text, prompt: nat, choices: choices, answer: 1, pane: paneChoose, pick: 3, reveal: true, example: ex, mode: "rep"}},
+		{"R1-typing", card{kind: cR1, word: long.Text, prompt: nat, native: long.Text, keyboard: true, attempts: 3, pane: paneType, mode: "rep"}},
 		{"L1", card{kind: cL1, word: long.Text, prompt: long.Text, native: nat, example: ex}},
-		{"L1b", card{kind: cL1b, word: long.Text, prompt: long.Text, native: nat, example: ex}},
-		{"L2-done-wrong", card{kind: cL2, word: long.Text, prompt: long.Text, choices: choices, answer: 0, done: true}},
+		{"L1b", card{kind: cL1b, word: long.Text, prompt: long.Text, native: nat, example: ex, choices: choices}},
 	}
 	var fails []string
 	for _, zen := range []bool{false, true} {
@@ -977,7 +1085,7 @@ func TestCardKindsFitViewport(t *testing.T) {
 					c := cc.c
 					m.sess.cur = &c
 					m.sess.zen = zen
-					if c.kind == cR3 {
+					if c.pane == paneType {
 						m.sess.typing = true
 						m.sess.input = "supercalifragilisticexpialidocious typed"
 					}
@@ -1109,7 +1217,7 @@ func TestEdgeCursorVisibleAfterCrop(t *testing.T) {
 		setup func(m *Model)
 	}
 	cases := []tc{
-		{"settings last row", func(m *Model) { m.screen, m.ov, m.searchOn = sSettings, oNone, false; m.setIdx = 7 }},
+		{"settings last row", func(m *Model) { m.screen, m.ov, m.searchOn = sSettings, oNone, false; m.setIdx = len(settingRows) - 1 }},
 		{"add enroll row", func(m *Model) { m.screen, m.ov, m.searchOn = sAdd, oNone, false; m.addIdx = 4 }},
 		{"learn mixed row", func(m *Model) { m.screen, m.ov, m.searchOn = sLearn, oNone, false; m.menuIdx = 2 }},
 		{"menu about row", func(m *Model) { m.screen, m.ov, m.searchOn = sMenu, oNone, false; m.menuIdx = 4 }},
@@ -1152,7 +1260,7 @@ func TestEdgeCardAndOverlayContentAfterCrop(t *testing.T) {
 			m := fitModel(t)
 			m.width, m.height = w, h
 			m.screen, m.ov, m.searchOn = sSession, oNone, false
-			c := card{kind: cR2, word: long.Text, prompt: "перевод", choices: choices, answer: 1, mode: "rep"}
+			c := card{kind: cR1, word: long.Text, prompt: "перевод", choices: choices, answer: 1, pane: paneChoose, mode: "rep"}
 			m.sess.cur = &c
 			out := m.View()
 			for i := 1; i <= 4; i++ {
@@ -1208,31 +1316,10 @@ func TestLearnMenuRowsMapToModes(t *testing.T) {
 	}
 }
 
-func TestChosenCatsFollowSelection(t *testing.T) {
-	m := testModel(t)
-	if m.chosenCats() != nil {
-		t.Fatal("unknown categories must load the whole app")
-	}
-	m.cats = []rwcore.Category{{ID: "animals"}, {ID: "food"}, {ID: "custom"}}
-	m.catSel = map[string]bool{"animals": true, "custom": true}
-	if got := strings.Join(m.chosenCats(), ","); got != "animals,custom" {
-		t.Fatalf("pool must follow the chosen categories, got %q", got)
-	}
-	m.catSel = map[string]bool{}
-	if got := m.chosenCats(); got == nil || len(got) != 0 {
-		t.Fatalf("nothing chosen must mean an empty pool, got %v", got)
-	}
-	m.prefs.ReviewFrom = "all"
-	if m.chosenCats() != nil {
-		t.Fatal("review-from-all must load the whole app")
-	}
-}
-
 func TestNewWordHidesTranslationUntilShown(t *testing.T) {
 	m := testModel(t)
-	m.screen = sSession
 	m.sess.mode = modeLearn
-	m.sess.cur = m.learnFrom(rwcore.Word{Text: "la foca", Translations: map[string]string{"RUS": "тюлень"}})
+	m = dealt(t, m, rcard(7, "la foca", "тюлень", 1, 0))
 	if m.sess.cur.kind != cL1 {
 		t.Fatalf("setup: want a new-word card, got %v", m.sess.cur.kind)
 	}
@@ -1248,102 +1335,133 @@ func TestNewWordHidesTranslationUntilShown(t *testing.T) {
 		t.Fatal("space must show the translation")
 	}
 	m.prefs.RevealAtOnce = true
-	m.sess.cur = m.learnFrom(rwcore.Word{Text: "el oso", Translations: map[string]string{"RUS": "медведь"}})
+	m = dealt(t, m, rcard(8, "el oso", "медведь", 1, 0))
 	if !strings.Contains(m.View(), "медведь") {
 		t.Fatal("'show translation at once' must reveal new words too")
 	}
 }
 
 func TestReviewAdvancesByItself(t *testing.T) {
-	m := testModel(t)
-	m.screen = sSession
-	m.sess.mode = modeReview
-	m.pool = []rwcore.Word{{ID: 2, Text: "b", Translations: map[string]string{"RUS": "б"}}}
-	m.poolIdx = map[int64]int{2: 0}
-	m.sess.units = []reviewUnit{{id: 2, word: "b", mode: 1}}
-	m.sess.cur = &card{kind: cR1, word: "a", mode: "rec", reveal: true}
-	m = press(t, m, "g")
-	if m.sess.cur == nil || m.sess.cur.word != "b" {
-		t.Fatalf("got it in review must show the next word, cur=%+v", m.sess.cur)
+	m := dealt(t, testModel(t), rcard(1, "a", "а", 1, 2))
+	next, cmd := m.Update(key("g"))
+	m = next.(Model)
+	if m.sess.cur != nil || cmd == nil || m.sess.ok != 1 {
+		t.Fatal("got it in review must deal the next word by itself")
 	}
 	m.sess.mode = modeLearn
-	m.sess.cur = &card{kind: cL1, word: "c", fromLearn: true}
+	m = dealt(t, m, rcard(2, "c", "с", 1, 0))
 	m = press(t, m, "l")
-	if m.sess.cur == nil || m.sess.cur.word != "c" || !m.sess.cur.done {
-		t.Fatal("learning must wait for the user after a decision")
+	if m.sess.cur != nil {
+		t.Fatal("a learning decision must move on like a swipe")
 	}
 	if m.sess.ok != 1 {
 		t.Fatalf("start learning is a decision, not a correct answer: ok=%d", m.sess.ok)
 	}
 }
 
-func TestReviewChoiceAdvancesAfterFlash(t *testing.T) {
+func TestChooseBlockPicksWithHjklOrDigits(t *testing.T) {
+	onCard := func(kind cardKind) Model {
+		m := testModel(t)
+		m.screen = sSession
+		m.sess.mode = modeReview
+		m.sess.cur = &card{kind: kind, word: "a", wordID: 1, mode: "rep", choices: []string{"x", "y", "z", "w"}, answer: 1}
+		return press(t, m, "c")
+	}
+	for i, k := range []string{"h", "j", "k", "l"} {
+		m := onCard(cR1)
+		if m.sess.cur.pane != paneChoose {
+			t.Fatal("c must open the choose block")
+		}
+		next, cmd := m.Update(key(k))
+		m = next.(Model)
+		c := m.sess.cur
+		if cmd != nil || c == nil || c.word != "a" || c.pick != i+1 || !c.reveal || len(m.q.Items) != 0 {
+			t.Fatalf("%s must pick answer %d and stay on the card ungraded: %+v", k, i+1, c)
+		}
+		if d := press(t, onCard(cR1), strconv.Itoa(i+1)); d.sess.cur.pick != i+1 {
+			t.Fatalf("%d must pick the same answer as %s", i+1, k)
+		}
+	}
+	m := press(t, onCard(cR1), "j")
+	m = press(t, m, "h")
+	if m.sess.cur.pick != 2 {
+		t.Fatal("a pick is final")
+	}
+	m = press(t, m, "left")
+	if it := answered(t, m); !it.Positive || m.sess.cur != nil {
+		t.Fatalf("← after a pick must answer got it and move on: %+v", it)
+	}
+	m = press(t, onCard(cL1b), "l")
+	m = press(t, m, "l")
+	if len(m.q.Items) != 0 || m.sess.cur == nil || m.sess.cur.pick != 4 {
+		t.Fatal("hjkl in a choose block must never fall through to the card's own letters")
+	}
+	m = press(t, onCard(cR1), "esc")
+	if m.screen != sSession || m.sess.cur.pane != paneNone {
+		t.Fatal("esc before a pick must close the choose block, not the session")
+	}
+}
+
+func TestAttemptsWarningStaysWithItsCard(t *testing.T) {
+	m := testModel(t)
+	m.screen = sSession
+	m.sess.cur = &card{kind: cR1, word: "a", mode: "rep", keyboard: true, attempts: 2, pane: paneType}
+	m.sess.typing = true
+	m = press(t, m, "z")
+	m = graded(t, press(t, m, "enter"), "wrong")
+	if m.notice != "not quite · 1 attempt left" || !m.noticeWarn {
+		t.Fatalf("a wrong try must warn with the attempts left, got %q", m.notice)
+	}
+	m = press(t, m, "z")
+	m = graded(t, press(t, m, "enter"), "wrong")
+	if m.notice != "" || m.sess.cur.typed != vWrong {
+		t.Fatalf("the last wrong try resolves the card and drops the warning, got %q", m.notice)
+	}
+}
+
+func TestTypedAnswerStaysUntilArrow(t *testing.T) {
 	m := testModel(t)
 	m.screen = sSession
 	m.sess.mode = modeReview
-	m.pool = []rwcore.Word{{ID: 2, Text: "b", Translations: map[string]string{"RUS": "б"}}}
-	m.poolIdx = map[int64]int{2: 0}
-	m.sess.units = []reviewUnit{{id: 2, word: "b", mode: 1}}
-	m.sess.cur = &card{kind: cR2, word: "a", mode: "rep", choices: []string{"x", "y", "z", "w"}, answer: 0}
-	next, cmd := m.Update(key("1"))
+	m.sess.cur = &card{kind: cR1, word: "a", mode: "rep", native: "a", keyboard: true, attempts: 3, pane: paneType}
+	m.sess.typing = true
+	m = press(t, m, "a")
+	m = graded(t, press(t, m, "enter"), "correct")
+	if m.sess.cur == nil || m.sess.cur.word != "a" || m.sess.cur.typed != vRight {
+		t.Fatal("a typed answer must stay on screen with its result")
+	}
+	if out := sgrRe.ReplaceAllString(m.View(), ""); !strings.Contains(out, "← Got it") || !strings.Contains(out, "Missed it →") {
+		t.Fatal("a resolved answer must offer the two grades under the frame")
+	}
+	m = press(t, m, "left")
+	if it := answered(t, m); !it.Positive || m.sess.cur != nil {
+		t.Fatal("← must answer got it and move on to the next card")
+	}
+}
+
+func TestTabSwitchesSessionAndRedeals(t *testing.T) {
+	m := dealt(t, testModel(t), rcard(1, "r1", "р", 1, 2))
+	next, cmd := m.Update(key("tab"))
 	m = next.(Model)
-	if cmd == nil || !m.sess.cur.done {
-		t.Fatal("a picked choice must show its result and schedule the next card")
+	if m.sess.mode != modeLearn || m.sess.cur != nil || !m.sess.dealing || cmd == nil {
+		t.Fatal("tab must switch to learning and deal from there")
 	}
-	next, _ = m.Update(autoNextMsg{seq: m.sess.seq - 1})
-	if m = next.(Model); m.sess.cur.word != "a" {
-		t.Fatal("a stale tick must not skip a card")
-	}
-	next, _ = m.Update(autoNextMsg{seq: m.sess.seq})
-	if m = next.(Model); m.sess.cur == nil || m.sess.cur.word != "b" {
-		t.Fatal("the tick must move on to the next card")
+	if len(m.q.Items) != 0 {
+		t.Fatal("switching leaves the unanswered card untouched")
 	}
 }
 
-func TestSwitchModeKeepsQueues(t *testing.T) {
-	m := testModel(t)
-	m.screen = sSession
-	m.pool = []rwcore.Word{
-		{ID: 1, Text: "r1", Translations: map[string]string{"RUS": "р"}, Recognition: rwcore.ModeState{Level: 2}, Reproduction: rwcore.ModeState{Level: 2}},
-		{ID: 2, Text: "n1", Translations: map[string]string{"RUS": "н"}},
+func TestSessionBarShowsTheDay(t *testing.T) {
+	m := dealt(t, testModel(t), rcard(1, "a", "а", 1, 2))
+	g := int64(10)
+	m.sess.day = rwcore.Day{LearnedToday: 3, Goal: &g, Due: 7, Learning: 2}
+	bar := sgrRe.ReplaceAllString(m.sessionBar(), "")
+	if !strings.Contains(bar, "3/10 today") || !strings.Contains(bar, "due 7") {
+		t.Fatalf("the bar reads the day's goal and the reviews due: %q", bar)
 	}
-	m.poolIdx = map[int64]int{1: 0, 2: 1}
-	m.sess = session{mode: modeReview, units: []reviewUnit{{id: 1, word: "r1", mode: 1}}, revWords: 1, learn: []rwcore.Word{m.pool[1]}}
-	m.advance()
-	if m.sess.reviewLeft() != 1 || m.sess.learnLeft() != 1 {
-		t.Fatalf("setup: review=%d learn=%d", m.sess.reviewLeft(), m.sess.learnLeft())
-	}
-	m = press(t, m, "tab")
-	if m.sess.mode != modeLearn || m.sess.reviewLeft() != 1 || m.sess.cur == nil || m.sess.cur.word != "n1" {
-		t.Fatalf("tab must switch to learning and keep the unanswered review word (review=%d)", m.sess.reviewLeft())
-	}
-	m = press(t, m, "tab")
-	if m.sess.mode != modeReview || m.sess.learnLeft() != 1 || m.sess.cur == nil || m.sess.cur.word != "r1" {
-		t.Fatalf("tab back must resume review and keep the unanswered new word (learn=%d)", m.sess.learnLeft())
-	}
-}
-
-func TestSessionProgressCountsWords(t *testing.T) {
-	m := testModel(t)
-	m.screen = sSession
-	m.prefs.Keyboard, m.prefs.Guess = false, false
-	m.pool = []rwcore.Word{{ID: 5, Text: "a", Translations: map[string]string{"RUS": "а"}}}
-	m.poolIdx = map[int64]int{5: 0}
-	m.due = []rwcore.DueItem{{ID: 5, Word: "a", Modes: []int64{1, 2}}}
-	m.buildReview()
-	m.advance()
-	if bar := m.sessionBar(); !strings.Contains(bar, "0/1") {
-		t.Fatalf("a word with two sides is one word to review: %q", bar)
-	}
-	m = press(t, m, " ")
-	m = press(t, m, "g")
-	if bar := m.sessionBar(); !strings.Contains(bar, "0/1") {
-		t.Fatalf("a word is not done until both sides are: %q", bar)
-	}
-	m = press(t, m, " ")
-	m = press(t, m, "g")
-	if bar := m.sessionBar(); !strings.Contains(bar, "1/1") {
-		t.Fatalf("both sides answered must finish the word: %q", bar)
+	col := sgrRe.ReplaceAllString(strings.Join(m.modeColumn(), "\n"), "")
+	if !strings.Contains(col, "Review (7)") || !strings.Contains(col, "Learning (2)") {
+		t.Fatalf("the modes count what rwcore counts: %q", col)
 	}
 }
 
@@ -1358,28 +1476,12 @@ func TestSessionQuietQueue(t *testing.T) {
 }
 
 func TestDuplicateTextsResolveByID(t *testing.T) {
-	m := testModel(t)
-	m.screen = sSession
-	m.sess.mode = modeReview
-	m.prefs.Keyboard, m.prefs.Guess = false, false
-	pool := []rwcore.Word{
-		{ID: 937, Text: "la carne", Translations: map[string]string{"RUS": "мясо"}},
-		{ID: 7393, Text: "la carne", Translations: map[string]string{"RUS": "мясо, плоть"},
-			Recognition: rwcore.ModeState{Level: 2, Step: 2}, Reproduction: rwcore.ModeState{Level: 2, Step: 4}},
-	}
-	m.due = []rwcore.DueItem{{ID: 7393, Word: "la carne", Modes: []int64{1}}}
-	next, _ := m.Update(wordsMsg{key: "pool", words: pool})
-	m = next.(Model)
-	if m.sess.cur == nil || m.sess.cur.wordID != 7393 || m.sess.cur.native != "мясо, плоть" {
-		t.Fatalf("the due word must come from its own id, got %+v", m.sess.cur)
-	}
+	m := dealt(t, testModel(t), rcard(7393, "la carne", "мясо, плоть", 1, 2))
 	m = press(t, m, " ")
 	m = press(t, m, "g")
-	if len(m.q.Items) != 1 {
-		t.Fatalf("want one queued grade, got %d", len(m.q.Items))
-	}
-	if got := m.q.Items[0].ApplyBody()["word"]; got != "7393" {
-		t.Fatalf("the grade must target the due word's id, not a same-text twin: %v", got)
+	body := answered(t, m).ApplyBody()
+	if body["word"] != "7393" || body["positive"] != true || body["op"] != "answer" || body["ts"] == nil {
+		t.Fatalf("the answer must target the dealt word's id, not a same-text twin: %v", body)
 	}
 }
 
@@ -1419,33 +1521,33 @@ func TestSwipeArrowsPickTheSideAnswer(t *testing.T) {
 		m := testModel(t)
 		m.screen = sSession
 		m.sess.mode = modeLearn
-		m.sess.cur = &card{kind: kind, word: "w", wordID: 9, fromLearn: true, reveal: reveal, mode: "rec"}
+		m.sess.cur = &card{kind: kind, word: "w", wordID: 9, reveal: reveal, mode: "rec"}
 		return m
 	}
-	m := press(t, onCard(cL1, false), "left")
-	if it := m.q.Items; len(it) != 1 || it[0].Decision != "known" || m.sess.cur.verdict != "already known" {
-		t.Fatalf("← on a new word must mark it already known: %+v", it)
+	// Each side names its answer; rwcore reads it by the card's queue.
+	for _, tc := range []struct {
+		kind   cardKind
+		reveal bool
+		key    string
+		left   bool
+	}{
+		{cL1, false, "left", true},    // already known
+		{cL1, false, "right", false},  // start learning
+		{cL1b, false, "right", false}, // keep showing
+		{cL1b, true, "left", true},    // i have memorized
+		{cR1, false, "left", true},    // got it, no block needed
+		{cR1, false, "right", false},  // missed it
+	} {
+		m := press(t, onCard(tc.kind, tc.reveal), tc.key)
+		if it := answered(t, m); it.Positive != tc.left || it.ID != 9 || m.sess.cur != nil {
+			t.Fatalf("%v %s must queue the %v answer and move on: %+v", tc.kind, tc.key, tc.left, it)
+		}
 	}
-	m = press(t, onCard(cL1, false), "right")
-	if it := m.q.Items; len(it) != 1 || it[0].Decision != "learn" {
-		t.Fatalf("→ on a new word must start learning: %+v", it)
-	}
-	m = press(t, onCard(cL1b, false), "right")
-	if len(m.q.Items) != 0 || !m.sess.cur.done || m.sess.cur.verdict != "keep showing" {
-		t.Fatal("→ on a learning word must keep showing it without queuing anything")
-	}
-	m = press(t, onCard(cL1b, true), "left")
-	if it := m.q.Items; len(it) != 1 || it[0].Decision != "learn" {
-		t.Fatalf("← on a learning word means i have memorized: %+v", it)
-	}
-	m = press(t, onCard(cR1, false), "left")
-	if len(m.q.Items) != 0 {
-		t.Fatal("arrows must not grade before the answer is shown")
-	}
-	m.sess.cur.reveal = true
-	m = press(t, m, "right")
-	if it := m.q.Items; len(it) != 1 || it[0].Result != "fail" {
-		t.Fatalf("→ after the answer means missed it: %+v", it)
+	m := onCard(cR1, false)
+	m.sess.cur.choices, m.sess.cur.pane = []string{"a", "b", "c", "d"}, paneChoose
+	m = press(t, m, "left")
+	if len(m.q.Items) != 0 || m.sess.cur == nil {
+		t.Fatal("an open block hides the swipes until it is resolved")
 	}
 }
 
@@ -1454,7 +1556,7 @@ func TestSwipeLabelsSitUnderTheCard(t *testing.T) {
 	m.screen = sSession
 	m.width, m.height = 112, 40
 	m.sess.mode = modeLearn
-	m.sess.cur = m.learnFrom(rwcore.Word{ID: 3, Text: "el topo", Translations: map[string]string{"RUS": "крот"}})
+	m = dealt(t, m, rcard(3, "el topo", "крот", 1, 0))
 	lines := strings.Split(sgrRe.ReplaceAllString(m.View(), ""), "\n")
 	bottom := -1
 	for i, ln := range lines {
@@ -1484,22 +1586,10 @@ func TestSwipeLabelsSitUnderTheCard(t *testing.T) {
 	}
 }
 
-func TestReviewCountsSameTextWordsApart(t *testing.T) {
-	m := testModel(t)
-	m.due = []rwcore.DueItem{
-		{ID: 1, Word: "blanco", Modes: []int64{1}},
-		{ID: 2, Word: "blanco", Modes: []int64{1, 2}},
-	}
-	m.buildReview()
-	if m.sess.revWords != 2 || m.sess.reviewLeft() != 2 {
-		t.Fatalf("two words sharing a text are two words to review: total=%d left=%d", m.sess.revWords, m.sess.reviewLeft())
-	}
-}
-
 func TestArrowsKeepTyping(t *testing.T) {
 	m := testModel(t)
 	m.screen = sSession
-	m.sess.cur = &card{kind: cR3, word: "x", mode: "rep", expected: []string{"x"}, attempts: 3}
+	m.sess.cur = &card{kind: cR1, word: "x", mode: "rep", keyboard: true, attempts: 3, pane: paneType}
 	m.sess.typing, m.sess.input = true, "ab"
 	m = press(t, m, "left")
 	if !m.sess.typing || m.sess.input != "ab" {
@@ -1511,7 +1601,7 @@ func TestBurstInputReplaysRunes(t *testing.T) {
 	burst := func(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
 	m := testModel(t)
 	m.screen = sSession
-	m.sess.cur = &card{kind: cR3, word: "la carne", mode: "rep", expected: []string{"la carne"}, attempts: 3}
+	m.sess.cur = &card{kind: cR1, word: "la carne", mode: "rep", keyboard: true, attempts: 3, pane: paneType}
 	m.sess.typing = true
 	next, _ := m.Update(burst("la carne"))
 	if m = next.(Model); m.sess.input != "la carne" || !m.sess.typing {
@@ -1529,11 +1619,130 @@ func TestLearningVerdictNotQueued(t *testing.T) {
 	m := testModel(t)
 	m.screen = sSession
 	m.sess.mode = modeLearn
-	m.sess.cur = m.learnFrom(rwcore.Word{Text: "la foca", Translations: map[string]string{"RUS": "тюлень"}})
+	m = dealt(t, m, rcard(7, "la foca", "тюлень", 1, 0))
 	m = press(t, m, "l")
-	out := m.View()
-	if !strings.Contains(out, "learning started") || strings.Contains(out, "queued:") || strings.Contains(out, "✓ queued") {
-		t.Fatal("start learning must say what it did, not that something was queued")
+	if m.notice != "" || strings.Contains(m.View(), "queued:") {
+		t.Fatal("start learning must not raise a queued notice")
+	}
+}
+
+func TestReviewTitleNamesItsNumber(t *testing.T) {
+	c := &card{kind: cR1, mode: "rep", stepRec: 4, stepRep: 2}
+	for _, tc := range []struct {
+		mode string
+		pane pane
+		rec  int64
+		want string
+	}{
+		{"rep", paneNone, 4, "2nd review"},
+		{"rec", paneNone, 4, "4th review"},
+		{"rec", paneType, 4, "4th review · type"},
+		{"rec", paneChoose, 11, "11th review · choose"},
+		{"rec", paneNone, 21, "21st review"},
+	} {
+		c.mode, c.pane, c.stepRec = tc.mode, tc.pane, tc.rec
+		if got := cardTitle(c); got != tc.want {
+			t.Fatalf("title %q, want %q", got, tc.want)
+		}
+	}
+	if cardTitle(&card{kind: cL1}) != "new word" || cardTitle(&card{kind: cL1b}) != "learning" {
+		t.Fatal("new and learning words keep their headers")
+	}
+}
+
+func TestStreakDotsFollowTheGoal(t *testing.T) {
+	g := int64(10)
+	m := testModel(t)
+	m.today = &rwcore.Today{WeekGoal: &g, StreakCur: 1, StreakBest: 3, Week: []rwcore.WeekDay{
+		{Date: "2000-01-03", Learned: 10}, {Date: "2000-01-04", Learned: 12}, {Date: "2000-01-05", Learned: 3},
+		{Date: "2000-01-06", Learned: 4}, {Date: "2000-01-07"}, {Date: "2000-01-08"}, {Date: "2000-01-09"},
+	}}
+	out := sgrRe.ReplaceAllString(m.viewDots(), "")
+	if !strings.HasPrefix(out, "● ── ● ── ◐ ── ◐ ── ○ ── ○ ── ○") || !strings.Contains(out, "Current 1 · Best 3") {
+		t.Fatalf("a day fills at the goal and half-fills below it:\n%s", out)
+	}
+	m.today.WeekGoal = nil
+	if out := sgrRe.ReplaceAllString(m.viewDots(), ""); !strings.HasPrefix(out, "○ ── ○ ── ○") {
+		t.Fatalf("without a goal no day fills, as on the phone:\n%s", out)
+	}
+}
+
+func TestEachAppKeepsItsOwnQueue(t *testing.T) {
+	m := testModel(t)
+	m.enqueue(queue.Intent{Op: "select", Category: "animals"})
+	if it := m.q.Items[0]; it.App != "es" || m.q.Path != queue.PathFor(m.cfg.QueuePath, "es") {
+		t.Fatalf("a change is marked with its app and kept in that app's queue: %+v in %s", it, m.q.Path)
+	}
+	next, cmd := m.openApp("en")
+	m = next.(Model)
+	if cmd == nil || m.q.Path != queue.PathFor(m.cfg.QueuePath, "en") || len(m.q.Items) != 0 || m.cli.DB != "" {
+		t.Fatalf("another app opens on its own queue and working copy: %s %d", m.q.Path, len(m.q.Items))
+	}
+	if got := queue.Load(queue.PathFor(m.cfg.QueuePath, "es")).Items; len(got) != 1 {
+		t.Fatal("the first app's queue stays as it was")
+	}
+}
+
+func TestQueuingRaisesNoNotice(t *testing.T) {
+	m := testModel(t)
+	m.screen = sLearn
+	m.enqueue(queue.Intent{Op: "select", Category: "animals", Selected: false})
+	if len(m.q.Items) != 1 || m.notice != "" {
+		t.Fatalf("a queued change must stay quiet, notice %q", m.notice)
+	}
+}
+
+func TestKeyboardNeverFirst(t *testing.T) {
+	m := testModel(t)
+	m.width, m.height = 100, 30
+	m.prefs.ShowTranscription = true
+	tr := func(s string) map[string]string { return map[string]string{"RUS": s} }
+	rc := rcard(1, "el pan", "хлеб", 2, 2)
+	rc.Word.Transcription = new("[el ˈpan]")
+	rc.Keyboard, rc.Choose = true, true
+	rc.Variants = []rwcore.Word{
+		{ID: 2, Text: "la mesa", Translations: tr("стол")},
+		rc.Word,
+		{ID: 3, Text: "el gato", Translations: tr("кот")},
+		{ID: 4, Text: "la casa", Translations: tr("дом")},
+	}
+	m = dealt(t, m, rc)
+	c := m.sess.cur
+	if c == nil || m.sess.typing || c.pane != paneNone {
+		t.Fatal("a card must open on its three blocks, never straight in the keyboard")
+	}
+	if !c.keyboard || len(c.choices) != 4 || c.choices[c.answer] != "el pan" {
+		t.Fatalf("keyboard and choose must come together: keyboard=%v choices=%v", c.keyboard, c.choices)
+	}
+	out := sgrRe.ReplaceAllString(m.View(), "")
+	for _, b := range []string{"i type", "space show", "c choose"} {
+		if !strings.Contains(out, b) {
+			t.Fatalf("the card must offer %q:\n%s", b, out)
+		}
+	}
+	if strings.Contains(out, "ˈpan") {
+		t.Fatal("the translation side must not voice the answer before it is shown")
+	}
+	m = press(t, m, "i")
+	m = press(t, m, "esc")
+	if m.sess.typing || m.sess.cur.pane != paneNone || m.screen != sSession {
+		t.Fatal("esc must close the keyboard back to the blocks")
+	}
+	if m = press(t, m, " "); !strings.Contains(sgrRe.ReplaceAllString(m.View(), ""), "ˈpan") {
+		t.Fatal("space must show the word with its transcription")
+	}
+	// rwcore deals the word side without blocks in the phone's foreign mode.
+	m = dealt(t, m, rcard(1, "el pan", "хлеб", 1, 2))
+	if c := m.sess.cur; c.keyboard || len(c.choices) != 0 {
+		t.Fatalf("a card without blocks offers none: %+v", c)
+	}
+	if out := sgrRe.ReplaceAllString(m.View(), ""); strings.Contains(out, "i type") || strings.Contains(out, "c choose") || !strings.Contains(out, "space show") {
+		t.Fatalf("the word side must offer show alone:\n%s", out)
+	}
+	lc := rcard(5, "el vaso", "стакан", 2, 1)
+	lc.Keyboard = true
+	if m = dealt(t, m, lc); m.sess.cur.kind != cL1b || m.sess.cur.prompt != "стакан" || !m.sess.cur.keyboard {
+		t.Fatalf("a word in learning gets the same blocks on its translation side: %+v", m.sess.cur)
 	}
 }
 

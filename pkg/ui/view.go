@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"cmp"
 	"fmt"
 	"maps"
 	"slices"
@@ -151,7 +150,7 @@ func (m Model) viewHints(cw int) string {
 	case sMenu:
 		return hints(cw, kb{"j/k", "move"}, kb{"enter", "open"}, kb{"esc", "back"}, kb{"q", "quit"})
 	case sSettings:
-		return hints(cw, kb{"j/k", "move"}, kb{"space", "toggle"}, kb{"g", "goal"}, kb{"esc", "back"})
+		return hints(cw, kb{"j/k", "move"}, kb{"space", "change"}, kb{"g", "goal"}, kb{"esc", "back"})
 	case sImport:
 		return hints(cw, kb{"tab", "field"}, kb{"enter", "import"}, kb{"esc", "cancel"})
 	case sAddCat:
@@ -169,32 +168,41 @@ func (m Model) sessionHints() []kb {
 	c := m.sess.cur
 	switch {
 	case m.sess.typing:
-		return []kb{{"type", "answer"}, {"enter", "check"}, {"esc", "stop"}, {"tab", "mode"}}
+		return []kb{{"type", "answer"}, {"enter", "check"}, {"esc", "back"}, {"tab", "mode"}}
+	case c == nil && len(m.sess.undo) > 0:
+		return []kb{{"u", "undo"}, {"tab", "mode"}, {"esc", "back"}, {"q", "quit"}}
 	case c == nil:
 		return []kb{{"tab", "mode"}, {"esc", "back"}, {"q", "quit"}}
 	case c.done:
-		return []kb{{"enter", "next"}, {"e", "card"}, {"tab", "mode"}, {"esc", "back"}}
+		return []kb{{"←/→", "next"}, {"e", "card"}, {"tab", "mode"}, {"esc", "back"}}
+	case c.pane == paneChoose && c.pick == 0:
+		return []kb{{"1-4/hjkl", "pick"}, {"esc", "back"}, {"tab", "mode"}, {"e", "card"}}
 	}
-	// The answers themselves sit under the card; the footer names the keys.
+	// The blocks sit on the card with their keys and the answers under it;
+	// the footer names only the arrows.
 	var bs []kb
-	switch c.kind {
-	case cR1:
-		if c.reveal {
-			bs = []kb{{"←/→", "choose"}}
-		} else {
-			bs = []kb{{"space", "show"}}
-		}
-	case cR2, cL2:
-		bs = []kb{{"1-4", "pick"}}
-	case cR3:
-		bs = []kb{{"type", "answer"}}
-	case cL1, cL1b:
-		if !c.reveal {
-			bs = append(bs, kb{"space", "show"})
-		}
-		bs = append(bs, kb{"←/→", "choose"})
+	if _, _, ok := c.swipe(); ok {
+		bs = []kb{{"←/→", "answer"}}
+	}
+	if len(m.sess.undo) > 0 {
+		bs = append(bs, kb{"u", "undo"})
 	}
 	return append(bs, kb{"tab", "mode"}, kb{"e", "card"}, kb{"z", "zen"}, kb{"esc", "back"})
+}
+
+// blocksRow lists a card's ways to check itself, each with its key:
+// type, show and choose, equal and in the phone's order.
+func blocksRow(c *card) string {
+	var bs []string
+	block := func(k, label string) { bs = append(bs, interactive.Render(k)+" "+fg.Render(label)) }
+	if c.keyboard {
+		block("i", "type")
+	}
+	block("space", "show")
+	if len(c.choices) > 0 {
+		block("c", "choose")
+	}
+	return strings.Join(bs, "   ")
 }
 
 func window(n, cur, h int) (from, to int) {
@@ -656,34 +664,83 @@ func (m Model) viewLearn(cw, h int) string {
 	return b.String()
 }
 
+// viewDots draws the phone's streak week (StreakProgressView): the calendar
+// week, a full dot where the day's learned words reached the daily goal and a
+// half one below it, the line lit between two full or two half days. Today's
+// dot is blue.
 func (m Model) viewDots() string {
-	if m.today == nil {
+	if m.today == nil || len(m.today.Week) == 0 {
 		return dim.Render("no history yet")
 	}
-	today := time.Now()
-	var dots []string
-	for i := 6; i >= 0; i-- {
-		d := today.AddDate(0, 0, -i).Format("2006-01-02")
-		if slices.Contains(m.today.ActiveDates, d) {
-			dots = append(dots, attn.Render("●"))
-		} else {
-			dots = append(dots, faint.Render("○"))
+	level := func(d rwcore.WeekDay) int {
+		g := m.today.WeekGoal
+		switch {
+		case g == nil || *g <= 0 || d.Learned <= 0:
+			return 0
+		case d.Learned >= *g:
+			return 2
+		}
+		return 1
+	}
+	today := time.Now().Format("2006-01-02")
+	var b strings.Builder
+	for i, d := range m.today.Week {
+		lv := level(d)
+		if i > 0 {
+			if lv > 0 && lv == level(m.today.Week[i-1]) {
+				b.WriteString(attn.Render(" ── "))
+			} else {
+				b.WriteString(faint.Render(" ── "))
+			}
+		}
+		glyph := [...]string{"○", "◐", "●"}[lv]
+		switch {
+		case d.Date == today:
+			b.WriteString(interactive.Render(glyph))
+		case lv == 0:
+			b.WriteString(faint.Render(glyph))
+		default:
+			b.WriteString(attn.Render(glyph))
 		}
 	}
-	return strings.Join(dots, " ── ") + dim.Render("   Current ") + attn.Render(fmt.Sprint(m.today.StreakCur)) + dim.Render(" · Best ") + attn.Render(fmt.Sprint(m.today.StreakBest))
+	return b.String() + dim.Render("   Current ") + attn.Render(fmt.Sprint(m.today.StreakCur)) + dim.Render(" · Best ") + attn.Render(fmt.Sprint(m.today.StreakBest))
 }
 
 func (m Model) viewSession(cw, h int) string {
-	if m.loading != "" && m.sess.cur == nil {
-		return dim.Render("loading session…")
+	s := &m.sess
+	if s.cur == nil && (s.dealing || !s.started) {
+		return dim.Render("dealing…")
 	}
-	if m.sess.cur == nil {
-		if m.sess.mode == modeLearn {
-			return dim.Render("There are no new words in the chosen categories")
-		}
-		return dim.Render("There are no words for review in the chosen categories")
+	if s.cur == nil {
+		return dim.Render(m.sessionDone())
 	}
 	return m.viewSessionWide(cw, cw, h)
+}
+
+// sessionDone says why the phone would have no card now.
+// sessionDone is what a session shows once it has no card, in the phone's
+// words: the goal reached screen (f02) for learning, when the next review
+// comes (wy5) for review, or why there is nothing (WordCardStateHelper).
+func (m Model) sessionDone() string {
+	d := m.sess.day
+	switch {
+	case m.sess.mode != modeReview && d.GoalReached && d.Goal != nil:
+		lines := []string{
+			bold.Render("Nice job!"),
+			"Today you've learned " + prog.Render(plural(d.LearnedToday, "%d new word", "%d new words")),
+		}
+		if d.NextReview != nil {
+			lines = append(lines, dim.Render(showUpIn(*d.NextReview-m.sess.now)))
+		}
+		return strings.Join(append(lines, "", dim.Render("[c] continue · add more new words   [r] review")), "\n")
+	case m.sess.mode == modeLearn && !m.anySelected():
+		return "Choose categories to learn new words from"
+	case m.sess.mode == modeLearn:
+		return "There are no new words in the chosen categories"
+	case d.NextReview != nil:
+		return showUpIn(*d.NextReview - m.sess.now)
+	}
+	return "There are no words for review in the chosen categories"
 }
 
 // viewSessionWide lays out a running session across the whole width w: the
@@ -739,8 +796,8 @@ func (m Model) modeColumn() []string {
 		mode  int
 		label string
 	}{
-		{modeReview, fmt.Sprintf("Review (%d)", m.sess.reviewLeft())},
-		{modeLearn, fmt.Sprintf("Learning (%d)", m.sess.learnLeft())},
+		{modeReview, fmt.Sprintf("Review (%d)", m.sess.day.Due)},
+		{modeLearn, fmt.Sprintf("Learning (%d)", m.sess.day.Learning)},
 		{modeMixed, "Mixed"},
 	}
 	out := make([]string, 0, len(rows))
@@ -757,7 +814,12 @@ func (m Model) modeColumn() []string {
 // cardBlock renders the card with its two swipe answers right under the
 // bottom border: "← left answer" flush left, "right answer →" flush right.
 func (m Model) cardBlock(w, maxH int) (string, bool) {
-	left, right, ok := m.sess.cur.swipe()
+	c := m.sess.cur
+	left, right, ok := m.swipeSides(c)
+	if !ok && c != nil && c.done {
+		// An answered card waits for the user; any arrow moves on.
+		left, right, ok = "", "Next", true
+	}
 	if !ok {
 		return m.viewCard(w, maxH)
 	}
@@ -766,7 +828,10 @@ func (m Model) cardBlock(w, maxH int) (string, bool) {
 }
 
 func swipeLine(left, right string, w int) string {
-	l := interactive.Render("←") + " " + swipeStyle(left).Render(left)
+	l := ""
+	if left != "" {
+		l = interactive.Render("←") + " " + swipeStyle(left).Render(left)
+	}
 	r := swipeStyle(right).Render(right) + " " + interactive.Render("→")
 	gap := w - 4 - lipgloss.Width(l) - lipgloss.Width(r)
 	if gap < 1 {
@@ -786,27 +851,20 @@ func swipeStyle(answer string) lipgloss.Style {
 	return fg
 }
 
-// sessionBar is the progress line over the card: words finished in the
-// current mode, the answer tally and the write queue.
+// sessionBar is the line over the card: the words learned today against
+// the goal, the reviews due, the answer tally and the write queue.
 func (m Model) sessionBar() string {
 	s := &m.sess
-	revDone := s.revWords - s.reviewLeft()
-	lrnDone := len(s.learn) - s.learnLeft()
-	done, total := revDone, s.revWords
-	switch s.mode {
-	case modeLearn:
-		done, total = lrnDone, len(s.learn)
-	case modeMixed:
-		done, total = revDone+lrnDone, s.revWords+len(s.learn)
-	}
-	done = min(max(done, 0), total)
+	d := s.day
 	barW := 20
 	filled := 0
-	if total > 0 {
-		filled = done * barW / total
+	today := fmt.Sprintf("%d today", d.LearnedToday)
+	if d.Goal != nil && *d.Goal > 0 {
+		filled = int(min(d.LearnedToday, *d.Goal) * int64(barW) / *d.Goal)
+		today = fmt.Sprintf("%d/%d today", d.LearnedToday, *d.Goal)
 	}
 	bar := prog.Render(strings.Repeat("━", filled)) + faint.Render(strings.Repeat("━", barW-filled))
-	line := fmt.Sprintf("%s %d/%d · ✓%d ✗%d", bar, done, total, s.ok, s.fail)
+	line := fmt.Sprintf("%s %s · due %d · ✓%d ✗%d", bar, today, d.Due, s.ok, s.fail)
 	if len(m.q.Items) > 0 {
 		line += dim.Render(fmt.Sprintf(" · +%d queued", len(m.q.Items)))
 	}
@@ -845,60 +903,32 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 	var raw []cardLine
 	add := func(pri int, s string) { raw = append(raw, cardLine{s, pri, false}) }
 	addChoice := func(s string) { raw = append(raw, cardLine{s, 0, true}) }
-	stage := ""
-	if w, found := m.poolWord(c.wordID); found {
-		stage = " " + wordStage(w.Recognition.Step, w.Reproduction.Step)
-	}
-	add(2, dim.Render(cardTitle(c))+stage)
+	add(2, dim.Render(cardTitle(c))+" "+wordStage(c.stepRec, c.stepRep))
+	// Once picked, every answer gets a mark column: ▸ right, ✗ the miss.
 	choicesBlock := func() {
 		for i, ch := range c.choices {
 			line := fmt.Sprintf("%d  %s", i+1, ch)
-			if c.done && i == c.answer {
+			switch {
+			case c.pick == 0:
+			case i == c.answer:
 				line = okStyle.Render("▸ " + line)
-			} else if c.done {
-				line = dim.Render(line)
+			case i == c.pick-1:
+				line = badStyle.Render("✗ " + line)
+			default:
+				line = dim.Render("  " + line)
 			}
 			addChoice(line)
 		}
 	}
-	resultBlock := func(okText, badText string) {
-		if !c.done {
-			return
-		}
-		if c.wasOk {
-			add(2, okStyle.Render(okText))
-		} else {
-			add(2, badStyle.Render(badText))
-		}
-	}
-	switch c.kind {
-	case cR1:
-		add(0, bold.Render(c.prompt))
-		if c.tr != "" {
-			add(3, c.tr)
-		}
-		if c.reveal || c.done {
-			add(0, content.Render(c.native))
-			if c.example != "" {
-				add(3, c.example)
-			}
-		}
-		resultBlock("✓ Got it", "✗ Missed it")
-	case cR2:
-		add(3, dim.Render("how do you say:"))
-		add(0, bold.Render(c.prompt))
-		choicesBlock()
-		if c.done {
-			if c.wasOk {
-				add(2, okStyle.Render("✓"))
-			} else {
-				add(2, badStyle.Render("✗ answer: "+c.choices[c.answer]))
-			}
-		}
-	case cR3:
-		add(3, dim.Render("type in the target language:"))
-		add(0, bold.Render(c.prompt))
-		if m.sess.typing || c.done {
+	typeBlock := func() {
+		switch c.typed {
+		case vRight:
+			add(2, okStyle.Render("✓ right"))
+		case vPartial:
+			add(2, attn.Render("✓ nearly right"))
+		case vWrong:
+			add(2, badStyle.Render("✗ out of attempts"))
+		default:
 			in := m.sess.input
 			for lipgloss.Width(in) > inner-4 && len(in) > 0 {
 				_, size := utf8.DecodeRuneInString(in)
@@ -908,39 +938,39 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 				in = "…" + in
 			}
 			add(0, "› "+in+"▌")
-		}
-		if !c.done {
 			add(1, faint.Render(fmt.Sprintf("attempts left: %d", c.attempts)))
-		} else if c.wasOk {
+		}
+	}
+	// The transcription voices the foreign word: under the prompt when the
+	// prompt is the word, with the answer once the translation side opens.
+	wordFirst := c.native != c.word
+	add(0, bold.Render(c.prompt))
+	if c.tr != "" && wordFirst {
+		add(3, c.tr)
+	}
+	switch c.pane {
+	case paneChoose:
+		choicesBlock()
+	case paneType:
+		typeBlock()
+	}
+	if c.reveal || c.done {
+		// A pick already marks the answer among the four.
+		if c.native != "" && c.pane != paneChoose {
+			add(0, content.Render(c.native))
+		}
+		if c.tr != "" && !wordFirst {
+			add(3, c.tr)
+		}
+		if c.example != "" {
+			add(3, c.example)
+		}
+	}
+	if c.kind == cR1 && c.done {
+		if c.wasOk {
 			add(2, okStyle.Render("✓ Got it"))
 		} else {
 			add(2, badStyle.Render("✗ Missed it"))
-		}
-	case cL1, cL1b:
-		add(0, bold.Render(c.prompt))
-		if c.tr != "" {
-			add(3, c.tr)
-		}
-		if c.reveal || c.done {
-			if c.native != "" {
-				add(0, content.Render(c.native))
-			}
-			if c.example != "" {
-				add(3, c.example)
-			}
-		}
-		if c.done {
-			add(2, okStyle.Render("✓ "+cmp.Or(c.verdict, "done")))
-		}
-	case cL2:
-		add(0, bold.Render(c.prompt)+" → choose translation")
-		choicesBlock()
-		if c.done {
-			if c.wasOk {
-				add(2, okStyle.Render("✓"))
-			} else {
-				add(2, badStyle.Render("✗ answer: "+c.choices[c.answer]))
-			}
 		}
 	}
 	// Wrap, preserving priority and choice flags.
@@ -950,9 +980,17 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 			lines = append(lines, cardLine{wln, cl.pri, cl.choice})
 		}
 	}
-	budget := maxH - 2 // frame border
-	if budget < 1 {
-		budget = 1
+	budget := max(maxH-2, 1) // frame border
+	// The blocks row sits on the card's bottom edge, like the phone's
+	// buttons; a card too short for it and the prompt keeps the prompt.
+	var foot []string
+	if c.pane == paneNone && !c.reveal && !c.done {
+		foot = wrapStyled(blocksRow(c), inner)
+		if budget-len(foot) >= 1 {
+			budget -= len(foot)
+		} else {
+			foot = nil
+		}
 	}
 	// Drop expendable lines (highest priority number, last first).
 	for len(lines) > budget {
@@ -1002,9 +1040,12 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 	}
 	// Pad up to 10 content rows only when the budget allows: Height is a
 	// minimum and padding past maxH would push the frame out of view.
-	cardH := min(10, maxH-2)
-	if cardH < 1 {
-		cardH = 1
+	cardH := max(min(10, maxH-2), 1)
+	if len(foot) > 0 {
+		for len(out)+len(foot) < cardH {
+			out = append(out, "")
+		}
+		out = append(out, foot...)
 	}
 	// lipgloss Width covers content + padding; the border adds 2 outside.
 	return abox.Width(max(cw-2, 10)).Height(cardH).Render(strings.Join(out, "\n")), cropped
@@ -1023,8 +1064,12 @@ func (m Model) viewVocab(cw, h int) string {
 	if m.vocabMode == 1 {
 		b.WriteString(dim.Render(m.wordListTitle) + "\n")
 		rows := make([]string, 0, len(m.vocabWords))
+		learning, now := "reproduction", time.Now().Unix()
+		if m.synced != nil {
+			learning = m.synced.Learning
+		}
 		for i, w := range m.vocabWords {
-			rest := truncateCell(fmt.Sprintf("%s — %s · S%d/S%d", w.Text, pickNative(w, m.nativeLang()), w.Recognition.Step, w.Reproduction.Step), cw-4)
+			rest := truncateCell(fmt.Sprintf("%s — %s · %s", w.Text, pickNative(w, m.nativeLang()), wordStatus(w, learning, now)), cw-4)
 			line := wordStage(w.Recognition.Step, w.Reproduction.Step) + " " + rest
 			if i == m.wlIdx {
 				rows = append(rows, sel.Render("▸ "+line))
@@ -1197,7 +1242,7 @@ func ordinal(n int64) string {
 
 func (m Model) viewStats(cw int) string {
 	var b strings.Builder
-	b.WriteString(bold.Render("Stats · "+m.appID+" · 7 days") + "\n")
+	b.WriteString(bold.Render("Stats · "+m.appID+" · this week") + "\n")
 	b.WriteString(m.viewDots() + "\n")
 	b.WriteString(faint.Render(strings.Repeat("─", cw)) + "\n")
 	var learned, reviewed, memorizing, known, mastered int64
@@ -1234,34 +1279,23 @@ func (m Model) viewStats(cw int) string {
 }
 
 func (m Model) viewBars() string {
-	if m.today == nil {
+	if m.today == nil || len(m.today.Week) == 0 {
 		return ""
 	}
-	active := m.today.ActiveDates
 	glyphs := []string{"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
-	now := time.Now()
-	todayStr := now.Format("2006-01-02")
-	vals := make([]int, 7)
-	for i := range vals {
-		d := now.AddDate(0, 0, i-6).Format("2006-01-02")
-		switch {
-		case d == todayStr:
-			vals[i] = int(m.today.Learned + m.today.Reviewed)
-		case slices.Contains(active, d):
-			vals[i] = 1
-		}
+	mx := int64(1)
+	for _, d := range m.today.Week {
+		mx = max(mx, d.Learned)
 	}
-	mx := max(1, slices.Max(vals))
-	bars := make([]string, 0, 7)
-	for _, v := range vals {
-		idx := min(v*7/mx, 7)
-		if v == 0 {
+	bars := make([]string, 0, len(m.today.Week))
+	for _, d := range m.today.Week {
+		if d.Learned == 0 {
 			bars = append(bars, faint.Render(glyphs[0]))
 		} else {
-			bars = append(bars, prog.Render(glyphs[idx]))
+			bars = append(bars, prog.Render(glyphs[min(d.Learned*7/mx, 7)]))
 		}
 	}
-	return strings.Join(bars, " ") + dim.Render("  7d · counts before today are presence-only")
+	return strings.Join(bars, " ") + dim.Render("  learned per day · Mon–Sun")
 }
 
 func (m Model) viewSync(cw int) string {
@@ -1353,33 +1387,29 @@ func onoff(v bool) string {
 	return faint.Render("off")
 }
 
+// viewSettings lists the settings shared with the phone (they live in the
+// backup's SETTINGS and go to iCloud with the next write), then this
+// computer's own.
 func (m Model) viewSettings(h int) string {
-	goal := "Not set"
-	if m.today != nil && m.today.Goal != nil {
-		goal = fmt.Sprint(*m.today.Goal)
-	} else if m.stats != nil && m.stats.Settings.DailyGoal != nil {
-		goal = *m.stats.Settings.DailyGoal
-	}
-	rows := []struct{ label, value string }{
-		{"Show transcription", onoff(m.prefs.ShowTranscription)},
-		{"New words first language", m.prefs.NewFirst},
-		{"Review first language", m.prefs.ReviewFirst},
-		{"Guessing game", onoff(m.prefs.Guess)},
-		{"Keyboard input", onoff(m.prefs.Keyboard)},
-		{"Show translation at once", onoff(m.prefs.RevealAtOnce)},
-		{"Review words from", m.prefs.ReviewFrom},
-		{"Daily goal", goal + dim.Render("  [g] adjust")},
-	}
-	var marked []string
-	for i, r := range rows {
-		line := fmt.Sprintf("%s: %s", r.label, r.value)
-		if i == m.setIdx {
-			marked = append(marked, sel.Render("▸ "+line))
-		} else {
-			marked = append(marked, "  "+line)
+	var lines []string
+	cursor := 0
+	for i, r := range settingRows {
+		switch i {
+		case 0:
+			lines = append(lines, dim.Render("Shared with the phone"))
+		case sharedRows:
+			lines = append(lines, "", dim.Render("This computer"))
 		}
+		line := r.label + ": " + m.settingValue(r)
+		if i == m.setIdx {
+			cursor = len(lines)
+			line = sel.Render("▸ " + line)
+		} else {
+			line = "  " + line
+		}
+		lines = append(lines, line)
 	}
-	return bold.Render("Settings") + "\n" + windowedCursor(marked, m.setIdx, max(h-1, 1))
+	return bold.Render("Settings") + "\n" + windowedCursor(lines, cursor, max(h-1, 1))
 }
 
 func (m Model) viewImport() string {

@@ -1,13 +1,13 @@
 package ui
 
 import (
-	"cmp"
 	"encoding/json"
+	"fmt"
 	"maps"
-	"math/rand"
 	"slices"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"reword-tui/pkg/queue"
 	"reword-tui/pkg/rwcore"
 )
@@ -16,14 +16,35 @@ type cardKind int
 
 const (
 	cR1 cardKind = iota
-	cR2
-	cR3
 	cL1
 	cL1b
-	cL2
 )
 
-// Session modes. The Learn menu lists them as Learn, Review, Mixed.
+// pane is the block a tested card opened. Like the phone, a card offers
+// three equal ways to check yourself — type, show, choose from four —
+// and none of them is picked for the user.
+type pane int
+
+const (
+	paneNone pane = iota
+	paneType
+	paneChoose
+)
+
+// verdict is how a typed answer came out.
+type verdict int
+
+const (
+	vNone verdict = iota
+	vRight
+	// vPartial is accepted in yellow, as on the phone: loose letters (an
+	// accent, ё for е) or only some of the meanings.
+	vPartial
+	vWrong
+)
+
+// Session modes. The Learn menu lists them as Learn, Review, Mixed; they
+// map to the phone's sessions: new-only, review-only and smart.
 const (
 	modeReview = iota
 	modeLearn
@@ -31,92 +52,72 @@ const (
 )
 
 type card struct {
-	kind      cardKind
-	word      string
-	wordID    int64
-	prompt    string
-	native    string
-	tr        string
-	example   string
-	choices   []string
-	answer    int
-	expected  []string
-	mode      string
-	reveal    bool
-	done      bool
-	wasOk     bool
-	attempts  int
-	fromLearn bool       // drawn from the learning queue, not a review unit
-	unit      reviewUnit // review unit behind the card, put back on a mode switch
-	verdict   string     // what a learning decision did, shown once resolved
-}
-
-type reviewUnit struct {
-	id      int64
-	word    string
-	mode    int64
-	overdue int64
+	kind     cardKind
+	word     string
+	wordID   int64
+	prompt   string
+	native   string // what the card hides: the translation, or the word itself
+	tr       string
+	example  string
+	choices  []string // choose-from-4 answers; empty when the block is off
+	answer   int
+	keyboard bool // the keyboard block is offered; rwcore grades the answer
+	pane     pane
+	pick     int // chosen answer, 1-based; 0 = not yet
+	typed    verdict
+	mode     string // the side the card asks: "rec" or "rep"
+	stepRec  int64
+	stepRep  int64
+	reveal   bool
+	done     bool
+	wasOk    bool
+	attempts int
+	// variantIDs are the choose-from-4's words, kept so an undo shows the
+	// card again with the same answers.
+	variantIDs []int64
 }
 
 type session struct {
 	mode     int
-	units    []reviewUnit
-	revWords int // distinct words in the review queue when it was built
-	learn    []rwcore.Word
-	lpos     int
-	turn     bool
-	started  bool
+	day      rwcore.Day
+	now      int64 // when the last card was dealt
 	cur      *card
-	seq      int // bumps on every card change so stale auto-advance ticks are ignored
+	dealing  bool // a deal is out; its card lands in cur
+	started  bool
 	ok       int
 	fail     int
 	zen      bool
 	typing   bool
 	input    string
+	checking bool // a typed answer is out with rwcore
+	undo     []undoStep
 }
 
-// reviewLeft counts distinct words still to review, the current card included.
-func (s *session) reviewLeft() int {
-	seen := map[unitWord]bool{}
-	for _, u := range s.units {
-		seen[u.key()] = true
-	}
-	if c := s.cur; c != nil && !c.done && !c.fromLearn && c.unit.word != "" {
-		seen[c.unit.key()] = true
-	}
-	return len(seen)
+// undoDepth is how many answers the phone's presenter keeps to take back.
+const undoDepth = 200
+
+// undoStep is one answer the session can take back (the phone's foa): the
+// word's scheduling columns before it, when it was given, and the card as
+// it was shown.
+type undoStep struct {
+	wordID   int64
+	word     string
+	side     int64 // 1 recognition, 2 reproduction
+	row      json.RawMessage
+	at       int64
+	variants []int64
+	counted  int // +1 got it, -1 missed it, 0 not a review
 }
 
-// unitWord identifies the word behind a review unit: by id, since texts
-// repeat across categories, else by text.
-type unitWord struct {
-	id   int64
-	text string
-}
-
-func (u reviewUnit) key() unitWord {
-	if u.id != 0 {
-		return unitWord{id: u.id}
+// kind names the phone's session for a mode.
+func (s *session) kind() string {
+	switch s.mode {
+	case modeReview:
+		return "review"
+	case modeLearn:
+		return "new"
 	}
-	return unitWord{text: u.word}
-}
-
-// learnLeft counts learning words not finished yet, the current card included.
-func (s *session) learnLeft() int {
-	n := len(s.learn) - s.lpos
-	if c := s.cur; c != nil && !c.done && c.fromLearn {
-		n++
-	}
-	return max(n, 0)
-}
-
-// poolWord resolves a word from the already-loaded session pool,
-// avoiding a backend round-trip per card.
-func (m *Model) poolWord(id int64) (rwcore.Word, bool) {
-	if i, ok := m.poolIdx[id]; ok && i >= 0 && i < len(m.pool) {
-		return m.pool[i], true
-	}
-	return rwcore.Word{}, false
+	return "smart"
 }
 
 func pickNative(w rwcore.Word, native string) string {
@@ -141,18 +142,6 @@ func firstLine(s string) string {
 		return strings.TrimSpace(s[:i])
 	}
 	return strings.TrimSpace(s)
-}
-
-func normalizeAnswer(s string) string {
-	s = strings.ToLower(s)
-	s = strings.Map(func(r rune) rune {
-		switch r {
-		case '-', '‐', '−', '–', '—':
-			return ' '
-		}
-		return r
-	}, s)
-	return strings.Join(strings.Fields(s), " ")
 }
 
 func pickExample(w rwcore.Word, native string) string {
@@ -221,245 +210,241 @@ func parseExamplesFull(raw string) [][2]string {
 	return out
 }
 
-func (m *Model) buildLearnQueue() {
-	var q []rwcore.Word
-	for _, w := range m.pool {
-		if w.Recognition.Level <= 1 || w.Reproduction.Level <= 1 {
-			q = append(q, w)
-		}
-	}
-	rand.Shuffle(len(q), func(i, j int) { q[i], q[j] = q[j], q[i] })
-	m.sess.learn = q
-}
-
-func (m *Model) buildReview() {
-	var units []reviewUnit
-	for _, d := range m.due {
-		modes := slices.Clone(d.Modes)
-		switch m.prefs.ReviewFirst {
-		case "native":
-			slices.Sort(modes)
-			slices.Reverse(modes)
-		case "target":
-			slices.Sort(modes)
-		default:
-			rand.Shuffle(len(modes), func(i, j int) { modes[i], modes[j] = modes[j], modes[i] })
-		}
-		for _, mo := range modes {
-			units = append(units, reviewUnit{id: d.ID, word: d.Word, mode: mo, overdue: d.OverdueSecs})
-		}
-	}
-	m.sess.units = units
-	seen := map[unitWord]bool{}
-	for _, u := range units {
-		seen[u.key()] = true
-	}
-	m.sess.revWords = len(seen)
-}
-
-func (m *Model) pickReview() *card {
-	u := m.sess.units
-	if len(u) == 0 {
+// cardFrom lays out a card rwcore dealt. Recognition shows the word and
+// hides its translation, reproduction the other way round. The blocks come
+// as the phone offers them: the keyboard asks for what the card hides (rwcore
+// grades it against the whole of it), and the choose block reads its four
+// answers the way the card does.
+func cardFrom(rc *rwcore.Card, native string, prefs Prefs) *card {
+	if rc == nil {
 		return nil
 	}
-	n := len(u)
-	if n > 5 {
-		n = 5
+	w := rc.Word
+	nat := pickNative(w, native)
+	c := &card{
+		word:     w.Text,
+		wordID:   w.ID,
+		example:  pickExample(w, native),
+		reveal:   prefs.RevealAtOnce,
+		keyboard: rc.Keyboard,
+		attempts: 3,
+		stepRec:  w.Recognition.Step,
+		stepRep:  w.Reproduction.Step,
 	}
-	i := rand.Intn(n)
-	picked := u[i]
-	m.sess.units = append(u[:i], u[i+1:]...)
-	c := m.reviewCard(picked.id, picked.word, picked.mode)
-	c.unit = picked
+	switch rc.Status {
+	case 0:
+		c.kind = cL1
+	case 1:
+		c.kind = cL1b
+	default:
+		c.kind = cR1
+	}
+	if w.Transcription != nil && prefs.ShowTranscription {
+		c.tr = *w.Transcription
+	}
+	show := func(v rwcore.Word) string { return pickNative(v, native) }
+	if rc.Side == 1 {
+		c.mode, c.prompt, c.native = "rec", w.Text, nat
+	} else {
+		c.mode, c.prompt, c.native = "rep", nat, w.Text
+		show = func(v rwcore.Word) string { return v.Text }
+	}
+	if rc.Choose {
+		for i, v := range rc.Variants {
+			c.choices = append(c.choices, show(v))
+			c.variantIDs = append(c.variantIDs, v.ID)
+			if v.ID == w.ID {
+				c.answer = i
+			}
+		}
+	}
 	return c
 }
 
-func (m *Model) learnFrom(w rwcore.Word) *card {
-	c := m.learnCard(w)
-	c.fromLearn = true
-	return c
+// deal asks rwcore for the session's next card, keeping the card just
+// answered out of the draw as the phone does.
+func (m Model) deal(exclude int64) tea.Cmd {
+	cli, app, kind, mode := m.cli, m.appID, m.sess.kind(), m.sess.mode
+	return func() tea.Msg {
+		d, err := cli.Next(app, kind, exclude)
+		return dealMsg{mode: mode, deal: d, err: err}
+	}
 }
 
-func (m *Model) nextCard() *card {
+func (m Model) onDeal(msg dealMsg) (tea.Model, tea.Cmd) {
+	// A deal for a mode left meanwhile has no place on screen.
+	if m.screen != sSession || msg.mode != m.sess.mode {
+		return m, nil
+	}
+	m.sess.dealing = false
+	m.loading = ""
+	if msg.err != nil {
+		m.err = msg.err.Error()
+		return m, nil
+	}
+	m.sess.day, m.sess.now = msg.deal.Day, msg.deal.Now
+	m.sess.cur = cardFrom(msg.deal.Card, m.nativeLang(), m.prefs)
+	m.sess.started = true
+	m.sess.typing, m.sess.input = false, ""
+	return m, nil
+}
+
+// answer sends a swipe as the phone reads it: positive is the left answer.
+// rwcore picks the action from the queue of the card's side, the working
+// copy takes it at once, and the next card is dealt from there.
+func (m Model) answer(positive bool) (tea.Model, tea.Cmd) {
+	c := m.sess.cur
+	if c == nil {
+		return m, nil
+	}
+	if m.noticeWarn {
+		// A warning belongs to the card it was about.
+		m.setNotice("", false)
+	}
+	r := m.enqueue(queue.Intent{Op: "answer", Word: c.word, ID: c.wordID, Mode: c.mode, Positive: positive})
+	counted := 0
+	if c.kind == cR1 {
+		if positive {
+			m.sess.ok++
+			counted = 1
+		} else {
+			m.sess.fail++
+			counted = -1
+		}
+	}
+	m.sess.pushUndo(c, r, counted)
+	m.sess.cur, m.sess.typing, m.sess.input = nil, false, ""
+	m.sess.dealing = true
+	return m, m.deal(c.wordID)
+}
+
+// pushUndo keeps what taking this answer back needs; the working copy's
+// receipt carries the word's row from before it.
+func (s *session) pushUndo(c *card, r rwcore.Receipt, counted int) {
+	pre, ok := r.Detail.Detail["pre"]
+	if !ok {
+		return
+	}
+	row, err := json.Marshal(pre)
+	if err != nil {
+		return
+	}
+	at, _ := r.Detail.Detail["at"].(float64)
+	side := int64(1)
+	if c.mode == "rep" {
+		side = 2
+	}
+	if len(s.undo) == undoDepth {
+		s.undo = s.undo[1:]
+	}
+	s.undo = append(s.undo, undoStep{
+		wordID: c.wordID, word: c.word, side: side, row: row, at: int64(at),
+		variants: c.variantIDs, counted: counted,
+	})
+}
+
+// undo takes the last answer back, as the phone's undo does: the word's
+// columns return, that answer's LOG rows go, and its card comes again with
+// the choose-from-4 it had.
+func (m Model) undo() (tea.Model, tea.Cmd) {
 	s := &m.sess
-	if s.mode == modeMixed {
-		for len(s.units) > 0 || s.lpos < len(s.learn) {
-			s.turn = !s.turn
-			if s.turn && len(s.units) > 0 {
-				if c := m.pickReview(); c != nil {
-					return c
-				}
-				continue
-			}
-			if s.lpos < len(s.learn) {
-				w := s.learn[s.lpos]
-				s.lpos++
-				return m.learnFrom(w)
-			}
-		}
-		return nil
+	n := len(s.undo)
+	if n == 0 || s.dealing {
+		return m, nil
 	}
-	if s.mode == modeReview {
-		return m.pickReview()
+	st := s.undo[n-1]
+	s.undo = s.undo[:n-1]
+	m.enqueue(queue.Intent{Op: "restore", Word: st.word, ID: st.wordID, Row: st.row, At: st.at})
+	switch st.counted {
+	case 1:
+		s.ok--
+	case -1:
+		s.fail--
 	}
-	if s.lpos < len(s.learn) {
-		w := s.learn[s.lpos]
-		s.lpos++
-		return m.learnFrom(w)
+	s.cur, s.typing, s.input = nil, false, ""
+	s.dealing = true
+	cli, app, mode := m.cli, m.appID, s.mode
+	return m, func() tea.Msg {
+		d, err := cli.Card(app, st.wordID, st.side, st.variants)
+		return dealMsg{mode: mode, deal: d, err: err}
 	}
-	return nil
 }
 
-func (m *Model) reviewCard(id int64, word string, mode int64) *card {
-	w, ok := m.poolWord(id)
-	if !ok {
-		var err error
-		w, err = m.cli.Show(m.appID, wordRef(id, word))
-		if err != nil {
-			return &card{kind: cR1, word: word, wordID: id, prompt: word, native: "(gone — skipped)", done: true, wasOk: true}
-		}
+// swipeSides lays a card's answers on ← and →: the positive one on the
+// left, or on the right with inverted swipes, as on the phone.
+func (m Model) swipeSides(c *card) (left, right string, ok bool) {
+	pos, neg, ok := c.swipe()
+	if m.prefs.InvertedSwipes {
+		return neg, pos, ok
 	}
-	nat := pickNative(w, m.nativeLang())
-	tr := ""
-	if w.Transcription != nil && m.prefs.ShowTranscription {
-		tr = *w.Transcription
-	}
-	if mode == 1 {
-		prompt, shown := w.Text, nat
-		if m.prefs.ReviewFirst == "native" {
-			prompt, shown = nat, w.Text
-		} else if m.prefs.ReviewFirst == "random" && rand.Intn(2) == 0 {
-			prompt, shown = nat, w.Text
-		}
-		return &card{kind: cR1, word: w.Text, wordID: w.ID, prompt: prompt, native: shown, tr: tr, mode: "rec", reveal: m.prefs.RevealAtOnce}
-	}
-	if m.prefs.Keyboard {
-		return &card{kind: cR3, word: w.Text, wordID: w.ID, prompt: nat, native: "", tr: tr, expected: []string{w.Text}, mode: "rep", attempts: 3}
-	}
-	if m.prefs.Guess {
-		if choices, ans, ok := m.makeChoicesEs(w); ok {
-			return &card{kind: cR2, word: w.Text, wordID: w.ID, prompt: nat, native: "", tr: tr, choices: choices, answer: ans, mode: "rep"}
-		}
-	}
-	return &card{kind: cR1, word: w.Text, wordID: w.ID, prompt: w.Text, native: nat, tr: tr, mode: "rep", reveal: m.prefs.RevealAtOnce}
+	return pos, neg, ok
 }
 
-func (m *Model) learnCard(w rwcore.Word) *card {
-	nat := pickNative(w, m.nativeLang())
-	tr := ""
-	if w.Transcription != nil && m.prefs.ShowTranscription {
-		tr = *w.Transcription
+// check has rwcore grade a typed answer against the card's side of the word,
+// with the phone's own matcher.
+func (m Model) check(c *card, typed string) tea.Cmd {
+	cli, app, id, mode := m.cli, m.appID, c.wordID, c.mode
+	return func() tea.Msg {
+		res, err := cli.Check(app, id, mode, typed)
+		return checkMsg{wordID: id, mode: mode, res: res, err: err}
 	}
-	ex := pickExample(w, m.nativeLang())
-	prompt, shown := w.Text, nat
-	if m.prefs.NewFirst == "native" {
-		prompt, shown = nat, w.Text
-	} else if m.prefs.NewFirst == "random" && rand.Intn(2) == 0 {
-		prompt, shown = nat, w.Text
-	}
-	if w.Recognition.Level <= 0 && w.Reproduction.Level <= 0 {
-		return &card{kind: cL1, word: w.Text, wordID: w.ID, prompt: prompt, native: shown, tr: tr, example: ex, reveal: m.prefs.RevealAtOnce}
-	}
-	if w.Recognition.Level <= 1 || w.Reproduction.Level <= 1 {
-		return &card{kind: cL1b, word: w.Text, wordID: w.ID, prompt: prompt, native: shown, tr: tr, example: ex, reveal: m.prefs.RevealAtOnce}
-	}
-	if prompt == nat {
-		var pool []string
-		seen := map[string]bool{w.Text: true}
-		for _, o := range m.pool {
-			if seen[o.Text] || o.Text == "" {
-				continue
-			}
-			seen[o.Text] = true
-			pool = append(pool, o.Text)
-		}
-		if choices, ans, ok := pickN(w.Text, pool); ok {
-			return &card{kind: cL2, word: w.Text, wordID: w.ID, prompt: prompt, native: "", choices: choices, answer: ans}
-		}
-		return &card{kind: cR1, word: w.Text, wordID: w.ID, prompt: prompt, native: shown, tr: tr, mode: "rec"}
-	}
-	choices, ans, ok := m.makeChoices(w)
-	if !ok {
-		return &card{kind: cR1, word: w.Text, wordID: w.ID, prompt: prompt, native: shown, mode: "rec"}
-	}
-	return &card{kind: cL2, word: w.Text, wordID: w.ID, prompt: prompt, native: "", choices: choices, answer: ans}
 }
 
-func (m *Model) makeChoices(w rwcore.Word) ([]string, int, bool) {
-	nat := pickNative(w, m.nativeLang())
-	type cand struct {
-		text string
-		pos  int64
-		dist int
+// onCheck takes the grade as the phone's keyboard block does: a correct or
+// partial answer opens the card for the swipe, a wrong one costs one of the
+// three attempts, and the last one opens it as missed.
+func (m Model) onCheck(msg checkMsg) (tea.Model, tea.Cmd) {
+	s := &m.sess
+	s.checking = false
+	c := s.cur
+	if m.screen != sSession || c == nil || c.wordID != msg.wordID || c.mode != msg.mode || !s.typing {
+		return m, nil
 	}
-	var pool []cand
-	var wpos int64 = -1
-	if w.Pos != nil {
-		wpos = *w.Pos
+	if msg.err != nil {
+		m.setNotice("check failed: "+msg.err.Error(), true)
+		return m, nil
 	}
-	for _, o := range m.pool {
-		if o.Text == w.Text {
-			continue
+	if msg.res.Accepted {
+		s.typing, s.input = false, ""
+		m.setNotice("", false)
+		c.typed, c.reveal = vRight, true
+		if msg.res.Verdict == "partial" {
+			c.typed = vPartial
 		}
-		v := pickNative(o, m.nativeLang())
-		if v == "" || v == nat {
-			continue
-		}
-		var opos int64 = -1
-		if o.Pos != nil {
-			opos = *o.Pos
-		}
-		if wpos >= 0 && opos != wpos {
-			continue
-		}
-		d := len([]rune(o.Text)) - len([]rune(w.Text))
-		if d < 0 {
-			d = -d
-		}
-		pool = append(pool, cand{v, opos, d})
+		return m, nil
 	}
-	slices.SortFunc(pool, func(a, b cand) int { return cmp.Compare(a.dist, b.dist) })
-	pool = pool[:min(len(pool), 12)]
-	rand.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
-	if len(pool) < 3 {
-		return nil, 0, false
+	c.attempts--
+	s.input = ""
+	if c.attempts <= 0 {
+		s.typing = false
+		m.setNotice("", false)
+		c.typed, c.reveal = vWrong, true
+		return m, nil
 	}
-	choices := []string{nat, pool[0].text, pool[1].text, pool[2].text}
-	rand.Shuffle(len(choices), func(i, j int) { choices[i], choices[j] = choices[j], choices[i] })
-	for i, c := range choices {
-		if c == nat {
-			return choices, i, true
-		}
+	left := "1 attempt left"
+	if c.attempts > 1 {
+		left = fmt.Sprintf("%d attempts left", c.attempts)
 	}
-	return choices, 0, true
+	m.setNotice("not quite · "+left, true)
+	return m, nil
 }
 
-func (m *Model) makeChoicesEs(w rwcore.Word) ([]string, int, bool) {
-	var pool []string
-	seen := map[string]bool{w.Text: true}
-	for _, o := range m.pool {
-		if seen[o.Text] || o.Text == "" {
-			continue
-		}
-		seen[o.Text] = true
-		pool = append(pool, o.Text)
+func (m Model) switchMode(mode int) (tea.Model, tea.Cmd) {
+	if mode == m.sess.mode {
+		return m, nil
 	}
-	return pickN(w.Text, pool)
+	m.sess.mode = mode
+	m.sess.cur, m.sess.typing, m.sess.input = nil, false, ""
+	m.sess.dealing = true
+	return m, m.deal(0)
 }
 
-func pickN(answer string, pool []string) ([]string, int, bool) {
-	rand.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
-	if len(pool) < 3 {
-		return nil, 0, false
-	}
-	choices := []string{answer, pool[0], pool[1], pool[2]}
-	rand.Shuffle(len(choices), func(i, j int) { choices[i], choices[j] = choices[j], choices[i] })
-	for i, c := range choices {
-		if c == answer {
-			return choices, i, true
-		}
-	}
-	return choices, 0, true
+func (m Model) startSession(mode int) (tea.Model, tea.Cmd) {
+	m.sess = session{mode: mode, dealing: true}
+	m.screen = sSession
+	m.notice, m.noticeWarn = "", false
+	m.loading = "session"
+	return m, m.deal(0)
 }
 
 func (m *Model) nativeLang() string {
@@ -469,28 +454,38 @@ func (m *Model) nativeLang() string {
 	return "RUS"
 }
 
+// cardTitle is the phone's card header (WordCardDeckView): new word,
+// learning, or the review's number on the card's side, then the open block.
 func cardTitle(c *card) string {
+	var title string
 	switch c.kind {
 	case cR1:
-		return "recall"
-	case cR2:
-		return "choose"
-	case cR3:
-		return "type"
+		step := c.stepRec
+		if c.mode == "rep" {
+			step = c.stepRep
+		}
+		title = ordinal(step) + " review"
 	case cL1:
-		return "new word"
+		title = "new word"
 	case cL1b:
-		return "learning"
-	case cL2:
-		return "quiz"
+		title = "learning"
 	}
-	return ""
+	switch c.pane {
+	case paneType:
+		return title + " · type"
+	case paneChoose:
+		return title + " · choose"
+	}
+	return title
 }
 
 // swipe names the two answers a card offers on ← and →, mirroring the
 // phone's swipes: left takes the word out of the loop, right keeps it in.
+// As on the phone (WordCardView) they are there from the start — the
+// blocks are optional checks, not a gate.
 func (c *card) swipe() (left, right string, ok bool) {
-	if c == nil || c.done {
+	if c == nil || c.done || c.pane != paneNone && !c.reveal {
+		// An open block hides the answers until it is resolved.
 		return "", "", false
 	}
 	switch c.kind {
@@ -499,49 +494,7 @@ func (c *card) swipe() (left, right string, ok bool) {
 	case cL1b:
 		return "I have memorized", "Keep showing", true
 	case cR1:
-		if c.reveal {
-			return "Got it", "Missed it", true
-		}
+		return "Got it", "Missed it", true
 	}
 	return "", "", false
-}
-
-// swipeKey maps ← or → to the session key of the answer on that side,
-// or "" when the card offers no two-way choice right now.
-func (c *card) swipeKey(left bool) string {
-	if _, _, ok := c.swipe(); !ok {
-		return ""
-	}
-	switch c.kind {
-	case cL1:
-		if left {
-			return "k"
-		}
-		return "l"
-	case cL1b:
-		if left {
-			return "l"
-		}
-		return "keep"
-	case cR1:
-		if left {
-			return "g"
-		}
-		return "m"
-	}
-	return ""
-}
-
-func (m *Model) gradeCurrent(ok bool) {
-	c := m.sess.cur
-	if c == nil {
-		return
-	}
-	m.enqueue(queue.Intent{Op: "grade", Word: c.word, ID: c.wordID, Mode: c.mode, Result: gradeResult(ok)})
-	if ok {
-		m.sess.ok++
-	} else {
-		m.sess.fail++
-	}
-	c.done, c.wasOk = true, ok
 }
