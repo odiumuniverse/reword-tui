@@ -110,11 +110,11 @@ func TestE2EWritePath(t *testing.T) {
 	r2, err2 := c.Apply("es", map[string]any{"op": "grade", "word": "el pan", "mode": "rep", "result": "ok"})
 	mustReceipt(t, r2, err2)
 	w, err := c.Show("es", "el pan")
-	if err != nil || w.Reproduction.Step != 2 {
+	if err != nil || w.Reproduction.Level != 2 || w.Reproduction.Step != 1 || w.Recognition.Level != 2 {
 		t.Fatalf("show: %+v %v", w, err)
 	}
 	td, err := c.Today("es")
-	if err != nil || td.Learned != 1 || td.Reviewed != 1 || td.StreakCur != 1 {
+	if err != nil || td.Learned != 1 || td.Reviewed != 0 || td.StreakCur != 1 {
 		t.Fatalf("today: %+v %v", td, err)
 	}
 	if _, err := c.Select("es", "food", true); err != nil {

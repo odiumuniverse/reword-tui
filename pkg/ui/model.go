@@ -98,7 +98,7 @@ type Model struct {
 	setIdx         int
 	goalInput      string
 	goalTitle      string
-	numFor         string // what the number overlay sets: "" the daily goal, "mastered" days
+	numFor         string
 	synced         *rwcore.Synced
 	obStep         int
 	syncRows       []rwcore.StatusRow
@@ -222,10 +222,6 @@ type workMsg struct {
 	app  string
 	path string
 	err  error
-	// legacy counts old shared-queue changes that fit no single app.
-	legacy int
-	// skipped are queued changes the fresh copy could not take.
-	skipped []string
 }
 
 func (m Model) loadPickerMeta(id string) tea.Cmd {
@@ -344,7 +340,6 @@ func (m Model) doWrite() tea.Cmd {
 		written, orphaned := 0, 0
 		for _, it := range items {
 			if it.App != "" && it.App != app {
-				// Queues are per app; one found here is a bug, not a write.
 				n := written + orphaned
 				return writeMsg{written: written, orphaned: orphaned, consumed: n,
 					err: fmt.Errorf("queue holds %s's change %q; not written to %s", it.App, it.Label(), app)}
@@ -373,9 +368,6 @@ func (m Model) doWrite() tea.Cmd {
 	}
 }
 
-// enqueue queues a change for iCloud and applies it to the working copy at
-// once, returning the working copy's receipt (an answer's carries the row
-// an undo puts back).
 func (m *Model) enqueue(it queue.Intent) rwcore.Receipt {
 	if it.TS == 0 {
 		it.TS = time.Now().Unix()
@@ -387,8 +379,6 @@ func (m *Model) enqueue(it queue.Intent) rwcore.Receipt {
 		m.err = err.Error()
 		return rwcore.Receipt{}
 	}
-	// The working copy takes the intent at once, so the next card and every
-	// count already see it; iCloud gets it on the next write.
 	var r rwcore.Receipt
 	if m.cli.DB != "" {
 		var err error
@@ -396,21 +386,13 @@ func (m *Model) enqueue(it queue.Intent) rwcore.Receipt {
 			m.err = "working copy: " + err.Error()
 		}
 	}
-	// No notice: the change shows at once, and the header counts the queue.
 	return r
 }
 
-// workPath is the app's working copy: a local copy of the backup that
-// every answer lands in at once, so the next card is dealt from the state
-// the phone would see. It sits next to the write queue it mirrors.
 func (m Model) workPath() string {
 	return filepath.Join(filepath.Dir(m.cfg.QueuePath), "work-"+m.appID+".db")
 }
 
-// loadWork makes the working copy ready: always a fresh copy of the backup
-// with this app's queued changes replayed into it, so it is exactly what the
-// next write will make of iCloud. Changes of the old shared queue go to
-// their apps first.
 func (m Model) loadWork() tea.Cmd {
 	cli, app, path, base := m.cli.Remote(), m.appID, m.workPath(), m.cfg.QueuePath
 	apps := make([]string, 0, len(m.apps))
@@ -418,27 +400,18 @@ func (m Model) loadWork() tea.Cmd {
 		apps = append(apps, a.ID)
 	}
 	return func() tea.Msg {
-		left, err := migrateLegacy(cli, base, apps)
-		msg := workMsg{app: app, legacy: left}
-		if err != nil {
-			msg.err = fmt.Errorf("split the old queue: %w", err)
-			return msg
+		if _, err := migrateLegacy(cli, base, apps); err != nil {
+			return workMsg{app: app, err: fmt.Errorf("split the old queue: %w", err)}
 		}
 		if err := cli.Work(app, path); err != nil {
-			msg.err = err
-			return msg
+			return workMsg{app: app, err: err}
 		}
 		local := cli
 		local.DB = path
-		// One change the copy cannot take (its word gone meanwhile) must not
-		// cost the rest; the write will shelve it the same way.
 		for _, it := range queue.Load(queue.PathFor(base, app)).Items {
-			if _, err := local.Apply(app, it.ApplyBody()); err != nil {
-				msg.skipped = append(msg.skipped, it.Label()+": "+err.Error())
-			}
+			_, _ = local.Apply(app, it.ApplyBody())
 		}
-		msg.path = path
-		return msg
+		return workMsg{app: app, path: path}
 	}
 }
 
@@ -446,26 +419,16 @@ func (m Model) onWork(msg workMsg) (tea.Model, tea.Cmd) {
 	if msg.app != m.appID {
 		return m, nil
 	}
-	// The old shared queue may have handed this app changes meanwhile.
 	m.q = queue.Load(m.appQueuePath())
 	m.cli.DB = msg.path
 	switch {
 	case msg.err != nil:
-		// Without a working copy the screens read the backup itself; answers
-		// still queue, but the next card cannot see them.
 		m.err = "working copy: " + msg.err.Error()
 		m.cli.DB = ""
-	case len(msg.skipped) > 0:
-		m.err = fmt.Sprintf("working copy: %d queued change(s) did not apply, first: %s", len(msg.skipped), msg.skipped[0])
-	case msg.legacy > 0:
-		m.setNotice(fmt.Sprintf("%d old queued change(s) fit no single app; kept aside in %s, not written",
-			msg.legacy, filepath.Base(m.cfg.QueuePath)), true)
 	}
 	return m, tea.Batch(m.loadMain(), m.loadCats(), m.loadSynced())
 }
 
-// loadSynced reads the settings shared with the phone, from the working
-// copy once there is one.
 func (m Model) loadSynced() tea.Cmd {
 	cli, app := m.cli, m.appID
 	return func() tea.Msg {

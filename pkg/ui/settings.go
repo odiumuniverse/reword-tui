@@ -10,14 +10,11 @@ import (
 	"reword-tui/pkg/rwcore"
 )
 
-// settingRow is one line of the settings screen. A synced row names its
-// SETTINGS key and the values the phone's settings screen offers; a row of
-// this computer names the pref it flips.
 type settingRow struct {
-	key    string // SETTINGS name
-	local  string // "goal", "reveal" or "inverted"
+	key    string
+	local  string
 	label  string
-	values []string // choices to cycle; nil for the day count
+	values []string
 }
 
 const masteredKey = "word_review_interval_completely_learned_days"
@@ -41,8 +38,6 @@ var (
 	}
 )
 
-// sharedRows is how many rows at the top live in the backup and so are
-// shared with the phone; the rest belong to this computer.
 const sharedRows = 9
 
 func syncedValue(s rwcore.Synced, key string) string {
@@ -91,7 +86,6 @@ func setSyncedValue(s *rwcore.Synced, key, v string) {
 	}
 }
 
-// valueLabel spells a stored value the way the phone's settings read.
 func valueLabel(key, v string) string {
 	switch key {
 	case masteredKey:
@@ -143,8 +137,6 @@ func (m Model) settingValue(r settingRow) string {
 	return valueLabel(r.key, syncedValue(*m.synced, r.key))
 }
 
-// changeSetting moves the row under the cursor to its next value; the day
-// count and the daily goal ask for a number instead.
 func (m Model) changeSetting() (tea.Model, tea.Cmd) {
 	r := settingRows[m.setIdx]
 	switch r.local {
@@ -178,8 +170,6 @@ func (m Model) changeSetting() (tea.Model, tea.Cmd) {
 	return m.setSynced(r.key, r.values[(i+1)%len(r.values)])
 }
 
-// setSynced writes a shared setting like any other change: into the queue
-// for iCloud and at once into the working copy, so the next card follows it.
 func (m Model) setSynced(key, value string) (tea.Model, tea.Cmd) {
 	m.enqueue(queue.Intent{Op: "setting", Name: key, Value: value})
 	s := rwcore.Synced{}
@@ -190,7 +180,6 @@ func (m Model) setSynced(key, value string) (tea.Model, tea.Cmd) {
 	m.synced = &s
 	m.prefs.ShowTranscription = s.Transcription
 	if m.cli.DB == "" {
-		// Without a working copy the backup still holds the old value.
 		return m, nil
 	}
 	return m, m.loadSynced()

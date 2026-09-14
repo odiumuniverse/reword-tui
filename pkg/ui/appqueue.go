@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"cmp"
 	"slices"
 	"strconv"
 	"sync"
@@ -10,20 +11,13 @@ import (
 	"reword-tui/pkg/rwcore"
 )
 
-// Each app keeps its own write queue, next to the base queue file: a change
-// must never reach another app's backup, where the same word id can be a
-// different word.
-
-// appQueuePath is the open app's queue.
 func (m Model) appQueuePath() string {
 	return queue.PathFor(m.cfg.QueuePath, m.appID)
 }
 
-// openApp switches to an app: its own queue, and a working copy made for it.
 func (m Model) openApp(id string) (tea.Model, tea.Cmd) {
 	m.appID = id
 	m.screen = sLearn
-	// Another app's working copy and queue must not serve this one.
 	m.cli.DB = ""
 	m.q = queue.Load(m.appQueuePath())
 	return m, m.loadWork()
@@ -31,26 +25,31 @@ func (m Model) openApp(id string) (tea.Model, tea.Cmd) {
 
 var legacyMu sync.Mutex
 
-// migrateLegacy empties the shared queue of old versions, which held every
-// app's changes in one file: each change goes, ahead of that app's own, to
-// the one app whose backup has its word (by id and text) or category. What
-// fits no single app stays in the old file, never written anywhere; the
-// count of those comes back.
 func migrateLegacy(cli rwcore.Client, base string, apps []string) (int, error) {
 	legacyMu.Lock()
 	defer legacyMu.Unlock()
 	legacy := queue.Load(base)
 	if len(legacy.Items) == 0 || len(apps) == 0 {
-		// Not split yet: the apps are not known before the list loads.
 		return 0, nil
 	}
 	cats := map[string][]rwcore.Category{}
 	byApp, rest := queue.Split(legacy.Items, func(it queue.Intent) string {
 		return ownerOf(cli, apps, cats, it)
 	})
+	if len(rest) > 0 {
+		placed, left := queue.PlaceByTime(rest, workMarks(cli, base, apps, byApp), func(app string, it queue.Intent) bool {
+			return fits(cli, app, cats, it)
+		})
+		for app, items := range placed {
+			byApp[app] = append(byApp[app], items...)
+		}
+		rest = left
+	}
 	for app, items := range byApp {
 		s := queue.Load(queue.PathFor(base, app))
-		if err := s.Rewrite(append(items, s.Items...)); err != nil {
+		all := append(items, s.Items...)
+		slices.SortStableFunc(all, func(a, b queue.Intent) int { return cmp.Compare(a.TS, b.TS) })
+		if err := s.Rewrite(all); err != nil {
 			return len(legacy.Items), err
 		}
 	}
@@ -60,7 +59,23 @@ func migrateLegacy(cli rwcore.Client, base string, apps []string) (int, error) {
 	return len(rest), nil
 }
 
-// ownerOf is the one app a change fits, or "" when none or several do.
+func workMarks(cli rwcore.Client, base string, apps []string, byApp map[string][]queue.Intent) []queue.Mark {
+	var marks []queue.Mark
+	for _, app := range apps {
+		for _, it := range append(queue.Load(queue.PathFor(base, app)).Items, byApp[app]...) {
+			marks = append(marks, queue.Mark{TS: it.TS, App: app})
+		}
+	}
+	if ops, err := cli.Oplog(1000); err == nil {
+		for _, o := range ops {
+			if slices.Contains(apps, o.App) {
+				marks = append(marks, queue.Mark{TS: o.Ts, App: o.App})
+			}
+		}
+	}
+	return marks
+}
+
 func ownerOf(cli rwcore.Client, apps []string, cats map[string][]rwcore.Category, it queue.Intent) string {
 	owner := ""
 	for _, app := range apps {
@@ -87,7 +102,6 @@ func fits(cli rwcore.Client, app string, cats map[string][]rwcore.Category, it q
 		}
 		return slices.ContainsFunc(cs, func(c rwcore.Category) bool { return c.ID == it.Category })
 	case it.Op == "add" || it.Word == "":
-		// A new word or a setting names nothing a backup already has.
 		return false
 	}
 	ref := it.Word

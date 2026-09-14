@@ -43,6 +43,32 @@ func TestSplitKeepsOrderAndLeftovers(t *testing.T) {
 	}
 }
 
+func TestPlaceByTimeFollowsTheAppInUse(t *testing.T) {
+	marks := []Mark{{TS: 100, App: "es"}, {TS: 200, App: "en"}, {TS: 300, App: "es"}, {TS: 0, App: "en"}}
+	rest := []Intent{
+		{Op: "select", Category: "anatomy", TS: 250},
+		{Op: "select", Category: "animals", TS: 350},
+		{Op: "select", Category: "early", TS: 50},
+		{Op: "select", Category: "old"},
+		{Op: "select", Category: "gone", TS: 260},
+	}
+	fits := func(app string, it Intent) bool { return it.Category != "gone" }
+	placed, left := PlaceByTime(rest, marks, fits)
+	if en := placed["en"]; len(en) != 1 || en[0].Category != "anatomy" || en[0].App != "en" {
+		t.Fatalf("a change made while en was in use goes to en: %+v", en)
+	}
+	if es := placed["es"]; len(es) != 1 || es[0].Category != "animals" {
+		t.Fatalf("the latest app before a change takes it: %+v", es)
+	}
+	var names []string
+	for _, it := range left {
+		names = append(names, it.Category)
+	}
+	if !slices.Equal(names, []string{"early", "old", "gone"}) {
+		t.Fatalf("no mark before it, no time, or an app that cannot take it: left %v", names)
+	}
+}
+
 func TestRewriteReplacesAndEmptyRemoves(t *testing.T) {
 	s := Store{Path: filepath.Join(t.TempDir(), "q.jsonl")}
 	if err := s.Append(Intent{Op: "grade", Word: "a"}); err != nil {

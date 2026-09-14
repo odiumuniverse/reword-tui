@@ -66,11 +66,9 @@ func TestConsumeKeepsTailAndGarbage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// intent appended while the write was in flight
 	if err := s.Append(Intent{Op: "triage", Word: "d", Decision: "known"}); err != nil {
 		t.Fatal(err)
 	}
-	// garbage line between applied and pending
 	f, _ := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
 	f.WriteString("nope\n")
 	f.Close()

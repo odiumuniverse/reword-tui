@@ -57,7 +57,6 @@ func defaultQueuePath(dataDir, home string) string {
 	if next == legacy {
 		return next
 	}
-	// Don't strand pending intents queued at the old location.
 	if _, err := os.Stat(next); os.IsNotExist(err) {
 		if _, err := os.Stat(legacy); err == nil {
 			return legacy

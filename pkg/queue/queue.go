@@ -11,35 +11,26 @@ import (
 )
 
 type Intent struct {
-	Op string `json:"op"`
-	// App is the app the change was made in; its backup is the only one
-	// it may reach.
-	App           string   `json:"app,omitempty"`
-	Word          string   `json:"word,omitempty"`
-	ID            int64    `json:"id,omitzero"`
-	Mode          string   `json:"mode,omitempty"`
-	Result        string   `json:"result,omitempty"`
-	Decision      string   `json:"decision,omitempty"`
-	Tr            []string `json:"tr,omitempty"`
-	Transcription string   `json:"transcription,omitempty"`
-	Enroll        bool     `json:"enroll,omitempty"`
-	Category      string   `json:"category,omitempty"`
-	Selected      bool     `json:"selected,omitempty"`
-	// Positive is the left answer of an "answer" swipe.
-	Positive bool `json:"positive,omitempty"`
-	// TS is when the intent happened, so a later write lands exactly as
-	// the working copy took it.
-	TS int64 `json:"ts,omitzero"`
-	// Name and Value are a synced setting ("setting").
-	Name  string `json:"name,omitempty"`
-	Value string `json:"value,omitempty"`
-	// Row and At take an answer back ("restore"): the word's scheduling
-	// columns before it, and when it was given.
-	Row json.RawMessage `json:"row,omitempty"`
-	At  int64           `json:"at,omitzero"`
-	// Goal sets the daily goal ("goal"); By raises today's ("raise_goal").
-	Goal int64 `json:"goal,omitzero"`
-	By   int64 `json:"by,omitzero"`
+	Op            string          `json:"op"`
+	App           string          `json:"app,omitempty"`
+	Word          string          `json:"word,omitempty"`
+	ID            int64           `json:"id,omitzero"`
+	Mode          string          `json:"mode,omitempty"`
+	Result        string          `json:"result,omitempty"`
+	Decision      string          `json:"decision,omitempty"`
+	Tr            []string        `json:"tr,omitempty"`
+	Transcription string          `json:"transcription,omitempty"`
+	Enroll        bool            `json:"enroll,omitempty"`
+	Category      string          `json:"category,omitempty"`
+	Selected      bool            `json:"selected,omitempty"`
+	Positive      bool            `json:"positive,omitempty"`
+	TS            int64           `json:"ts,omitzero"`
+	Name          string          `json:"name,omitempty"`
+	Value         string          `json:"value,omitempty"`
+	Row           json.RawMessage `json:"row,omitempty"`
+	At            int64           `json:"at,omitzero"`
+	Goal          int64           `json:"goal,omitzero"`
+	By            int64           `json:"by,omitzero"`
 }
 
 func (it Intent) ApplyBody() map[string]any {
@@ -88,8 +79,6 @@ func (it Intent) ApplyBody() map[string]any {
 	return m
 }
 
-// ref names the word for rwcore: its id when known, since texts repeat
-// across categories, else the text (intents queued before ids existed).
 func (it Intent) ref() string {
 	if it.ID != 0 {
 		return strconv.FormatInt(it.ID, 10)
@@ -136,15 +125,11 @@ func (it Intent) Label() string {
 	return it.Op
 }
 
-// PathFor is an app's own queue next to the base queue file:
-// queue.jsonl → queue-es.jsonl.
 func PathFor(base, app string) string {
 	ext := filepath.Ext(base)
 	return strings.TrimSuffix(base, ext) + "-" + app + ext
 }
 
-// Split hands each intent to the app owner names, in order, marking it with
-// that app; the ones owner leaves ("") come back as rest.
 func Split(items []Intent, owner func(Intent) string) (map[string][]Intent, []Intent) {
 	byApp := map[string][]Intent{}
 	var rest []Intent
@@ -160,13 +145,36 @@ func Split(items []Intent, owner func(Intent) string) (map[string][]Intent, []In
 	return byApp, rest
 }
 
+type Mark struct {
+	TS  int64
+	App string
+}
+
+func PlaceByTime(rest []Intent, marks []Mark, fits func(app string, it Intent) bool) (map[string][]Intent, []Intent) {
+	placed := map[string][]Intent{}
+	var left []Intent
+	for _, it := range rest {
+		var best Mark
+		for _, mk := range marks {
+			if mk.App != "" && mk.TS > 0 && mk.TS <= it.TS && mk.TS >= best.TS {
+				best = mk
+			}
+		}
+		if it.TS != 0 && best.App != "" && fits(best.App, it) {
+			it.App = best.App
+			placed[best.App] = append(placed[best.App], it)
+			continue
+		}
+		left = append(left, it)
+	}
+	return placed, left
+}
+
 type Store struct {
 	Path  string
 	Items []Intent
 }
 
-// Rewrite replaces the queue with items in one rename; no items removes
-// the file. Unparseable lines do not survive it.
 func (s *Store) Rewrite(items []Intent) error {
 	if len(items) == 0 {
 		return s.Clear()
@@ -245,8 +253,6 @@ func (s *Store) Clear() error {
 	return nil
 }
 
-// Consume drops the first n applied intents, keeping intents appended
-// while the write was in flight. Unparseable lines are preserved as-is.
 func (s *Store) Consume(n int) error {
 	if n <= 0 {
 		return nil
@@ -280,7 +286,6 @@ func (s *Store) Consume(n int) error {
 		}
 		return nil
 	}
-	// Atomic replace: crash between truncate and write must not eat the queue.
 	if dir := filepath.Dir(s.Path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err

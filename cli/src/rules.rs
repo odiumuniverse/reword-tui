@@ -1,24 +1,16 @@
-//! Settings that steer the phone's learning algorithms, read from the
-//! backup's SETTINGS table with ReWord 4.3.4's parsing and defaults
-//! (om8 getters, d85/we6/t23/o08 enums).
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::collections::HashMap;
 
-/// Which side a card shows (d85): recognition asks for the translation,
-/// reproduction for the word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SideMode {
     Recognition,
     Reproduction,
-    /// Both sides are learned apart, and their due times are kept apart.
     RecognitionOrReproduction,
-    /// A card picks its side at random and one answer counts for both.
     Random,
 }
 
 impl SideMode {
-    /// d85.a: an unknown value falls back to recognition.
     pub fn parse(s: &str) -> Self {
         if s.eq_ignore_ascii_case("recognition") {
             Self::Recognition
@@ -33,30 +25,23 @@ impl SideMode {
         }
     }
 
-    /// d85.b: an answer on the recognition side moves reproduction too.
     pub fn rec_carries(self) -> bool {
         matches!(self, Self::Recognition | Self::Random)
     }
 
-    /// d85.c: an answer on the reproduction side moves recognition too.
     pub fn rep_carries(self) -> bool {
         matches!(self, Self::Reproduction | Self::Random)
     }
 
-    /// d85.d: one answer stands for the whole word; only
-    /// recognition_or_reproduction keeps the two sides apart.
     pub fn joint(self) -> bool {
         self != Self::RecognitionOrReproduction
     }
 
-    /// Sides a card may ask (a42.m/y): recognition unless the mode is
-    /// reproduction, reproduction unless it is recognition.
     pub fn allows(self) -> (bool, bool) {
         (self != Self::Reproduction, self != Self::Recognition)
     }
 }
 
-/// Side of a card for a new word (we6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewMode {
     Recognition,
@@ -65,7 +50,6 @@ pub enum NewMode {
 }
 
 impl NewMode {
-    /// om8.p: anything but reproduction or random reads as recognition.
     pub fn parse(s: &str) -> Self {
         if s.eq_ignore_ascii_case("reproduction") {
             Self::Reproduction
@@ -77,17 +61,14 @@ impl NewMode {
     }
 }
 
-/// Where the keyboard and the choose-from-4 blocks appear (t23).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Blocks {
     Disabled,
-    /// Only on reproduction cards, which ask for the foreign word.
     Foreign,
     Both,
 }
 
 impl Blocks {
-    /// om8.n: an unknown value reads as both.
     pub fn parse(s: &str) -> Self {
         if s.eq_ignore_ascii_case("disabled") {
             Self::Disabled
@@ -99,7 +80,6 @@ impl Blocks {
     }
 }
 
-/// Which categories feed the review (o08).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewFrom {
     Selected,
@@ -107,7 +87,6 @@ pub enum ReviewFrom {
 }
 
 impl ReviewFrom {
-    /// om8.v: an unknown value reads as selected.
     pub fn parse(s: &str) -> Self {
         if s.eq_ignore_ascii_case("all") {
             Self::All
@@ -125,9 +104,6 @@ pub struct Rules {
     pub keyboard: Blocks,
     pub guessing: Blocks,
     pub review_from: ReviewFrom,
-    /// word_review_interval_completely_learned_days in seconds: the
-    /// longest interval, and the gap after which a clean review retires
-    /// the word as completely learned.
     pub cap_secs: i64,
     pub daily_goal: Option<i64>,
 }
@@ -141,13 +117,10 @@ impl Default for Rules {
 impl Rules {
     pub fn from_map(m: &HashMap<String, String>) -> Self {
         let get = |k: &str, d: &'static str| m.get(k).map_or(d, String::as_str);
-        // s19.c parses the stored text with Long.parseLong; a value it
-        // cannot read would crash the phone, so fall back to the default.
         let days = m
             .get("word_review_interval_completely_learned_days")
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(60);
-        // om8.m: only an all-digits value is a goal.
         let daily_goal = m
             .get("daily_goal")
             .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
@@ -164,7 +137,6 @@ impl Rules {
         }
     }
 
-    /// A stored NULL reads as the default, like the phone's s2.e.
     pub fn load(conn: &Connection) -> Result<Self> {
         let mut st = conn.prepare("SELECT NAME, VALUE FROM SETTINGS WHERE VALUE IS NOT NULL")?;
         let map = st
@@ -176,7 +148,6 @@ impl Rules {
 }
 
 impl SideMode {
-    /// The value the phone stores for the mode.
     pub fn name(self) -> &'static str {
         match self {
             Self::Recognition => "recognition",
@@ -216,18 +187,18 @@ impl ReviewFrom {
     }
 }
 
-/// Checks a setting the desktop writes to the backup: only the learning
-/// ones, with the values the phone's settings screen offers
-/// (SettingsActivity; the mastered interval is its 1–999 day picker).
-/// The device's own settings (night mode, swipes, notifications…) stay the
-/// phone's.
 pub fn check_setting(name: &str, value: &str) -> Result<()> {
     let ok = match name {
         "new_words_card_mode" => matches!(value, "recognition" | "reproduction" | "random"),
         "word_learning_card_mode" | "word_review_card_mode" => {
-            matches!(value, "recognition" | "reproduction" | "recognition_or_reproduction" | "random")
+            matches!(
+                value,
+                "recognition" | "reproduction" | "recognition_or_reproduction" | "random"
+            )
         }
-        "enable_words_keyboard_input" | "enable_guessing_game" => matches!(value, "disabled" | "foreign" | "both"),
+        "enable_words_keyboard_input" | "enable_guessing_game" => {
+            matches!(value, "disabled" | "foreign" | "both")
+        }
         "review_words_from_categories" => matches!(value, "selected" | "all"),
         "word_review_interval_completely_learned_days" => {
             !value.is_empty()
@@ -304,7 +275,12 @@ mod tests {
 
     #[test]
     fn names_read_back() {
-        for v in ["recognition", "reproduction", "recognition_or_reproduction", "random"] {
+        for v in [
+            "recognition",
+            "reproduction",
+            "recognition_or_reproduction",
+            "random",
+        ] {
             assert_eq!(SideMode::parse(v).name(), v);
         }
         for v in ["recognition", "reproduction", "random"] {
@@ -328,7 +304,10 @@ mod tests {
         assert!(check_setting("word_review_interval_completely_learned_days", "+5").is_err());
         assert!(check_setting("new_words_card_mode", "recognition_or_reproduction").is_err());
         assert!(check_setting("show_transcription", "yes").is_err());
-        assert!(check_setting("inverted_swipes", "1").is_err(), "the phone keeps it per device");
+        assert!(
+            check_setting("inverted_swipes", "1").is_err(),
+            "the phone keeps it per device"
+        );
     }
 
     #[test]
@@ -337,7 +316,10 @@ mod tests {
         let flags = |m: SideMode| (m.rec_carries(), m.rep_carries(), m.joint(), m.allows());
         assert_eq!(flags(Recognition), (true, false, true, (true, false)));
         assert_eq!(flags(Reproduction), (false, true, true, (false, true)));
-        assert_eq!(flags(RecognitionOrReproduction), (false, false, false, (true, true)));
+        assert_eq!(
+            flags(RecognitionOrReproduction),
+            (false, false, false, (true, true))
+        );
         assert_eq!(flags(Random), (true, true, true, (true, true)));
     }
 }

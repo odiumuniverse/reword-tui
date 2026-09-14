@@ -63,9 +63,6 @@ pub fn settings(conn: &Connection) -> Result<Settings> {
         learning_card_mode: map.remove("word_learning_card_mode"),
     })
 }
-/// Column holding category titles. Apps store them per interface language
-/// (NAME_ENG, NAME_RUS, ...) and the target language never gets its own
-/// column, so take English, then the native language, then any.
 pub(crate) fn cat_name_col(conn: &Connection) -> Result<String> {
     let mut st = conn.prepare("PRAGMA table_info(CATEGORY)")?;
     let names: Vec<String> = st
@@ -382,9 +379,6 @@ pub fn today(conn: &Connection, local_today: &str) -> Result<crate::model::Today
             |r| r.get(0),
         )
         .context("count known")?;
-    // m22: a day counts once a word is learned in both directions on it,
-    // dated by the later of its two 1→2 rows. Current is the run reaching
-    // today or yesterday, Best the longest run.
     let mut st = conn.prepare(
         "SELECT COUNT(*) AS _count, MAX(lrec.local_date, lrep.local_date) AS _date FROM log lrec \
          INNER JOIN log lrep ON lrep.word_id = lrec.word_id AND lrep.queue = 1 AND lrep.nqueue = 2 AND lrep.mode = 2 \
@@ -413,9 +407,6 @@ pub fn today(conn: &Connection, local_today: &str) -> Result<crate::model::Today
     best = best.max(run);
     let dates: Vec<String> = days.into_iter().map(|(_, d)| d).collect();
 
-    // t29 + a42.E: the calendar week, each day's words learned in both
-    // directions, measured against the daily goal setting. The phone starts
-    // the week on the locale's first day; Monday here.
     let (y, mo, d) = split_day(local_today).context("bad local date")?;
     let today_n = days_from_civil(y, mo, d);
     let monday = today_n - (today_n + 3).rem_euclid(7);
@@ -437,10 +428,12 @@ pub fn today(conn: &Connection, local_today: &str) -> Result<crate::model::Today
                 |r| r.get(0),
             )
             .context("count learned per day")?;
-        week.push(crate::model::WeekDay { date: from, learned });
+        week.push(crate::model::WeekDay {
+            date: from,
+            learned,
+        });
     }
     let week_goal = rules(conn)?.daily_goal;
-    // o02.a: the day's ADJUSTED_GOAL, keyed YYYY-MM-DD like a42.k writes it.
     let goal: Option<i64> = conn
         .query_row(
             "SELECT ADJUSTED_GOAL FROM DAILY_GOAL WHERE DATE = ?",
@@ -815,10 +808,10 @@ pub fn set_goal(conn: &Connection, today: &str, goal: i64) -> Result<()> {
         rusqlite::params![today, goal, goal],
     )
     .context("write goal")?;
-    // e32 + om8.h: the day's row takes the goal on both columns, and the
-    // setting keeps it for the days to come.
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS SETTINGS (NAME TEXT PRIMARY KEY NOT NULL, VALUE TEXT)")
-        .context("ensure SETTINGS")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS SETTINGS (NAME TEXT PRIMARY KEY NOT NULL, VALUE TEXT)",
+    )
+    .context("ensure SETTINGS")?;
     conn.execute(
         "INSERT INTO SETTINGS (NAME, VALUE) VALUES ('daily_goal', ?1)
          ON CONFLICT(NAME) DO UPDATE SET VALUE = excluded.VALUE",
@@ -834,10 +827,6 @@ fn ensure_goal_table(conn: &Connection) -> Result<()> {
     )
     .context("ensure goal table")
 }
-/// The goal reached screen's "continue" (a42.k, then ADJUSTED_GOAL + by):
-/// today's row — made from the daily goal setting if the phone has not
-/// opened today — raises its adjusted goal; the base goal stays. Returns the
-/// new adjusted goal.
 pub fn raise_goal(conn: &Connection, today: &str, by: i64) -> Result<i64> {
     if by < 1 {
         anyhow::bail!("raise the goal by at least 1");
@@ -866,7 +855,6 @@ pub fn raise_goal(conn: &Connection, today: &str, by: i64) -> Result<i64> {
     set_adjusted_goal(conn, today, adjusted)?;
     Ok(adjusted)
 }
-/// Sets a day's adjusted goal, making its row from the setting if needed.
 pub fn set_adjusted_goal(conn: &Connection, date: &str, adjusted: i64) -> Result<()> {
     ensure_goal_table(conn)?;
     let base = rules(conn)?.daily_goal;
@@ -1311,7 +1299,6 @@ fn insert_word_row(
         .context("insert WORD")?;
     Ok(())
 }
-/// The card side a CardMode names.
 pub fn side_of(mode: CardMode) -> Result<crate::sched::Side> {
     match mode {
         CardMode::Recognition => Ok(crate::sched::Side::Rec),
@@ -1319,7 +1306,6 @@ pub fn side_of(mode: CardMode) -> Result<crate::sched::Side> {
         CardMode::Unknown(m) => anyhow::bail!("unsupported mode {m}"),
     }
 }
-/// The twelve scheduling columns of one word, as the phone's rules read them.
 pub fn sched_row(conn: &Connection, word: WordId) -> Result<crate::sched::Row> {
     conn.query_row(
         "SELECT Q_REC, Q_REP, T_REC, T_REP, I_REC, I_REP, S_REC, S_REP, E_REC, E_REP, F_REC, F_REP
@@ -1335,7 +1321,6 @@ pub fn sched_row(conn: &Connection, word: WordId) -> Result<crate::sched::Row> {
                 i_rep: r.get(5)?,
                 s_rec: r.get(6)?,
                 s_rep: r.get(7)?,
-                // The phone keeps easiness as a Java float.
                 e_rec: r.get::<_, f64>(8)? as f32,
                 e_rep: r.get::<_, f64>(9)? as f32,
                 f_rec: r.get(10)?,
@@ -1345,7 +1330,6 @@ pub fn sched_row(conn: &Connection, word: WordId) -> Result<crate::sched::Row> {
     )
     .with_context(|| format!("no word id {}", word.0))
 }
-/// Writes all twelve columns at once, like the phone's a42.L.
 fn write_row(conn: &Connection, word: WordId, r: &crate::sched::Row) -> Result<()> {
     conn.execute(
         "UPDATE WORD SET Q_REC=?, Q_REP=?, T_REC=?, T_REP=?, I_REC=?, I_REP=?, S_REC=?, S_REP=?,
@@ -1369,7 +1353,6 @@ fn write_row(conn: &Connection, word: WordId, r: &crate::sched::Row) -> Result<(
     .context("write WORD schedule")?;
     Ok(())
 }
-/// The phone's rules for this backup; defaults when it has no SETTINGS.
 pub fn rules(conn: &Connection) -> Result<crate::rules::Rules> {
     let has: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'SETTINGS'",
@@ -1397,8 +1380,6 @@ fn settings_map(conn: &Connection) -> Result<HashMap<String, String>> {
         .context("decode SETTINGS row")?;
     Ok(map)
 }
-/// The settings the desktop shares with the phone through SETTINGS, as the
-/// phone reads them: its defaults fill what the backup lacks.
 pub fn synced_settings(conn: &Connection) -> Result<serde_json::Value> {
     let map = settings_map(conn)?;
     let r = crate::rules::Rules::from_map(&map);
@@ -1417,12 +1398,12 @@ pub fn synced_settings(conn: &Connection) -> Result<serde_json::Value> {
 pub fn get_setting(conn: &Connection, name: &str) -> Result<Option<String>> {
     Ok(settings_map(conn)?.remove(name))
 }
-/// Writes one learning setting (see rules::check_setting) the way the phone
-/// keeps it: one NAME/VALUE row.
 pub fn set_setting(conn: &Connection, name: &str, value: &str) -> Result<()> {
     crate::rules::check_setting(name, value)?;
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS SETTINGS (NAME TEXT PRIMARY KEY NOT NULL, VALUE TEXT)")
-        .context("ensure SETTINGS")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS SETTINGS (NAME TEXT PRIMARY KEY NOT NULL, VALUE TEXT)",
+    )
+    .context("ensure SETTINGS")?;
     conn.execute(
         "INSERT INTO SETTINGS (NAME, VALUE) VALUES (?1, ?2)
          ON CONFLICT(NAME) DO UPDATE SET VALUE = excluded.VALUE",
@@ -1431,19 +1412,20 @@ pub fn set_setting(conn: &Connection, name: &str, value: &str) -> Result<()> {
     .context("write setting")?;
     Ok(())
 }
-/// Takes one answer back, like the phone's undo (foa): the word's scheduling
-/// columns return to `row`, and the LOG rows that answer wrote go. They are
-/// found by the answer's time, since row ids differ between the working
-/// copy and the backup.
-pub fn restore_answer(conn: &Connection, word: WordId, row: &crate::sched::Row, at: i64) -> Result<()> {
+pub fn restore_answer(
+    conn: &Connection,
+    word: WordId,
+    row: &crate::sched::Row,
+    at: i64,
+) -> Result<()> {
     write_row(conn, word, row)?;
-    conn.execute("DELETE FROM LOG WHERE WORD_ID = ? AND TIMESTAMP = ?", [word.0, at])
-        .context("drop undone LOG rows")?;
+    conn.execute(
+        "DELETE FROM LOG WHERE WORD_ID = ? AND TIMESTAMP = ?",
+        [word.0, at],
+    )
+    .context("drop undone LOG rows")?;
     Ok(())
 }
-/// Applies one answer the way the phone's WordPresenter does: the new WORD
-/// columns, the LOG rows it writes, and the dropped history when keeping a
-/// card pulls a reviewed side back into learning.
 pub fn answer(
     conn: &Connection,
     word: WordId,
@@ -1465,9 +1447,6 @@ pub fn answer(
         .context("drop LOG")?;
     }
     for l in &out.log {
-        // greenDAO's insertOrReplace (LogDao.l), as the phone writes them: a
-        // row with the same word, mode, queue and step replaces its twin
-        // under the backup's unique IDX_LOG_WORD_ID_MODE_QUEUE_STEP.
         conn.execute(
             "INSERT OR REPLACE INTO LOG (ID, TIMESTAMP, LOCAL_DATE, WORD_ID, MODE, QUEUE, STEP, NQUEUE, FLAGS)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1487,9 +1466,6 @@ pub fn answer(
     }
     Ok(out)
 }
-/// A review answer on the `mode` side: p32 "Got it" or k32 "Missed it".
-/// Returns the side's easiness and fails before it, which the op log keeps
-/// to tell a replayed miss from one already applied.
 pub fn grade_review(
     conn: &Connection,
     word: WordId,
@@ -1505,19 +1481,42 @@ pub fn grade_review(
         Side::Rec => (row.e_rec, row.f_rec),
         Side::Rep => (row.e_rep, row.f_rep),
     };
-    let action = if ok { Action::ReviewOk } else { Action::ReviewFail };
+    let action = if ok {
+        Action::ReviewOk
+    } else {
+        Action::ReviewFail
+    };
     answer(conn, word, side, action, now_ts, local_date)?;
     Ok((f64::from(e), f))
 }
-/// t32 "I already know": both sides park as known.
 pub fn triage_known(conn: &Connection, word: WordId, now_ts: i64, local_date: &str) -> Result<()> {
     use crate::sched::{Action, Side};
-    answer(conn, word, Side::Rec, Action::AlreadyKnown, now_ts, local_date).map(|_| ())
+    answer(
+        conn,
+        word,
+        Side::Rec,
+        Action::AlreadyKnown,
+        now_ts,
+        local_date,
+    )
+    .map(|_| ())
 }
-/// s32 "Start learning": both sides enter learning, due in 30 s.
-pub fn start_learning(conn: &Connection, word: WordId, now_ts: i64, local_date: &str) -> Result<()> {
+pub fn start_learning(
+    conn: &Connection,
+    word: WordId,
+    now_ts: i64,
+    local_date: &str,
+) -> Result<()> {
     use crate::sched::{Action, Side};
-    answer(conn, word, Side::Rec, Action::StartLearning, now_ts, local_date).map(|_| ())
+    answer(
+        conn,
+        word,
+        Side::Rec,
+        Action::StartLearning,
+        now_ts,
+        local_date,
+    )
+    .map(|_| ())
 }
 pub fn advance_learn(
     conn: &Connection,
@@ -1534,14 +1533,18 @@ pub fn advance_learn(
             decision: "learn".to_string(),
         }));
     }
-    // Without a card side, memorize on the side the learning mode shows,
-    // reproduction first when it shows both.
     let (rec_shown, rep_shown) = rules(conn)?.learning.allows();
     let learning: Vec<Side> = [Side::Rep, Side::Rec]
         .into_iter()
         .filter(|&s| row.queue(s) == 1)
         .collect();
-    let shown = |s: &Side| if *s == Side::Rec { rec_shown } else { rep_shown };
+    let shown = |s: &Side| {
+        if *s == Side::Rec {
+            rec_shown
+        } else {
+            rep_shown
+        }
+    };
     let Some(side) = learning
         .iter()
         .copied()
@@ -1557,8 +1560,6 @@ pub fn advance_learn(
         decision: "memorized".to_string(),
     }))
 }
-/// Adding a word with "learn" on: like the phone's j22, it enters learning
-/// at once, due in 30 s, without LOG rows.
 pub fn enroll_word(conn: &Connection, word: WordId, now_ts: i64, local_date: &str) -> Result<()> {
     start_learning(conn, word, now_ts, local_date)
 }
@@ -2053,8 +2054,6 @@ mod tests {
     }
     #[test]
     fn memorized_writes_like_the_users_backup() {
-        // The es backup's modes: every word graduated there reads rec 2700 /
-        // rep 1800 with a rep LOG row and a flagged rec copy.
         let (_tmp, db) = fixture_db();
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch(
@@ -2081,12 +2080,14 @@ mod tests {
         let day = "2026-09-14".to_string();
         assert_eq!(
             log_shape(&conn),
-            vec![(2, 1, 1, 2, 0, 5000, day.clone()), (1, 1, 1, 2, 2, 5000, day)]
+            vec![
+                (2, 1, 1, 2, 0, 5000, day.clone()),
+                (1, 1, 1, 2, 2, 5000, day)
+            ]
         );
     }
     #[test]
     fn review_ok_moves_both_sides_by_default() {
-        // No card modes stored: review shows reproduction, which carries.
         let (_tmp, db) = fixture_db();
         let conn = Connection::open(&db).unwrap();
         review_word(&conn, 1);
@@ -2101,12 +2102,21 @@ mod tests {
         .unwrap();
         assert_eq!(pre, (2.5, 0));
         let r = sched_row(&conn, WordId(1)).unwrap();
-        assert_eq!((r.i_rec, r.i_rep, r.s_rec, r.s_rep), (Some(10800), Some(10800), 2, 2));
-        assert_eq!((r.e_rec, r.e_rep, r.t_rec, r.t_rep), (2.75, 2.75, Some(5000), Some(5000)));
+        assert_eq!(
+            (r.i_rec, r.i_rep, r.s_rec, r.s_rep),
+            (Some(10800), Some(10800), 2, 2)
+        );
+        assert_eq!(
+            (r.e_rec, r.e_rep, r.t_rec, r.t_rep),
+            (2.75, 2.75, Some(5000), Some(5000))
+        );
         let day = "2026-09-13".to_string();
         assert_eq!(
             log_shape(&conn),
-            vec![(2, 2, 1, 2, 0, 5000, day.clone()), (1, 2, 1, 2, 2, 5000, day)]
+            vec![
+                (2, 2, 1, 2, 0, 5000, day.clone()),
+                (1, 2, 1, 2, 2, 5000, day)
+            ]
         );
     }
     #[test]
@@ -2125,8 +2135,14 @@ mod tests {
         .unwrap();
         assert_eq!(log_count(&conn), 0);
         let r = sched_row(&conn, WordId(1)).unwrap();
-        assert_eq!((r.t_rep, r.i_rep, r.s_rep, r.f_rep), (Some(100), Some(6960), 3, 1));
-        assert_eq!((r.t_rec, r.i_rec, r.f_rec, r.e_rec, r.e_rep), (Some(100), Some(6960), 1, 2.0, 2.0));
+        assert_eq!(
+            (r.t_rep, r.i_rep, r.s_rep, r.f_rep),
+            (Some(100), Some(6960), 3, 1)
+        );
+        assert_eq!(
+            (r.t_rec, r.i_rec, r.f_rec, r.e_rec, r.e_rep),
+            (Some(100), Some(6960), 1, 2.0, 2.0)
+        );
     }
     #[test]
     fn triage_known_parks() {
@@ -2281,7 +2297,6 @@ mod tests {
         assert_eq!(t.mastered, 0);
         assert_eq!(t.known, 0);
         assert_eq!(t.goal, Some(40));
-        // Only word 2 got learned both ways (rec 09-12, rep 09-13).
         assert_eq!((t.streak_cur, t.streak_best), (1, 1));
         assert_eq!(t.active_dates, vec!["2026-09-13".to_string()]);
         let t2 = today(&conn, "2026-09-14").unwrap();
@@ -2294,10 +2309,6 @@ mod tests {
     fn streak_and_week_count_learned_words_like_the_phone() {
         let (_tmp, db) = fixture_db();
         let conn = Connection::open(&db).unwrap();
-        // A word is learned once both sides went 1→2; its day is the later
-        // row's. Word 3's sides land on 09-09 and 09-10: its day is 09-10.
-        // Starting to learn (0→1) and reviews (2→2) make no day; a mirrored
-        // row (flags 2) counts, an undone one (flags 1) only for the streak.
         conn.execute_batch(
             "INSERT INTO LOG VALUES (1, 1, '2026-09-08', 1, 1, 1, 1, 2, 0);
              INSERT INTO LOG VALUES (2, 1, '2026-09-08', 1, 2, 1, 1, 2, 2);
@@ -2326,7 +2337,11 @@ mod tests {
         assert_eq!(streak("2026-09-15"), (0, 3));
         assert_eq!(streak("2026-09-10"), (3, 3));
         let t = today(&conn, "2026-09-13").unwrap();
-        let week: Vec<(&str, i64)> = t.week.iter().map(|d| (d.date.as_str(), d.learned)).collect();
+        let week: Vec<(&str, i64)> = t
+            .week
+            .iter()
+            .map(|d| (d.date.as_str(), d.learned))
+            .collect();
         assert_eq!(
             week,
             vec![
@@ -2340,13 +2355,22 @@ mod tests {
             ]
         );
         assert_eq!(t.week_goal, Some(5));
-        assert_eq!(today(&conn, "2026-09-14").unwrap().week[0].date, "2026-09-14", "a new week on Monday");
+        assert_eq!(
+            today(&conn, "2026-09-14").unwrap().week[0].date,
+            "2026-09-14",
+            "a new week on Monday"
+        );
     }
     #[test]
     fn synced_settings_read_and_write_like_the_phone() {
         let (_tmp, db) = fixture_db();
         let conn = Connection::open(&db).unwrap();
-        set_setting(&conn, "word_review_card_mode", "recognition_or_reproduction").unwrap();
+        set_setting(
+            &conn,
+            "word_review_card_mode",
+            "recognition_or_reproduction",
+        )
+        .unwrap();
         set_setting(&conn, "word_review_interval_completely_learned_days", "90").unwrap();
         set_setting(&conn, "show_transcription", "0").unwrap();
         set_setting(&conn, "show_transcription", "0").unwrap();
@@ -2355,7 +2379,10 @@ mod tests {
         assert_eq!(s["word_review_interval_completely_learned_days"], 90);
         assert_eq!(s["show_transcription"], false);
         assert_eq!(rules(&conn).unwrap().cap_secs, 90 * 86400);
-        assert_eq!(get_setting(&conn, "show_transcription").unwrap().as_deref(), Some("0"));
+        assert_eq!(
+            get_setting(&conn, "show_transcription").unwrap().as_deref(),
+            Some("0")
+        );
         assert!(set_setting(&conn, "night_mode", "dark").is_err());
         assert!(set_setting(&conn, "word_review_card_mode", "sideways").is_err());
         assert_eq!(get_setting(&conn, "night_mode").unwrap(), None);
@@ -2391,14 +2418,21 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(rows, vec![(100, 1), (100, 2)], "the twin is replaced, not a failed answer");
+        assert_eq!(
+            rows,
+            vec![(100, 1), (100, 2)],
+            "the twin is replaced, not a failed answer"
+        );
     }
     #[test]
     fn goal_changes_follow_the_phone() {
         let (_tmp, db) = fixture_db();
         let conn = Connection::open(&db).unwrap();
         set_goal(&conn, "2026-09-14", 30).unwrap();
-        assert_eq!(get_setting(&conn, "daily_goal").unwrap().as_deref(), Some("30"));
+        assert_eq!(
+            get_setting(&conn, "daily_goal").unwrap().as_deref(),
+            Some("30")
+        );
         assert_eq!(raise_goal(&conn, "2026-09-14", 15).unwrap(), 45);
         let row = |d: &str| -> (i64, i64) {
             conn.query_row(
@@ -2408,8 +2442,16 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(row("2026-09-14"), (30, 45), "continue raises only the adjusted goal");
-        assert_eq!(raise_goal(&conn, "2026-09-15", 5).unwrap(), 35, "a new day starts from the setting");
+        assert_eq!(
+            row("2026-09-14"),
+            (30, 45),
+            "continue raises only the adjusted goal"
+        );
+        assert_eq!(
+            raise_goal(&conn, "2026-09-15", 5).unwrap(),
+            35,
+            "a new day starts from the setting"
+        );
         assert!(raise_goal(&conn, "2026-09-15", 0).is_err());
         set_adjusted_goal(&conn, "2026-09-16", 50).unwrap();
         assert_eq!(row("2026-09-16"), (30, 50));

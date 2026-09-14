@@ -189,10 +189,8 @@ pub struct Settings {
     pub native_language: Option<String>,
     pub daily_goal: Option<String>,
     pub ui_language: Option<String>,
-    /// word_learning_card_mode: side a word in learning opens on.
     pub learning_card_mode: Option<String>,
 }
-/// One day of the phone's streak week: words learned in both directions.
 #[derive(Debug, Clone, Serialize)]
 pub struct WeekDay {
     pub date: String,
@@ -209,11 +207,8 @@ pub struct TodayStats {
     pub goal: Option<i64>,
     pub streak_cur: i64,
     pub streak_best: i64,
-    /// Days a word was learned in both directions (the streak's days).
     pub active_dates: Vec<String>,
-    /// The calendar week, Monday first, as the phone's streak dots.
     pub week: Vec<WeekDay>,
-    /// The daily goal setting the dots measure against.
     pub week_goal: Option<i64>,
 }
 #[derive(Debug, Clone, Serialize)]

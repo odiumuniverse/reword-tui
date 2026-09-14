@@ -66,7 +66,6 @@ func press(t *testing.T, m Model, k string) Model {
 	return next.(Model)
 }
 
-// graded answers the pending typed check the way rwcore would.
 func graded(t *testing.T, m Model, verdict string) Model {
 	t.Helper()
 	c := m.sess.cur
@@ -94,7 +93,6 @@ func TestParseExamples(t *testing.T) {
 	}
 }
 
-// dealt puts a card on screen the way a deal from rwcore lands.
 func dealt(t *testing.T, m Model, rc rwcore.Card) Model {
 	t.Helper()
 	m.screen = sSession
@@ -106,8 +104,6 @@ func dealt(t *testing.T, m Model, rc rwcore.Card) Model {
 	return next.(Model)
 }
 
-// rcard is a card rwcore could deal: side 1 asks for the translation and
-// 2 for the word; status 0 new, 1 learning, 2 review.
 func rcard(id int64, text, rus string, side, status int64) rwcore.Card {
 	lvl := rwcore.ModeState{Level: status}
 	return rwcore.Card{
@@ -119,7 +115,6 @@ func rcard(id int64, text, rus string, side, status int64) rwcore.Card {
 	}
 }
 
-// answered is the swipe the session queued last.
 func answered(t *testing.T, m Model) queue.Intent {
 	t.Helper()
 	if len(m.q.Items) == 0 {
@@ -1156,7 +1151,6 @@ func TestScrollFit(t *testing.T) {
 	if m.scrOff[sStats] != 0 {
 		t.Fatal("k must scroll up")
 	}
-	// Clamp: offset must not coast past the content end.
 	m.scrOff[sStats] = 29
 	m = press(t, m, "j")
 	if m.scrOff[sStats] != 2 {
@@ -1524,19 +1518,18 @@ func TestSwipeArrowsPickTheSideAnswer(t *testing.T) {
 		m.sess.cur = &card{kind: kind, word: "w", wordID: 9, reveal: reveal, mode: "rec"}
 		return m
 	}
-	// Each side names its answer; rwcore reads it by the card's queue.
 	for _, tc := range []struct {
 		kind   cardKind
 		reveal bool
 		key    string
 		left   bool
 	}{
-		{cL1, false, "left", true},    // already known
-		{cL1, false, "right", false},  // start learning
-		{cL1b, false, "right", false}, // keep showing
-		{cL1b, true, "left", true},    // i have memorized
-		{cR1, false, "left", true},    // got it, no block needed
-		{cR1, false, "right", false},  // missed it
+		{cL1, false, "left", true},
+		{cL1, false, "right", false},
+		{cL1b, false, "right", false},
+		{cL1b, true, "left", true},
+		{cR1, false, "left", true},
+		{cR1, false, "right", false},
 	} {
 		m := press(t, onCard(tc.kind, tc.reveal), tc.key)
 		if it := answered(t, m); it.Positive != tc.left || it.ID != 9 || m.sess.cur != nil {
@@ -1731,7 +1724,6 @@ func TestKeyboardNeverFirst(t *testing.T) {
 	if m = press(t, m, " "); !strings.Contains(sgrRe.ReplaceAllString(m.View(), ""), "ˈpan") {
 		t.Fatal("space must show the word with its transcription")
 	}
-	// rwcore deals the word side without blocks in the phone's foreign mode.
 	m = dealt(t, m, rcard(1, "el pan", "хлеб", 1, 2))
 	if c := m.sess.cur; c.keyboard || len(c.choices) != 0 {
 		t.Fatalf("a card without blocks offers none: %+v", c)
@@ -1808,8 +1800,6 @@ func TestPickerCardsEqualHeight(t *testing.T) {
 	if tops, bottoms := strings.Count(out, "┌"), strings.Count(out, "└"); tops != 2 || bottoms != 2 {
 		t.Fatalf("want 2 intact cards, got tops=%d bottoms=%d", tops, bottoms)
 	}
-	// Both cards must start at the same column (equal width) and the row
-	// must be centered in the 76-cell column.
 	for _, ln := range strings.Split(out, "\n") {
 		if strings.Contains(ln, "┌") {
 			lead := len(ln) - len(strings.TrimLeft(ln, " "))
@@ -1851,7 +1841,6 @@ func TestPickerDigitsSelectApp(t *testing.T) {
 		m.apps = []rwcore.App{{N: 1, ID: "en"}, {N: 2, ID: "es"}, {N: 3, ID: "fr"}}
 		return m
 	}
-	// 1/2/3 on the picker must select the app, not jump to Learn/Vocab/Menu.
 	for _, tc := range []struct {
 		key string
 		id  string
@@ -1865,7 +1854,6 @@ func TestPickerDigitsSelectApp(t *testing.T) {
 			t.Fatalf("picker %q: appID=%q screen=%v, want %q sLearn", tc.key, m.appID, m.screen, tc.id)
 		}
 	}
-	// q and ? keep working on the picker.
 	m := press(t, mk(t), "q")
 	if m.ov != oQuit {
 		t.Fatal("q on picker must open the quit guard")

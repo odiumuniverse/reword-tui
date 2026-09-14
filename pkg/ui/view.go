@@ -31,8 +31,6 @@ func (m Model) View() string {
 	}
 	col := lipgloss.NewStyle().Width(cw)
 	if m.screen == sSession && m.sess.cur != nil && zenOn(m) {
-		// Width first (pads and wraps strays to cw), then height:
-		// Place pads short content but never crops tall content.
 		card, _ := m.cardBlock(cw, h-2)
 		body := fitHeight(col.Render(strings.TrimRight(card, "\n")), h)
 		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Position(0.45), body)
@@ -50,8 +48,6 @@ func (m Model) View() string {
 	}
 	var mid string
 	if m.ov == oNone && m.screen == sSession && m.sess.cur != nil {
-		// A running session spans the full width: the card sits on the
-		// screen's center line, the mode column in its left margin.
 		body := fitHeight(m.viewSessionWide(w, cw, bodyH), bodyH)
 		mid = lipgloss.Place(w, bodyH, lipgloss.Left, lipgloss.Position(0.45), body)
 	} else {
@@ -61,9 +57,6 @@ func (m Model) View() string {
 		} else {
 			body = m.viewBody(cw, bodyH)
 		}
-		// Place pads but never crops: clip the body so header, status and
-		// footer hints always survive short terminals. Width-fit first, since
-		// col.Render also wraps overlong lines (which changes row count).
 		body = fitHeight(col.Render(strings.TrimRight(body, "\n")), bodyH)
 		mid = lipgloss.Place(w, bodyH, lipgloss.Center, lipgloss.Position(0.45), body)
 	}
@@ -109,8 +102,6 @@ func hints(cw int, bs ...kb) string {
 	for _, b := range bs {
 		p := interactive.Render(b.k) + " " + dim.Render(b.d)
 		if lipgloss.Width(join(append(parts, p))) > cw {
-			// Drop trailing hints until the "? more" marker fits too:
-			// the result must stay on one row.
 			for len(parts) > 0 && lipgloss.Width(join(parts)+sep+more) > cw {
 				parts = parts[:len(parts)-1]
 			}
@@ -163,7 +154,6 @@ func (m Model) viewHints(cw int) string {
 	return hints(cw, kb{"q", "quit"}, kb{"?", "help"})
 }
 
-// sessionHints mirrors the keys the current card actually takes.
 func (m Model) sessionHints() []kb {
 	c := m.sess.cur
 	switch {
@@ -178,8 +168,6 @@ func (m Model) sessionHints() []kb {
 	case c.pane == paneChoose && c.pick == 0:
 		return []kb{{"1-4/hjkl", "pick"}, {"esc", "back"}, {"tab", "mode"}, {"e", "card"}}
 	}
-	// The blocks sit on the card with their keys and the answers under it;
-	// the footer names only the arrows.
 	var bs []kb
 	if _, _, ok := c.swipe(); ok {
 		bs = []kb{{"←/→", "answer"}}
@@ -190,8 +178,6 @@ func (m Model) sessionHints() []kb {
 	return append(bs, kb{"tab", "mode"}, kb{"e", "card"}, kb{"z", "zen"}, kb{"esc", "back"})
 }
 
-// blocksRow lists a card's ways to check itself, each with its key:
-// type, show and choose, equal and in the phone's order.
 func blocksRow(c *card) string {
 	var bs []string
 	block := func(k, label string) { bs = append(bs, interactive.Render(k)+" "+fg.Render(label)) }
@@ -213,9 +199,6 @@ func window(n, cur, h int) (from, to int) {
 	return from, from + h
 }
 
-// fitHeight crops s to h rows, marking the cut. Place pads short content
-// but never crops tall content, so without this the footer hints are the
-// first thing pushed off-screen on short terminals.
 func fitHeight(s string, h int) string {
 	if h < 1 {
 		h = 1
@@ -229,7 +212,6 @@ func fitHeight(s string, h int) string {
 	return strings.Join(keep, "\n")
 }
 
-// pctBar renders a 5-cell pink mini-bar from a "12%" string, "—" when empty.
 func pctBar(pct string) string {
 	n, err := strconv.Atoi(strings.TrimSuffix(pct, "%"))
 	if err != nil || n < 0 {
@@ -242,7 +224,6 @@ func pctBar(pct string) string {
 	return prog.Render(strings.Repeat("▰", filled)) + faint.Render(strings.Repeat("▱", 5-filled)) + " " + pct
 }
 
-// truncateCell cuts s to w cells with an ellipsis. Width is display-based.
 func truncateCell(s string, w int) string {
 	if w < 1 {
 		w = 1
@@ -257,10 +238,6 @@ func truncateCell(s string, w int) string {
 	return string(r) + "…"
 }
 
-// wrapLine splits s to width w. Plain text breaks on spaces first, then
-// hard-splits spaceless overflow so row counts stay exact. Styled lines
-// break on spaces only: SGR sequences contain no spaces, so a break never
-// cuts an escape sequence (a spaceless styled token is left whole).
 func wrapLine(s string, w int) []string {
 	if w < 4 {
 		w = 4
@@ -295,10 +272,6 @@ func wrapLine(s string, w int) []string {
 	return out
 }
 
-// wrapStyled splits an already-styled line into lines of at most w cells,
-// breaking on spaces only. Safe for ANSI: SGR sequences contain no spaces,
-// so a break never cuts an escape sequence. Spaceless overlong words are
-// left as-is (same as before, no panic).
 func wrapStyled(line string, w int) []string {
 	if w < 4 {
 		w = 4
@@ -336,8 +309,6 @@ func wrapStyled(line string, w int) []string {
 	return out
 }
 
-// windowedCursor shows a cursor list in h rows: the cursor row is never
-// replaced by a counter; markers take their own rows.
 func windowedCursor(rows []string, cur, h int) string {
 	n := len(rows)
 	if h < 1 {
@@ -379,7 +350,6 @@ func windowedCursor(rows []string, cur, h int) string {
 		seg = append(seg, faint.Render(fmt.Sprintf("↓ %d more", n-to)))
 	}
 	if len(seg) > h {
-		// Degenerate height: the cursor row alone outranks markers.
 		return rows[cur]
 	}
 	return strings.Join(seg, "\n")
@@ -427,9 +397,6 @@ func (m Model) viewHeader(cw int) string {
 		duePart = attn.Render(duePart)
 	}
 	right := learned + goal + " · " + duePart
-	if len(m.q.Items) > 0 {
-		right += fmt.Sprintf(" · +%d queued", len(m.q.Items))
-	}
 	leftFull := left + " " + dot
 	gap := cw - lipgloss.Width(leftFull) - lipgloss.Width(stale) - lipgloss.Width(right)
 	if gap < 1 && stale != "" {
@@ -440,7 +407,6 @@ func (m Model) viewHeader(cw int) string {
 		gap = 1
 	}
 	line := leftFull + stale + strings.Repeat(" ", gap) + right
-	// ansi.Truncate is width- and escape-aware, unlike rune slicing.
 	line = ansi.Truncate(line, cw, "…")
 	if lipgloss.Width(line) > cw {
 		line = left + " " + dot
@@ -519,8 +485,6 @@ func (m Model) viewPicker(cw, h int) string {
 		if i == m.appIdx {
 			style = abox
 		}
-		// Width covers content + padding: add padding back so the text
-		// gets the full measured bw instead of wrapping at bw-4.
 		blocks = append(blocks, style.Width(bw+4).Render(c))
 	}
 	rowW := 0
@@ -544,8 +508,6 @@ func (m Model) viewPicker(cw, h int) string {
 	if lipgloss.Height(head+full) <= h {
 		return lipgloss.PlaceHorizontal(cw, lipgloss.Center, strings.TrimRight(head+full, "\n"))
 	}
-	// Compact: single-line title + vertical stack windowed on the cursor.
-	// A block is 4 content rows + 2 border rows.
 	capApps := max(1, (h-1)/6)
 	title := 1
 	if title+6*capApps > h {
@@ -642,8 +604,6 @@ func (m Model) viewLearn(cw, h int) string {
 		}
 		return []string{line, "  " + dim.Render(r.desc)}
 	}
-	// Budget: title(2) fixed; catline+sep(2) and dots+sep(2) join when fit.
-	// Items window around the cursor so it is never cropped away.
 	k := max(1, min(3, (h-2)/2))
 	from, to := window(len(rows), m.menuIdx, k)
 	used := 2
@@ -664,10 +624,6 @@ func (m Model) viewLearn(cw, h int) string {
 	return b.String()
 }
 
-// viewDots draws the phone's streak week (StreakProgressView): the calendar
-// week, a full dot where the day's learned words reached the daily goal and a
-// half one below it, the line lit between two full or two half days. Today's
-// dot is blue.
 func (m Model) viewDots() string {
 	if m.today == nil || len(m.today.Week) == 0 {
 		return dim.Render("no history yet")
@@ -717,10 +673,6 @@ func (m Model) viewSession(cw, h int) string {
 	return m.viewSessionWide(cw, cw, h)
 }
 
-// sessionDone says why the phone would have no card now.
-// sessionDone is what a session shows once it has no card, in the phone's
-// words: the goal reached screen (f02) for learning, when the next review
-// comes (wy5) for review, or why there is nothing (WordCardStateHelper).
 func (m Model) sessionDone() string {
 	d := m.sess.day
 	switch {
@@ -743,9 +695,6 @@ func (m Model) sessionDone() string {
 	return "There are no words for review in the chosen categories"
 }
 
-// viewSessionWide lays out a running session across the whole width w: the
-// card sits on the screen's center line and the mode column takes the left
-// margin. When that margin is too narrow the modes stack above the card.
 func (m Model) viewSessionWide(w, cw, h int) string {
 	const minGap, maxGap = 2, 3
 	modes := m.modeColumn()
@@ -753,8 +702,6 @@ func (m Model) viewSessionWide(w, cw, h int) string {
 	for _, ln := range modes {
 		colW = max(colW, lipgloss.Width(ln))
 	}
-	// Prefer the full column width so the card lines up with the header and
-	// footer; tighten the gap before narrowing the card.
 	cardW, gap := cw, maxGap
 	side := (w-cw)/2-colW >= minGap
 	if side {
@@ -766,16 +713,14 @@ func (m Model) viewSessionWide(w, cw, h int) string {
 	if !side {
 		head = append(head, ansi.Truncate(strings.Join(modes, "  "), cardW, "…"))
 	}
-	// The bar can wrap on narrow screens (queue suffix): measure, don't assume.
 	head = append(head, wrapLine(m.sessionBar(), cardW)...)
 	block := append(head, "")
 	card, cut := m.cardBlock(cardW, h-len(block))
 	if cut || len(block)+lipgloss.Height(card) > h {
-		// Tight screen: the card alone outranks the bar and stacked modes.
 		card, _ = m.cardBlock(cardW, h)
 		block = nil
 	}
-	top := len(block) + 1 // first row inside the card frame
+	top := len(block) + 1
 	block = append(block, strings.Split(card, "\n")...)
 	pad := (w - cardW) / 2
 	colStyle := lipgloss.NewStyle().Width(colW)
@@ -789,8 +734,6 @@ func (m Model) viewSessionWide(w, cw, h int) string {
 	return strings.Join(block, "\n")
 }
 
-// modeColumn lists the session modes with the words left in each; the
-// active one carries the cursor.
 func (m Model) modeColumn() []string {
 	rows := []struct {
 		mode  int
@@ -811,13 +754,10 @@ func (m Model) modeColumn() []string {
 	return out
 }
 
-// cardBlock renders the card with its two swipe answers right under the
-// bottom border: "← left answer" flush left, "right answer →" flush right.
 func (m Model) cardBlock(w, maxH int) (string, bool) {
 	c := m.sess.cur
 	left, right, ok := m.swipeSides(c)
 	if !ok && c != nil && c.done {
-		// An answered card waits for the user; any arrow moves on.
 		left, right, ok = "", "Next", true
 	}
 	if !ok {
@@ -840,7 +780,6 @@ func swipeLine(left, right string, w int) string {
 	return "  " + l + strings.Repeat(" ", gap) + r + "  "
 }
 
-// swipeStyle colors an answer by what it does to the word.
 func swipeStyle(answer string) lipgloss.Style {
 	switch answer {
 	case "Got it", "Already known", "I have memorized":
@@ -851,8 +790,6 @@ func swipeStyle(answer string) lipgloss.Style {
 	return fg
 }
 
-// sessionBar is the line over the card: the words learned today against
-// the goal, the reviews due, the answer tally and the write queue.
 func (m Model) sessionBar() string {
 	s := &m.sess
 	d := s.day
@@ -865,14 +802,9 @@ func (m Model) sessionBar() string {
 	}
 	bar := prog.Render(strings.Repeat("━", filled)) + faint.Render(strings.Repeat("━", barW-filled))
 	line := fmt.Sprintf("%s %s · due %d · ✓%d ✗%d", bar, today, d.Due, s.ok, s.fail)
-	if len(m.q.Items) > 0 {
-		line += dim.Render(fmt.Sprintf(" · +%d queued", len(m.q.Items)))
-	}
 	return line
 }
 
-// cardLine is one card body line: drop priority (higher drops first)
-// and a choice flag for the inline-choices fallback.
 type cardLine struct {
 	s      string
 	pri    int
@@ -894,17 +826,14 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 	if c == nil {
 		return "", false
 	}
-	inner := cw - 6 // abox border + padding
+	inner := cw - 6
 	if inner < 10 {
 		inner = 10
 	}
-	// priorities: 0 must-keep, 1 feedback, 2 title/result,
-	// 3 label/transcription/example (drop first).
 	var raw []cardLine
 	add := func(pri int, s string) { raw = append(raw, cardLine{s, pri, false}) }
 	addChoice := func(s string) { raw = append(raw, cardLine{s, 0, true}) }
 	add(2, dim.Render(cardTitle(c))+" "+wordStage(c.stepRec, c.stepRep))
-	// Once picked, every answer gets a mark column: ▸ right, ✗ the miss.
 	choicesBlock := func() {
 		for i, ch := range c.choices {
 			line := fmt.Sprintf("%d  %s", i+1, ch)
@@ -941,8 +870,6 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 			add(1, faint.Render(fmt.Sprintf("attempts left: %d", c.attempts)))
 		}
 	}
-	// The transcription voices the foreign word: under the prompt when the
-	// prompt is the word, with the answer once the translation side opens.
 	wordFirst := c.native != c.word
 	add(0, bold.Render(c.prompt))
 	if c.tr != "" && wordFirst {
@@ -955,7 +882,6 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 		typeBlock()
 	}
 	if c.reveal || c.done {
-		// A pick already marks the answer among the four.
 		if c.native != "" && c.pane != paneChoose {
 			add(0, content.Render(c.native))
 		}
@@ -973,16 +899,13 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 			add(2, badStyle.Render("✗ Missed it"))
 		}
 	}
-	// Wrap, preserving priority and choice flags.
 	var lines []cardLine
 	for _, cl := range raw {
 		for _, wln := range wrapStyled(cl.s, inner) {
 			lines = append(lines, cardLine{wln, cl.pri, cl.choice})
 		}
 	}
-	budget := max(maxH-2, 1) // frame border
-	// The blocks row sits on the card's bottom edge, like the phone's
-	// buttons; a card too short for it and the prompt keeps the prompt.
+	budget := max(maxH-2, 1)
 	var foot []string
 	if c.pane == paneNone && !c.reveal && !c.done {
 		foot = wrapStyled(blocksRow(c), inner)
@@ -992,7 +915,6 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 			foot = nil
 		}
 	}
-	// Drop expendable lines (highest priority number, last first).
 	for len(lines) > budget {
 		idx, best := -1, 2
 		for i, ln := range lines {
@@ -1005,7 +927,6 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 		}
 		lines = append(lines[:idx], lines[idx+1:]...)
 	}
-	// Merge choices into one inline row as a last resort before cropping.
 	if n := countCardChoices(lines); len(lines) > budget && n > 1 {
 		var merged []cardLine
 		var acc []string
@@ -1038,8 +959,6 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 	for _, ln := range lines {
 		out = append(out, ln.s)
 	}
-	// Pad up to 10 content rows only when the budget allows: Height is a
-	// minimum and padding past maxH would push the frame out of view.
 	cardH := max(min(10, maxH-2), 1)
 	if len(foot) > 0 {
 		for len(out)+len(foot) < cardH {
@@ -1047,7 +966,6 @@ func (m Model) viewCard(cw, maxH int) (string, bool) {
 		}
 		out = append(out, foot...)
 	}
-	// lipgloss Width covers content + padding; the border adds 2 outside.
 	return abox.Width(max(cw-2, 10)).Height(cardH).Render(strings.Join(out, "\n")), cropped
 }
 
@@ -1106,10 +1024,6 @@ func (m Model) viewVocab(cw, h int) string {
 	return b.String()
 }
 
-// scrollFit shows an h-row window of a tall static screen, movable with
-// the screen's scroll keys. Edge rows turn into markers when More hides.
-// The exact ceiling is stored for the key handlers so scrolling stops
-// where the content ends instead of coasting past it.
 func (m Model) scrollFit(s string, h int) string {
 	lines := strings.Split(s, "\n")
 	if len(lines) <= h || h < 1 {
@@ -1135,7 +1049,6 @@ func (m Model) scrollFit(s string, h int) string {
 	return strings.Join(win, "\n")
 }
 
-// clampScroll keeps a scroll offset inside the last rendered ceiling.
 func (m *Model) clampScroll(s screen) {
 	mx, ok := m.scrMax[s]
 	if !ok {
@@ -1224,7 +1137,6 @@ func (m Model) viewWord(cw int) string {
 	return strings.Join(lines, "\n")
 }
 
-// ordinal spells 1st, 2nd, 3rd, 4th, 11th, 21st...
 func ordinal(n int64) string {
 	suffix := "th"
 	if n%100 < 11 || n%100 > 13 {
@@ -1387,9 +1299,6 @@ func onoff(v bool) string {
 	return faint.Render("off")
 }
 
-// viewSettings lists the settings shared with the phone (they live in the
-// backup's SETTINGS and go to iCloud with the next write), then this
-// computer's own.
 func (m Model) viewSettings(h int) string {
 	var lines []string
 	cursor := 0
@@ -1477,12 +1386,10 @@ func (m Model) viewAdd(h int) string {
 }
 
 func (m Model) viewOverlay(cw, h int) string {
-	inner := cw - 6 // box border + padding
+	inner := cw - 6
 	if inner < 10 {
 		inner = 10
 	}
-	// Each overlay is head (title + text) + pin (never dropped: input,
-	// buttons) — the middle is what shrinks on short screens.
 	var head, pin []string
 	var frame lipgloss.Style
 	wrap := func(s string) []string { return wrapLine(s, inner) }
@@ -1554,17 +1461,14 @@ func (m Model) viewOverlay(cw, h int) string {
 	var out string
 	switch {
 	case avail-2 >= len(head):
-		// Everything fits: frame the whole thing.
 		out = frame.Width(max(cw-2, 10)).Render(strings.Join(append(head, strings.Split(pinned, "\n")...), "\n"))
 	case avail >= 4:
-		// Framed, but the head shrinks to one title block + marker.
-		keep := avail - 2 - 1 // frame + … marker
+		keep := avail - 2 - 1
 		lines := append(head[:min(keep, len(head))],
 			dim.Render(fmt.Sprintf("… +%d more", len(head)-min(keep, len(head)))))
 		lines = append(lines, strings.Split(pinned, "\n")...)
 		out = frame.Width(max(cw-2, 10)).Render(strings.Join(lines, "\n"))
 	default:
-		// No room for a frame: head shrinks first, pins survive to the end.
 		keep := h - pinH
 		var lines []string
 		switch {

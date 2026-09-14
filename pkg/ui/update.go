@@ -266,8 +266,6 @@ func (m Model) onSync(msg syncMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) onWrite(msg writeMsg) (tea.Model, tea.Cmd) {
 	m.loading = ""
-	// Drop exactly the applied prefix: intents appended while the
-	// async write was in flight stay queued.
 	if err := m.q.Consume(msg.consumed); err != nil {
 		m.err = "queue not trimmed: " + err.Error() + " (will retry)"
 		m.quitAfterWrite = false
@@ -292,13 +290,10 @@ func (m Model) onWrite(msg writeMsg) (tea.Model, tea.Cmd) {
 		return m, m.loadSync()
 	}
 	m.setNotice(fmt.Sprintf("written %d", msg.written), false)
-	// With the queue drained the working copy starts over from the backup.
 	return m, tea.Batch(m.loadWork(), m.loadSync())
 }
 
 func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Fast typing, IME and paste deliver several runes in one event; replay
-	// them one by one so every handler keeps seeing single keys.
 	if msg.Type == tea.KeyRunes && !msg.Alt && (len(msg.Runes) > 1 || msg.Paste) {
 		var next tea.Model = m
 		cmds := make([]tea.Cmd, 0, len(msg.Runes))
@@ -327,8 +322,6 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	k := msg.String()
 	if m.screen == sPicker {
-		// The picker owns every key: global 1/2/3 must select apps,
-		// not jump to Learn/Vocab/Menu with no app chosen.
 		return m.pickerKey(k)
 	}
 	switch k {
@@ -458,15 +451,12 @@ func (m Model) learnKey(k string) (tea.Model, tea.Cmd) {
 		m.vocabMode = 0
 		return m, m.loadCats()
 	case "enter":
-		// Menu rows read Learn, Review, Mixed; session modes number differently.
 		rowMode := [3]int{modeLearn, modeReview, modeMixed}
 		return m.startSession(rowMode[min(max(m.menuIdx, 0), 2)])
 	}
 	return m, nil
 }
 
-// wordRef names a word for rwcore: its id when known, since texts repeat
-// across categories, else the text.
 func wordRef(id int64, text string) string {
 	if id != 0 {
 		return strconv.FormatInt(id, 10)
@@ -474,7 +464,6 @@ func wordRef(id int64, text string) string {
 	return text
 }
 
-// pickKey reads a choose-from-4 key: 1-4, or h j k l in the same order.
 func pickKey(k string) int {
 	if i := slices.Index([]string{"h", "j", "k", "l"}, k); i >= 0 {
 		return i + 1
@@ -505,7 +494,6 @@ func (m Model) sessionKey(k string) (tea.Model, tea.Cmd) {
 			return m.undo()
 		case "c":
 			if m.goalScreen() {
-				// "Continue · add more new words", as the phone's dialog.
 				m.numFor = "raise"
 				m.goalTitle = "Add more new words for today"
 				m.goalInput = strconv.FormatInt(day(s.day).raiseStart(), 10)
@@ -526,10 +514,8 @@ func (m Model) sessionKey(k string) (tea.Model, tea.Cmd) {
 		return m.typeKey(k)
 	}
 	c := s.cur
-	// Arrows answer at once, like a swipe, whenever the card offers one.
 	if k == "left" || k == "right" {
 		if _, _, ok := c.swipe(); ok {
-			// With inverted swipes the positive answer sits on →.
 			return m.answer((k == "left") != m.prefs.InvertedSwipes)
 		}
 		return m, nil
@@ -554,9 +540,6 @@ func (m Model) sessionKey(k string) (tea.Model, tea.Cmd) {
 	case "u":
 		return m.undo()
 	}
-	// An open choose block takes 1-4 or hjkl once — the pick is final, and
-	// those keys never fall through to the card's own letters; esc goes
-	// back to the blocks until something is picked.
 	if c.pane == paneChoose {
 		if n := pickKey(k); n > 0 {
 			if c.pick == 0 && n <= len(c.choices) {
@@ -581,8 +564,6 @@ func (m Model) sessionKey(k string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
-	// Letters name the answers too: g/m got it or missed it, k/l a new
-	// word's already known or start learning, l a learning word memorized.
 	var left, right string
 	switch c.kind {
 	case cR1:
@@ -631,7 +612,6 @@ func (m Model) typeKey(k string) (tea.Model, tea.Cmd) {
 	c := s.cur
 	switch k {
 	case "esc":
-		// Back to the three blocks; the card is still open.
 		s.typing = false
 		s.input = ""
 		c.pane = paneNone
@@ -644,8 +624,6 @@ func (m Model) typeKey(k string) (tea.Model, tea.Cmd) {
 			s.input += " "
 			return m, nil
 		}
-		// rwcore grades it; a resolved answer opens the card and the swipe
-		// grades the word, as on the phone.
 		if s.checking {
 			return m, nil
 		}
@@ -654,7 +632,6 @@ func (m Model) typeKey(k string) (tea.Model, tea.Cmd) {
 	case "ctrl+c":
 		m.ov = oQuit
 	default:
-		// Cursor and other special keys have nothing to do in a one-line answer.
 		if isRuneKey(k) {
 			s.input += k
 		}
@@ -1277,7 +1254,6 @@ func (m Model) goalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) submitGoal() (tea.Model, tea.Cmd) {
 	if m.numFor == "mastered" {
-		// The phone's picker takes 1 to 999 days.
 		d, err := strconv.ParseInt(m.goalInput, 10, 64)
 		if err != nil || d < 1 || d > 999 {
 			m.err = "the interval is 1 to 999 days"
@@ -1287,7 +1263,6 @@ func (m Model) submitGoal() (tea.Model, tea.Cmd) {
 		return m.setSynced(masteredKey, strconv.FormatInt(d, 10))
 	}
 	if m.numFor == "raise" {
-		// The phone's dialog keeps the raised goal above what is learned.
 		n, err := strconv.ParseInt(m.goalInput, 10, 64)
 		if lo := day(m.sess.day).raiseMin(); err != nil || n < lo || n > 999 {
 			m.err = fmt.Sprintf("add %d to 999 words", lo)
@@ -1308,8 +1283,6 @@ func (m Model) submitGoal() (tea.Model, tea.Cmd) {
 	if m.obStep == 2 {
 		m.finishOnboarding()
 	}
-	// Like the phone's settings: today's goal and the setting for the days
-	// to come, queued for iCloud and taken by the working copy at once.
 	m.enqueue(queue.Intent{Op: "goal", Goal: g})
 	if m.synced != nil {
 		s := *m.synced

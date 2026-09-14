@@ -25,8 +25,6 @@ fn now_local() -> (i64, String) {
     let now = chrono::Local::now();
     (now.timestamp(), now.format("%F").to_string())
 }
-/// When an intent happened: its own `ts` when the queue recorded one, so a
-/// later write to iCloud lands exactly as it did in the working copy.
 fn body_time(v: &serde_json::Value) -> Result<(i64, String)> {
     match v["ts"].as_i64() {
         Some(ts) => {
@@ -40,14 +38,9 @@ fn body_time(v: &serde_json::Value) -> Result<(i64, String)> {
         None => Ok(now_local()),
     }
 }
-/// The database reads come from: the working copy under --db, else the
-/// app's backup.
 fn read_db(cli: &Cli, app: &discover::App) -> Result<rusqlite::Connection> {
     store::open_ro(cli.db.as_deref().unwrap_or(&app.backup_path))
 }
-/// Applies one intent straight to a working copy: the same store rules as
-/// a write to iCloud, without the snapshot, the fingerprint gate or the op
-/// log.
 fn apply_local(
     db: &std::path::Path,
     v: &serde_json::Value,
@@ -90,7 +83,6 @@ fn apply_local(
             let positive = v["positive"].as_bool().context("missing .positive")?;
             let w = word(&tx)?;
             let side = store::side_of(mode)?;
-            // The row before the answer is what an undo puts back.
             let pre = store::sched_row(&tx, w.id)?;
             let action = Action::of(pre.queue(side), positive);
             store::answer(&tx, w.id, side, action, ts, date)?;
@@ -104,7 +96,8 @@ fn apply_local(
         }
         "restore" => {
             let w = word(&tx)?;
-            let row: crate::sched::Row = serde_json::from_value(v["row"].clone()).context("bad .row")?;
+            let row: crate::sched::Row =
+                serde_json::from_value(v["row"].clone()).context("bad .row")?;
             let at = v["at"].as_i64().context("missing .at")?;
             store::restore_answer(&tx, w.id, &row, at)?;
             serde_json::json!({ "word": w.id.0 })
@@ -201,7 +194,7 @@ fn do_grade(
     let snap = match store::modify(app, cache, data, Some(ts), |tx| {
         let w =
             store::get_word(tx, word_query)?.with_context(|| format!("no word '{word_query}'"))?;
-        let (pre_e, pre_f) = store::grade_review(tx, w.id, mode, ok, ts, &date)?;
+        let (pre_e, pre_f) = store::grade_review(tx, w.id, mode, ok, ts, date)?;
         Ok(vec![OpKind::Graded {
             id: w.id.0,
             mode: mode.value(),
@@ -244,13 +237,13 @@ fn do_triage(
         let w =
             store::get_word(tx, word_query)?.with_context(|| format!("no word '{word_query}'"))?;
         let op = if known {
-            store::triage_known(tx, w.id, ts, &date)?;
+            store::triage_known(tx, w.id, ts, date)?;
             OpKind::Triaged {
                 id: w.id.0,
                 decision: "known".to_string(),
             }
         } else {
-            match store::advance_learn(tx, w.id, ts, &date)? {
+            match store::advance_learn(tx, w.id, ts, date)? {
                 Some(op) => op,
                 None => return Ok(vec![]),
             }
@@ -273,9 +266,6 @@ fn do_triage(
         detail: serde_json::json!({ "word": word_query, "known": known }),
     })
 }
-/// One swipe as the phone's WordPresenter reads it: the queue of the card's
-/// side picks the action (triage, learning or review), and the op log keeps
-/// that decision so a replay repeats it.
 fn do_answer(
     app: &discover::App,
     cache: &std::path::Path,
@@ -302,7 +292,7 @@ fn do_answer(
         let op = match action {
             Action::ReviewOk | Action::ReviewFail => {
                 let ok = action == Action::ReviewOk;
-                let (pre_e, pre_f) = store::grade_review(tx, w.id, mode, ok, ts, &date)?;
+                let (pre_e, pre_f) = store::grade_review(tx, w.id, mode, ok, ts, date)?;
                 OpKind::Graded {
                     id: w.id.0,
                     mode: mode.value(),
@@ -314,9 +304,9 @@ fn do_answer(
             Action::AlreadyKnown | Action::StartLearning => {
                 let known = action == Action::AlreadyKnown;
                 if known {
-                    store::triage_known(tx, w.id, ts, &date)?;
+                    store::triage_known(tx, w.id, ts, date)?;
                 } else {
-                    store::start_learning(tx, w.id, ts, &date)?;
+                    store::start_learning(tx, w.id, ts, date)?;
                 }
                 OpKind::Triaged {
                     id: w.id.0,
@@ -324,12 +314,16 @@ fn do_answer(
                 }
             }
             Action::Memorized | Action::KeepShowing => {
-                store::answer(tx, w.id, side, action, ts, &date)?;
+                store::answer(tx, w.id, side, action, ts, date)?;
                 OpKind::Learned {
                     id: w.id.0,
                     mode: mode.value(),
-                    decision: if action == Action::Memorized { "memorized" } else { "keep" }
-                        .to_string(),
+                    decision: if action == Action::Memorized {
+                        "memorized"
+                    } else {
+                        "keep"
+                    }
+                    .to_string(),
                 }
             }
         };
@@ -429,9 +423,6 @@ struct Cli {
     format: Format,
     #[arg(long, global = true)]
     app: Option<String>,
-    /// Work on this SQLite file instead of the app's iCloud backup: reads
-    /// come from it and `apply` writes straight into it (no snapshot, no op
-    /// log). The desktop session keeps its working copy this way.
     #[arg(long, global = true)]
     db: Option<PathBuf>,
     #[command(subcommand)]
@@ -560,36 +551,27 @@ enum Cmd {
         yes: bool,
     },
     Snapshot,
-    /// The next card as the phone would deal it, with the day's counters.
     Next {
         #[arg(long, default_value = "smart")]
         session: String,
-        /// The card just answered, kept out of this draw.
         #[arg(long)]
         exclude: Option<i64>,
         #[arg(long)]
         seed: Option<u64>,
     },
-    /// Copy the app's backup to OUT as a fresh working copy.
     Work {
         #[arg(long)]
         out: PathBuf,
     },
-    /// The settings shared with the phone through SETTINGS, as it reads them.
     Settings,
-    /// One word's card again, as the phone shows it after an undo.
     Card {
         #[arg(long)]
         word: i64,
-        /// 1 recognition, 2 reproduction.
         #[arg(long)]
         side: i64,
-        /// The choose-from-4 it showed, in order.
         #[arg(long, value_delimiter = ',')]
         variants: Vec<i64>,
     },
-    /// Grade a typed answer as the phone's keyboard block does: against a
-    /// word's side (--word, --side rec|rep) or a given --expected/--lang.
     Check {
         #[arg(long)]
         typed: String,
@@ -599,7 +581,6 @@ enum Cmd {
         side: Option<String>,
         #[arg(long)]
         expected: Option<String>,
-        /// Three-letter language code (rus, eng, spa…).
         #[arg(long)]
         lang: Option<String>,
     },
@@ -1261,7 +1242,6 @@ fn main() -> Result<()> {
             let root = icloud_root(&cli)?;
             let app = resolve_app(&cli, &root)?;
             let conn = read_db(&cli, &app)?;
-            // DAILY_GOAL keys a day as YYYY-MM-DD (a42.k's date format).
             let key = chrono::Local::now().format("%F").to_string();
             if let Some(g) = set {
                 let cache = cache_dir(&cli)?;
@@ -1517,8 +1497,10 @@ fn main() -> Result<()> {
             for (seq, action, reason) in &outcomes {
                 match action.as_str() {
                     "apply-add" | "apply-grade" | "apply-triage" | "apply-enroll"
-                    | "apply-learn" | "apply-select" | "apply-category" | "apply-remove" | "apply-reset"
-                    | "apply-catadmin" | "apply-postpone" | "apply-goal" => applied += 1,
+                    | "apply-learn" | "apply-select" | "apply-category" | "apply-remove"
+                    | "apply-reset" | "apply-catadmin" | "apply-postpone" | "apply-goal" => {
+                        applied += 1
+                    }
                     "orphan" => {}
                     _ => skipped += 1,
                 }
@@ -1715,7 +1697,11 @@ fn main() -> Result<()> {
                         let w = store::get_word(tx, word)?
                             .with_context(|| format!("no word '{word}'"))?;
                         store::restore_answer(tx, w.id, &row, at)?;
-                        Ok(vec![OpKind::Restored { id: w.id.0, row, at }])
+                        Ok(vec![OpKind::Restored {
+                            id: w.id.0,
+                            row,
+                            at,
+                        }])
                     }) {
                         Ok(snap) => Receipt {
                             applied: true,
@@ -1914,9 +1900,6 @@ fn main() -> Result<()> {
             expected,
             lang,
         } => {
-            // ma3.d: a recognition card wants the whole native translation in
-            // the native language, a reproduction card the word in the course
-            // language.
             let (expected, lang) = match (word, expected) {
                 (Some(id), None) => {
                     let root = icloud_root(&cli)?;
@@ -1934,8 +1917,9 @@ fn main() -> Result<()> {
                             (t, scope.native.to_lowercase())
                         }
                         Some("rep") => {
-                            let lang = matcher::course_lang(&app.id)
-                                .with_context(|| format!("no course language for app {}", app.id))?;
+                            let lang = matcher::course_lang(&app.id).with_context(|| {
+                                format!("no course language for app {}", app.id)
+                            })?;
                             (text, lang.to_string())
                         }
                         _ => anyhow::bail!("--word needs --side rec or rep"),

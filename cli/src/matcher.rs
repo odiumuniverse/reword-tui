@@ -1,12 +1,3 @@
-//! The typed-answer check, ported one-to-one from ReWord 4.3.4: the answer
-//! automaton (wl5 Matcher, st9 Transition, d23 ExecState), the split into
-//! comma parts (h53.d), the per-language rules (o05 and its subclasses) and
-//! the verdict WordCardView.b draws from them.
-//!
-//! Strings are handled as UTF-16 code units, the way Java sees them, so
-//! positions, lengths and case mapping line up with the phone. Only the
-//! CHECK search is ported; the HINT one feeds the phone's typing hint.
-
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
@@ -14,17 +5,14 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 use unicode_properties::{GeneralCategory, GeneralCategoryGroup, UnicodeGeneralCategory};
 
-/// How a typed answer came out, as WordCardView.b grades it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Wrong = 1,
-    /// Accepted in yellow: loose letters (accents, ё/е) or only some meanings.
     Partial = 2,
     Correct = 3,
 }
 
 impl Verdict {
-    /// The phone takes a partial answer as well as a correct one.
     pub fn accepted(self) -> bool {
         self != Verdict::Wrong
     }
@@ -38,9 +26,6 @@ impl Verdict {
     }
 }
 
-/// Checks a typed answer against the expected one in language `lang` (the
-/// phone's three-letter code: the native language for a translation, the
-/// course language for the word itself).
 pub fn check(typed: &str, expected: &str, lang: &str) -> Result<Verdict> {
     let lang = Lang::of(lang)?;
     let typed = split(&normalize(typed));
@@ -62,7 +47,11 @@ pub fn check(typed: &str, expected: &str, lang: &str) -> Result<Verdict> {
     }
     Ok(
         if strict + loose == parts.len() && typed.len() == matchers.len() {
-            if loose > 0 { Verdict::Partial } else { Verdict::Correct }
+            if loose > 0 {
+                Verdict::Partial
+            } else {
+                Verdict::Correct
+            }
         } else if strict > 0 {
             Verdict::Partial
         } else {
@@ -71,9 +60,6 @@ pub fn check(typed: &str, expected: &str, lang: &str) -> Result<Verdict> {
     )
 }
 
-/// The course language an app asks the word itself in. ma3.d hard-codes it
-/// per app flavour ("eng" in ReWord English); app ids start with the course
-/// language's two-letter code ("en", "es", "esen").
 pub fn course_lang(app: &str) -> Option<&'static str> {
     Some(match app.get(..2)? {
         "ar" => "ara",
@@ -101,31 +87,35 @@ pub fn course_lang(app: &str) -> Option<&'static str> {
 #[derive(Clone, Copy)]
 enum Article {
     None,
-    /// `^(?i:w1|w2…)(?=[\p{L}(])`, each word followed by `\s+` (true) or
-    /// `\s*` (false).
     Words(&'static [(&'static str, bool)]),
-    /// Japanese `^[~～〜](?=[\p{L}])`.
     Tilde,
 }
 
-/// One of the phone's o05 languages.
 struct Lang {
-    /// `String.toLowerCase` with a Turkish locale.
     turkic: bool,
     article: Article,
-    /// Japanese `(?<=\p{L})[~～〜]$`.
     placeholder: bool,
-    /// Letters that may also be typed as these (ё as е, ä as ae).
     spellings: &'static [(&'static str, &'static str)],
 }
 
 impl Lang {
     fn of(code: &str) -> Result<Lang> {
-        let plain = Lang { turkic: false, article: Article::None, placeholder: false, spellings: &[] };
+        let plain = Lang {
+            turkic: false,
+            article: Article::None,
+            placeholder: false,
+            spellings: &[],
+        };
         Ok(match code.to_ascii_lowercase().as_str() {
             "ara" | "ces" | "fin" | "kat" | "kor" | "pol" | "ukr" | "zho" | "zhs" | "zht" => plain,
-            "tur" => Lang { turkic: true, ..plain },
-            "rus" => Lang { spellings: &[("ё", "е")], ..plain },
+            "tur" => Lang {
+                turkic: true,
+                ..plain
+            },
+            "rus" => Lang {
+                spellings: &[("ё", "е")],
+                ..plain
+            },
             "eng" => Lang {
                 article: Article::Words(&[("a", true), ("an", true), ("the", true), ("to", true)]),
                 ..plain
@@ -175,7 +165,10 @@ impl Lang {
                 ]),
                 ..plain
             },
-            "nld" => Lang { article: Article::Words(&[("de", true), ("het", true), ("een", true)]), ..plain },
+            "nld" => Lang {
+                article: Article::Words(&[("de", true), ("het", true), ("een", true)]),
+                ..plain
+            },
             "por" => Lang {
                 article: Article::Words(&[
                     ("o", true),
@@ -189,23 +182,25 @@ impl Lang {
                 ]),
                 ..plain
             },
-            "jpn" => Lang { article: Article::Tilde, placeholder: true, ..plain },
+            "jpn" => Lang {
+                article: Article::Tilde,
+                placeholder: true,
+                ..plain
+            },
             other => bail!("unknown language: {other}"),
         })
     }
 
-    /// Where the article the language's pattern finds at the start ends.
     fn article_end(&self, s: &[u16]) -> Option<usize> {
         match self.article {
             Article::None => None,
-            Article::Tilde => {
-                (s.first().is_some_and(|&u| is_tilde(u)) && code_point_at(s, 1).is_some_and(is_letter)).then_some(1)
-            }
-            // Only one alternative can fit a given start, and the lookahead
-            // sees past every space `\s+` could take, so no backtracking.
+            Article::Tilde => (s.first().is_some_and(|&u| is_tilde(u))
+                && code_point_at(s, 1).is_some_and(is_letter))
+            .then_some(1),
             Article::Words(words) => words.iter().find_map(|&(w, spaced)| {
                 let w: Vec<u16> = w.encode_utf16().collect();
-                if s.len() < w.len() || !s.iter().zip(&w).all(|(&a, &b)| ascii_eq_ignore_case(a, b)) {
+                if s.len() < w.len() || !s.iter().zip(&w).all(|(&a, &b)| ascii_eq_ignore_case(a, b))
+                {
                     return None;
                 }
                 let mut end = w.len();
@@ -215,23 +210,26 @@ impl Lang {
                 if spaced && end == w.len() {
                     return None;
                 }
-                code_point_at(s, end).is_some_and(|c| c == '(' || is_letter(c)).then_some(end)
+                code_point_at(s, end)
+                    .is_some_and(|c| c == '(' || is_letter(c))
+                    .then_some(end)
             }),
         }
     }
 
-    /// Where the trailing `~` the placeholder pattern finds sits.
     fn placeholder_at(&self, s: &[u16]) -> Option<usize> {
         if !self.placeholder {
             return None;
         }
-        // Java's `$` holds at the end, or before one final line terminator.
         let n = s.len();
         let mut ends = Vec::new();
         if n >= 2 && s[n - 2] == 0x0D && s[n - 1] == 0x0A {
             ends.push(n - 2);
         }
-        if n >= 1 && is_line_terminator(s[n - 1]) && !(s[n - 1] == 0x0A && n >= 2 && s[n - 2] == 0x0D) {
+        if n >= 1
+            && is_line_terminator(s[n - 1])
+            && !(s[n - 1] == 0x0A && n >= 2 && s[n - 2] == 0x0D)
+        {
             ends.push(n - 1);
         }
         ends.push(n);
@@ -241,7 +239,10 @@ impl Lang {
     }
 
     fn spelling(&self, key: &[u16]) -> Option<&'static str> {
-        self.spellings.iter().find(|(k, _)| k.encode_utf16().eq(key.iter().copied())).map(|&(_, v)| v)
+        self.spellings
+            .iter()
+            .find(|(k, _)| k.encode_utf16().eq(key.iter().copied()))
+            .map(|&(_, v)| v)
     }
 }
 
@@ -257,16 +258,17 @@ enum Kind {
 
 impl Kind {
     fn is_eps(self) -> bool {
-        matches!(self, Kind::EpsArticle | Kind::EpsParens | Kind::EpsPlaceholder)
+        matches!(
+            self,
+            Kind::EpsArticle | Kind::EpsParens | Kind::EpsPlaceholder
+        )
     }
 }
 
 struct Trans {
     kind: Kind,
     to: usize,
-    /// What the step reads, lower-cased (st9.d).
     text: Vec<u16>,
-    /// A loose spelling: the accent-free letter or a language spelling.
     loose: bool,
 }
 
@@ -277,17 +279,13 @@ enum Strictness {
     None,
 }
 
-/// A path through the automaton (d23).
 #[derive(Clone, Debug)]
 struct Node {
     state: usize,
     at_end: bool,
     strict: Strictness,
-    /// Characters thrown away before the answer.
     prefix: usize,
-    /// Characters the answer matched.
     len: usize,
-    /// Characters thrown away after it.
     suffix: usize,
 }
 
@@ -296,15 +294,17 @@ impl Node {
         Node {
             state: t.to,
             at_end,
-            strict: if self.strict == Strictness::Loose { Strictness::Loose } else { strict },
+            strict: if self.strict == Strictness::Loose {
+                Strictness::Loose
+            } else {
+                strict
+            },
             prefix: self.prefix + usize::from(t.kind == Kind::WrongPrefix),
             len: self.len + if t.kind == Kind::Str { t.text.len() } else { 0 },
             suffix: self.suffix + usize::from(t.kind == Kind::WrongSuffix),
         }
     }
 
-    /// d23.a in CHECK mode: at the end first, then the longer match, then
-    /// the strict one; a tie goes to the newcomer.
     fn beats(&self, o: &Node) -> bool {
         if self.at_end != o.at_end {
             return self.at_end;
@@ -323,7 +323,6 @@ enum SpanKind {
     Placeholder,
 }
 
-/// A stretch of the answer that may be left out.
 #[derive(Clone, Copy)]
 struct Span {
     a: usize,
@@ -331,7 +330,6 @@ struct Span {
     kind: SpanKind,
 }
 
-/// The automaton for one comma part of the answer (wl5).
 struct Matcher {
     start: usize,
     end: usize,
@@ -342,7 +340,13 @@ struct Matcher {
 
 impl Matcher {
     fn new(text: &[u16], lang: &Lang) -> Matcher {
-        let mut m = Matcher { start: 0, end: 0, states: 1, out: Vec::new(), turkic: lang.turkic };
+        let mut m = Matcher {
+            start: 0,
+            end: 0,
+            states: 1,
+            out: Vec::new(),
+            turkic: lang.turkic,
+        };
         if text.is_empty() {
             return m;
         }
@@ -358,7 +362,11 @@ impl Matcher {
         if let Some(end) = lang.article_end(text)
             && !is_only_parens(&text[end..])
         {
-            spans.push(Span { a: 0, b: end - 1, kind: SpanKind::Article });
+            spans.push(Span {
+                a: 0,
+                b: end - 1,
+                kind: SpanKind::Article,
+            });
             i = end;
         }
         let mut depth = 0i32;
@@ -369,7 +377,6 @@ impl Matcher {
             if ch == u16::from(b'(') || ch == 0xFF08 {
                 depth += 1;
                 if depth == 1 {
-                    // The spaces before a note go with it.
                     open = i;
                     while open > 0
                         && is_java_whitespace(text[open - 1])
@@ -388,14 +395,22 @@ impl Matcher {
                     while i < n - 1 && is_java_whitespace(text[i + 1]) {
                         i += 1;
                     }
-                    spans.push(Span { a: open, b: i, kind: SpanKind::Parens });
+                    spans.push(Span {
+                        a: open,
+                        b: i,
+                        kind: SpanKind::Parens,
+                    });
                 }
             }
             i += 1;
         }
         if balanced && depth == 0 {
             if let Some(p) = lang.placeholder_at(text) {
-                spans.push(Span { a: p, b: p, kind: SpanKind::Placeholder });
+                spans.push(Span {
+                    a: p,
+                    b: p,
+                    kind: SpanKind::Placeholder,
+                });
             }
         } else {
             spans.clear();
@@ -417,7 +432,11 @@ impl Matcher {
                 let alt: Vec<u16> = alt.encode_utf16().collect();
                 let mut at = from;
                 for (k, &u) in alt.iter().enumerate() {
-                    let to = if k == alt.len() - 1 { next } else { m.new_state() };
+                    let to = if k == alt.len() - 1 {
+                        next
+                    } else {
+                        m.new_state()
+                    };
                     m.add(Kind::Str, at, to, &[u], true);
                     at = to;
                 }
@@ -433,7 +452,6 @@ impl Matcher {
                 };
                 m.add(kind, entry, next, &[], false);
                 if s.a > 0 && s.b < n - 1 {
-                    // Left out mid-answer, it leaves one space behind.
                     m.add(Kind::Str, entry, next, &[0x20], false);
                 }
                 spans.remove(0);
@@ -453,15 +471,23 @@ impl Matcher {
         if self.out.len() <= from {
             self.out.resize_with(from + 1, Vec::new);
         }
-        let text = if kind == Kind::Str { lower(text, self.turkic) } else { Vec::new() };
-        self.out[from].push(Trans { kind, to, text, loose });
+        let text = if kind == Kind::Str {
+            lower(text, self.turkic)
+        } else {
+            Vec::new()
+        };
+        self.out[from].push(Trans {
+            kind,
+            to,
+            text,
+            loose,
+        });
     }
 
     fn from(&self, state: usize) -> &[Trans] {
         self.out.get(state).map_or(&[], Vec::as_slice)
     }
 
-    /// wl5.e in CHECK mode: the best path for `input`, layer by layer.
     fn run(&self, input: &[u16]) -> Node {
         let root = Node {
             state: self.start,
@@ -503,10 +529,12 @@ impl Matcher {
             }
             self.closure(&mut queue, &mut best);
         }
-        best.get(&self.end).cloned().or(stuck).unwrap_or_else(|| best[&self.start].clone())
+        best.get(&self.end)
+            .cloned()
+            .or(stuck)
+            .unwrap_or_else(|| best[&self.start].clone())
     }
 
-    /// wl5.b: follows the steps that read nothing (a left-out stretch).
     fn closure(&self, queue: &mut Vec<usize>, best: &mut HashMap<usize, Node>) {
         let mut work = queue.clone();
         while let Some(s) = work.pop() {
@@ -528,12 +556,15 @@ impl Matcher {
         }
     }
 
-    /// How step `t` reads `input` at `pos`.
     fn read(&self, t: &Trans, input: &[u16], pos: usize) -> Strictness {
         match t.kind {
             Kind::EpsArticle | Kind::EpsParens | Kind::EpsPlaceholder => Strictness::None,
             Kind::WrongPrefix | Kind::WrongSuffix => {
-                if input.len() < pos + 1 { Strictness::None } else { Strictness::Strict }
+                if input.len() < pos + 1 {
+                    Strictness::None
+                } else {
+                    Strictness::Strict
+                }
             }
             Kind::Str => {
                 if input.len() < pos + t.text.len() {
@@ -541,18 +572,28 @@ impl Matcher {
                 }
                 let sub = lower(&input[pos..pos + t.text.len()], self.turkic);
                 if sub == t.text {
-                    return if t.loose { Strictness::Loose } else { Strictness::Strict };
+                    return if t.loose {
+                        Strictness::Loose
+                    } else {
+                        Strictness::Strict
+                    };
                 }
-                if PUNCTUATION.iter().any(|g| in_group(g, &sub) && in_group(g, &t.text)) {
+                if PUNCTUATION
+                    .iter()
+                    .any(|g| in_group(g, &sub) && in_group(g, &t.text))
+                {
                     return Strictness::Strict;
                 }
-                if strip_marks(&sub) == t.text { Strictness::Loose } else { Strictness::None }
+                if strip_marks(&sub) == t.text {
+                    Strictness::Loose
+                } else {
+                    Strictness::None
+                }
             }
         }
     }
 }
 
-/// Punctuation that stands in for each other (st9.h).
 const PUNCTUATION: [&str; 10] = [
     ",，、;",
     "'’‘\"「」『』«»",
@@ -570,10 +611,6 @@ fn in_group(group: &str, s: &[u16]) -> bool {
     s.len() == 1 && group.encode_utf16().any(|u| u == s[0])
 }
 
-/// A `java.util.HashMap<Integer, _>` just far enough to hand its values out
-/// in Java's order — by bucket, then by insertion — since equally good paths
-/// are settled by that order on the phone. (Tree bins, which reorder a bucket,
-/// only form past 64 buckets with 8 states in one: not in a word.)
 struct JavaMap {
     keys: Vec<usize>,
     vals: Vec<Node>,
@@ -582,7 +619,11 @@ struct JavaMap {
 
 impl JavaMap {
     fn new() -> JavaMap {
-        JavaMap { keys: Vec::new(), vals: Vec::new(), cap: 16 }
+        JavaMap {
+            keys: Vec::new(),
+            vals: Vec::new(),
+            cap: 16,
+        }
     }
 
     fn bucket(key: usize, cap: usize) -> usize {
@@ -591,7 +632,10 @@ impl JavaMap {
     }
 
     fn get(&self, key: usize) -> Option<&Node> {
-        self.keys.iter().position(|&k| k == key).map(|i| &self.vals[i])
+        self.keys
+            .iter()
+            .position(|&k| k == key)
+            .map(|i| &self.vals[i])
     }
 
     fn put(&mut self, key: usize, val: Node) {
@@ -600,11 +644,14 @@ impl JavaMap {
             return;
         }
         let b = Self::bucket(key, self.cap);
-        let chain = self.keys.iter().filter(|&&k| Self::bucket(k, self.cap) == b).count();
+        let chain = self
+            .keys
+            .iter()
+            .filter(|&&k| Self::bucket(k, self.cap) == b)
+            .count();
         self.keys.push(key);
         self.vals.push(val);
         if chain >= 8 && self.cap < 64 {
-            // treeifyBin grows a small table instead.
             self.cap *= 2;
         }
         if self.keys.len() > self.cap * 3 / 4 {
@@ -621,13 +668,15 @@ impl JavaMap {
     }
 }
 
-/// The driver's clean-up: dashes to spaces, each run of `\s` to one space,
-/// then `String.trim()`.
 fn normalize(s: &str) -> Vec<u16> {
     let mut out: Vec<u16> = Vec::with_capacity(s.len());
     let mut spaced = false;
     for u in s.encode_utf16() {
-        let u = if in_group(PUNCTUATION[9], &[u]) { 0x20 } else { u };
+        let u = if in_group(PUNCTUATION[9], &[u]) {
+            0x20
+        } else {
+            u
+        };
         if is_regex_space(u) {
             if !spaced {
                 out.push(0x20);
@@ -647,14 +696,10 @@ fn is_comma(u: u16) -> bool {
     matches!(u, 0x2C | 0xFF0C | 0x3001)
 }
 
-/// h53.d: the comma parts of an answer, commas inside brackets kept. (Java's
-/// `$` before a final U+0085/U+2028/U+2029 is not followed: the driver has
-/// already turned every other line break into a space.)
 fn split(s: &[u16]) -> Vec<Vec<u16>> {
     if s.is_empty() {
         return vec![Vec::new()];
     }
-    // `^(\s*[,，、]\s*)+|(\s*[,，、]\s*)+$` → "".
     let mut lo = 0;
     loop {
         let mut j = lo;
@@ -710,15 +755,15 @@ fn split(s: &[u16]) -> Vec<Vec<u16>> {
     parts
 }
 
-/// `rest.matches("^\\(.+\\)$")`.
 fn is_only_parens(rest: &[u16]) -> bool {
     rest.len() >= 3
         && rest[0] == u16::from(b'(')
         && rest[rest.len() - 1] == u16::from(b')')
-        && !rest[1..rest.len() - 1].iter().any(|&u| is_line_terminator(u))
+        && !rest[1..rest.len() - 1]
+            .iter()
+            .any(|&u| is_line_terminator(u))
 }
 
-/// `String.toLowerCase(locale)`; a Turkish locale maps I to ı and İ to i.
 fn lower(s: &[u16], turkic: bool) -> Vec<u16> {
     let mut out = Vec::with_capacity(s.len());
     let mut run = String::new();
@@ -751,7 +796,6 @@ fn lower(s: &[u16], turkic: bool) -> Vec<u16> {
     out
 }
 
-/// `Normalizer.normalize(s, NFD).replaceAll("\\p{M}", "")`.
 fn strip_marks(s: &[u16]) -> Vec<u16> {
     let mut out = Vec::with_capacity(s.len());
     let mut run = String::new();
@@ -775,12 +819,10 @@ fn strip_marks(s: &[u16]) -> Vec<u16> {
     out
 }
 
-/// Java regex `\s`: ASCII whitespace only.
 fn is_regex_space(u: u16) -> bool {
     matches!(u, 0x20 | 0x09..=0x0D)
 }
 
-/// `Character.isWhitespace(char)`.
 fn is_java_whitespace(u: u16) -> bool {
     match u {
         0x09..=0x0D | 0x1C..=0x1F => true,
@@ -788,13 +830,14 @@ fn is_java_whitespace(u: u16) -> bool {
         _ => char::from_u32(u32::from(u)).is_some_and(|c| {
             matches!(
                 c.general_category(),
-                GeneralCategory::SpaceSeparator | GeneralCategory::LineSeparator | GeneralCategory::ParagraphSeparator
+                GeneralCategory::SpaceSeparator
+                    | GeneralCategory::LineSeparator
+                    | GeneralCategory::ParagraphSeparator
             )
         }),
     }
 }
 
-/// What Java's `.` stops at and `$` may stand before.
 fn is_line_terminator(u: u16) -> bool {
     matches!(u, 0x0A | 0x0D | 0x85 | 0x2028 | 0x2029)
 }
@@ -844,13 +887,17 @@ mod tests {
         assert_eq!(v("run", "to run", "eng"), Verdict::Correct);
         assert_eq!(v("go", "(to) go", "eng"), Verdict::Correct);
         assert_eq!(v("бежать", "бежать (быстро)", "rus"), Verdict::Correct);
-        assert_eq!(v("бежать (быстро)", "бежать (быстро)", "rus"), Verdict::Correct);
-        // A note goes whole or not at all: its brackets are letters to type.
+        assert_eq!(
+            v("бежать (быстро)", "бежать (быстро)", "rus"),
+            Verdict::Correct
+        );
         assert_eq!(v("бежать быстро", "бежать (быстро)", "rus"), Verdict::Wrong);
-        assert_eq!(v("take off", "to take (something) off", "eng"), Verdict::Correct);
+        assert_eq!(
+            v("take off", "to take (something) off", "eng"),
+            Verdict::Correct
+        );
         assert_eq!(v("gato", "el gato", "spa"), Verdict::Correct);
         assert_eq!(v("homme", "l'homme", "fra"), Verdict::Correct);
-        // Only notes: the article stays.
         assert_eq!(v("x", "the (x)", "eng"), Verdict::Wrong);
     }
 
@@ -898,7 +945,14 @@ mod tests {
 
     #[test]
     fn java_map_hands_values_out_by_bucket() {
-        let node = |state| Node { state, at_end: false, strict: Strictness::Strict, prefix: 0, len: 0, suffix: 0 };
+        let node = |state| Node {
+            state,
+            at_end: false,
+            strict: Strictness::Strict,
+            prefix: 0,
+            len: 0,
+            suffix: 0,
+        };
         let mut m = JavaMap::new();
         for k in [17, 3, 1, 33, 16] {
             m.put(k, node(k));
@@ -921,8 +975,6 @@ mod tests {
             runs: Vec<[usize; 8]>,
         }
 
-        /// Vectors from a Java transcription of the phone's matcher, run on the
-        /// JVM (its HashMap, regex, Normalizer and toLowerCase).
         #[test]
         fn matches_the_phone() {
             let mut bad = Vec::new();
@@ -944,7 +996,16 @@ mod tests {
                             Strictness::Loose => 1,
                             Strictness::None => 2,
                         };
-                        runs.push([ti, mi, r.state, usize::from(r.at_end), strict, r.prefix, r.len, r.suffix]);
+                        runs.push([
+                            ti,
+                            mi,
+                            r.state,
+                            usize::from(r.at_end),
+                            strict,
+                            r.prefix,
+                            r.len,
+                            r.suffix,
+                        ]);
                     }
                 }
                 let verdict = check(&c.typed, &c.expected, &c.lang).unwrap() as u8;
@@ -956,7 +1017,12 @@ mod tests {
                 }
             }
             assert!(n > 1000, "only {n} vectors");
-            assert!(bad.is_empty(), "{} of {n} differ:\n{}", bad.len(), bad.iter().take(15).cloned().collect::<Vec<_>>().join("\n"));
+            assert!(
+                bad.is_empty(),
+                "{} of {n} differ:\n{}",
+                bad.len(),
+                bad.iter().take(15).cloned().collect::<Vec<_>>().join("\n")
+            );
         }
     }
 }

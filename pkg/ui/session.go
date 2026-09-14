@@ -20,9 +20,6 @@ const (
 	cL1b
 )
 
-// pane is the block a tested card opened. Like the phone, a card offers
-// three equal ways to check yourself — type, show, choose from four —
-// and none of them is picked for the user.
 type pane int
 
 const (
@@ -31,20 +28,15 @@ const (
 	paneChoose
 )
 
-// verdict is how a typed answer came out.
 type verdict int
 
 const (
 	vNone verdict = iota
 	vRight
-	// vPartial is accepted in yellow, as on the phone: loose letters (an
-	// accent, ё for е) or only some of the meanings.
 	vPartial
 	vWrong
 )
 
-// Session modes. The Learn menu lists them as Learn, Review, Mixed; they
-// map to the phone's sessions: new-only, review-only and smart.
 const (
 	modeReview = iota
 	modeLearn
@@ -52,64 +44,57 @@ const (
 )
 
 type card struct {
-	kind     cardKind
-	word     string
-	wordID   int64
-	prompt   string
-	native   string // what the card hides: the translation, or the word itself
-	tr       string
-	example  string
-	choices  []string // choose-from-4 answers; empty when the block is off
-	answer   int
-	keyboard bool // the keyboard block is offered; rwcore grades the answer
-	pane     pane
-	pick     int // chosen answer, 1-based; 0 = not yet
-	typed    verdict
-	mode     string // the side the card asks: "rec" or "rep"
-	stepRec  int64
-	stepRep  int64
-	reveal   bool
-	done     bool
-	wasOk    bool
-	attempts int
-	// variantIDs are the choose-from-4's words, kept so an undo shows the
-	// card again with the same answers.
+	kind       cardKind
+	word       string
+	wordID     int64
+	prompt     string
+	native     string
+	tr         string
+	example    string
+	choices    []string
+	answer     int
+	keyboard   bool
+	pane       pane
+	pick       int
+	typed      verdict
+	mode       string
+	stepRec    int64
+	stepRep    int64
+	reveal     bool
+	done       bool
+	wasOk      bool
+	attempts   int
 	variantIDs []int64
 }
 
 type session struct {
 	mode     int
 	day      rwcore.Day
-	now      int64 // when the last card was dealt
+	now      int64
 	cur      *card
-	dealing  bool // a deal is out; its card lands in cur
+	dealing  bool
 	started  bool
 	ok       int
 	fail     int
 	zen      bool
 	typing   bool
 	input    string
-	checking bool // a typed answer is out with rwcore
+	checking bool
 	undo     []undoStep
 }
 
-// undoDepth is how many answers the phone's presenter keeps to take back.
 const undoDepth = 200
 
-// undoStep is one answer the session can take back (the phone's foa): the
-// word's scheduling columns before it, when it was given, and the card as
-// it was shown.
 type undoStep struct {
 	wordID   int64
 	word     string
-	side     int64 // 1 recognition, 2 reproduction
+	side     int64
 	row      json.RawMessage
 	at       int64
 	variants []int64
-	counted  int // +1 got it, -1 missed it, 0 not a review
+	counted  int
 }
 
-// kind names the phone's session for a mode.
 func (s *session) kind() string {
 	switch s.mode {
 	case modeReview:
@@ -210,11 +195,6 @@ func parseExamplesFull(raw string) [][2]string {
 	return out
 }
 
-// cardFrom lays out a card rwcore dealt. Recognition shows the word and
-// hides its translation, reproduction the other way round. The blocks come
-// as the phone offers them: the keyboard asks for what the card hides (rwcore
-// grades it against the whole of it), and the choose block reads its four
-// answers the way the card does.
 func cardFrom(rc *rwcore.Card, native string, prefs Prefs) *card {
 	if rc == nil {
 		return nil
@@ -261,8 +241,6 @@ func cardFrom(rc *rwcore.Card, native string, prefs Prefs) *card {
 	return c
 }
 
-// deal asks rwcore for the session's next card, keeping the card just
-// answered out of the draw as the phone does.
 func (m Model) deal(exclude int64) tea.Cmd {
 	cli, app, kind, mode := m.cli, m.appID, m.sess.kind(), m.sess.mode
 	return func() tea.Msg {
@@ -272,7 +250,6 @@ func (m Model) deal(exclude int64) tea.Cmd {
 }
 
 func (m Model) onDeal(msg dealMsg) (tea.Model, tea.Cmd) {
-	// A deal for a mode left meanwhile has no place on screen.
 	if m.screen != sSession || msg.mode != m.sess.mode {
 		return m, nil
 	}
@@ -289,16 +266,12 @@ func (m Model) onDeal(msg dealMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// answer sends a swipe as the phone reads it: positive is the left answer.
-// rwcore picks the action from the queue of the card's side, the working
-// copy takes it at once, and the next card is dealt from there.
 func (m Model) answer(positive bool) (tea.Model, tea.Cmd) {
 	c := m.sess.cur
 	if c == nil {
 		return m, nil
 	}
 	if m.noticeWarn {
-		// A warning belongs to the card it was about.
 		m.setNotice("", false)
 	}
 	r := m.enqueue(queue.Intent{Op: "answer", Word: c.word, ID: c.wordID, Mode: c.mode, Positive: positive})
@@ -318,8 +291,6 @@ func (m Model) answer(positive bool) (tea.Model, tea.Cmd) {
 	return m, m.deal(c.wordID)
 }
 
-// pushUndo keeps what taking this answer back needs; the working copy's
-// receipt carries the word's row from before it.
 func (s *session) pushUndo(c *card, r rwcore.Receipt, counted int) {
 	pre, ok := r.Detail.Detail["pre"]
 	if !ok {
@@ -343,9 +314,6 @@ func (s *session) pushUndo(c *card, r rwcore.Receipt, counted int) {
 	})
 }
 
-// undo takes the last answer back, as the phone's undo does: the word's
-// columns return, that answer's LOG rows go, and its card comes again with
-// the choose-from-4 it had.
 func (m Model) undo() (tea.Model, tea.Cmd) {
 	s := &m.sess
 	n := len(s.undo)
@@ -370,8 +338,6 @@ func (m Model) undo() (tea.Model, tea.Cmd) {
 	}
 }
 
-// swipeSides lays a card's answers on ← and →: the positive one on the
-// left, or on the right with inverted swipes, as on the phone.
 func (m Model) swipeSides(c *card) (left, right string, ok bool) {
 	pos, neg, ok := c.swipe()
 	if m.prefs.InvertedSwipes {
@@ -380,8 +346,6 @@ func (m Model) swipeSides(c *card) (left, right string, ok bool) {
 	return pos, neg, ok
 }
 
-// check has rwcore grade a typed answer against the card's side of the word,
-// with the phone's own matcher.
 func (m Model) check(c *card, typed string) tea.Cmd {
 	cli, app, id, mode := m.cli, m.appID, c.wordID, c.mode
 	return func() tea.Msg {
@@ -390,9 +354,6 @@ func (m Model) check(c *card, typed string) tea.Cmd {
 	}
 }
 
-// onCheck takes the grade as the phone's keyboard block does: a correct or
-// partial answer opens the card for the swipe, a wrong one costs one of the
-// three attempts, and the last one opens it as missed.
 func (m Model) onCheck(msg checkMsg) (tea.Model, tea.Cmd) {
 	s := &m.sess
 	s.checking = false
@@ -454,8 +415,6 @@ func (m *Model) nativeLang() string {
 	return "RUS"
 }
 
-// cardTitle is the phone's card header (WordCardDeckView): new word,
-// learning, or the review's number on the card's side, then the open block.
 func cardTitle(c *card) string {
 	var title string
 	switch c.kind {
@@ -479,13 +438,8 @@ func cardTitle(c *card) string {
 	return title
 }
 
-// swipe names the two answers a card offers on ← and →, mirroring the
-// phone's swipes: left takes the word out of the loop, right keeps it in.
-// As on the phone (WordCardView) they are there from the start — the
-// blocks are optional checks, not a gate.
 func (c *card) swipe() (left, right string, ok bool) {
 	if c == nil || c.done || c.pane != paneNone && !c.reveal {
-		// An open block hides the answers until it is resolved.
 		return "", "", false
 	}
 	switch c.kind {

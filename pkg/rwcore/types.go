@@ -12,11 +12,9 @@ type App struct {
 }
 
 type Settings struct {
-	NativeLanguage *string `json:"native_language"`
-	DailyGoal      *string `json:"daily_goal"`
-	UILanguage     *string `json:"ui_language"`
-	// LearningCardMode is the side the phone opens a word in learning on:
-	// recognition, reproduction or recognition_or_reproduction.
+	NativeLanguage   *string `json:"native_language"`
+	DailyGoal        *string `json:"daily_goal"`
+	UILanguage       *string `json:"ui_language"`
 	LearningCardMode *string `json:"learning_card_mode"`
 }
 
@@ -31,20 +29,18 @@ type Stats struct {
 }
 
 type Today struct {
-	Today       string   `json:"today"`
-	Learned     int64    `json:"learned"`
-	Reviewed    int64    `json:"reviewed"`
-	Memorizing  int64    `json:"memorizing"`
-	Mastered    int64    `json:"mastered"`
-	Known       int64    `json:"known"`
-	Goal        *int64   `json:"goal"`
-	StreakCur   int64    `json:"streak_cur"`
-	StreakBest  int64    `json:"streak_best"`
-	ActiveDates []string `json:"active_dates"`
-	// Week is the calendar week, Monday first: each day's words learned in
-	// both directions, as the phone's streak dots count them.
-	Week     []WeekDay `json:"week"`
-	WeekGoal *int64    `json:"week_goal"`
+	Today       string    `json:"today"`
+	Learned     int64     `json:"learned"`
+	Reviewed    int64     `json:"reviewed"`
+	Memorizing  int64     `json:"memorizing"`
+	Mastered    int64     `json:"mastered"`
+	Known       int64     `json:"known"`
+	Goal        *int64    `json:"goal"`
+	StreakCur   int64     `json:"streak_cur"`
+	StreakBest  int64     `json:"streak_best"`
+	ActiveDates []string  `json:"active_dates"`
+	Week        []WeekDay `json:"week"`
+	WeekGoal    *int64    `json:"week_goal"`
 }
 
 type WeekDay struct {
@@ -72,16 +68,12 @@ type Word struct {
 	Reproduction  ModeState         `json:"reproduction"`
 }
 
-// Deal is the next card of a session, dealt the way the phone deals it,
-// with the day's counters.
 type Deal struct {
 	Card *Card `json:"card"`
 	Day  Day   `json:"day"`
 	Now  int64 `json:"now"`
 }
 
-// Check is how the phone's keyboard block grades a typed answer: "correct",
-// "partial" (accepted in yellow) or "wrong".
 type Check struct {
 	Verdict  string `json:"verdict"`
 	Accepted bool   `json:"accepted"`
@@ -89,8 +81,6 @@ type Check struct {
 	Lang     string `json:"lang"`
 }
 
-// Synced is the settings the desktop shares with the phone through the
-// backup's SETTINGS, as the phone reads them (its defaults filled in).
 type Synced struct {
 	NewWords      string `json:"new_words_card_mode"`
 	Learning      string `json:"word_learning_card_mode"`
@@ -103,10 +93,6 @@ type Synced struct {
 	DailyGoal     *int64 `json:"daily_goal"`
 }
 
-// Card is one card as the phone lays it out: the side it asks (1 shows
-// the word, 2 the translation), the queue of that side, which picks what a
-// swipe does, the word's status, which names the swipe answers, and the
-// blocks it offers.
 type Card struct {
 	Word     Word   `json:"word"`
 	Side     int64  `json:"side"`
@@ -122,11 +108,10 @@ type Day struct {
 	Learning     int64  `json:"learning"`
 	LearnedToday int64  `json:"learned_today"`
 	Goal         *int64 `json:"goal"`
-	// BaseGoal is the day's goal before "continue" raised it.
-	BaseGoal    *int64 `json:"base_goal"`
-	GoalReached bool   `json:"goal_reached"`
-	Due         int64  `json:"due"`
-	NextReview  *int64 `json:"next_review"`
+	BaseGoal     *int64 `json:"base_goal"`
+	GoalReached  bool   `json:"goal_reached"`
+	Due          int64  `json:"due"`
+	NextReview   *int64 `json:"next_review"`
 }
 
 type DueItem struct {

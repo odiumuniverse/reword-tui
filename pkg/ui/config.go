@@ -6,15 +6,10 @@ import (
 	"path/filepath"
 )
 
-// Prefs are this computer's own settings. The learning settings live in
-// the backup's SETTINGS and are shared with the phone (rwcore.Synced).
 type Prefs struct {
-	RevealAtOnce bool `json:"reveal_at_once"`
-	// InvertedSwipes puts the positive answer on → and the negative on ←,
-	// like the phone's setting of the same name, which it keeps per device.
-	InvertedSwipes bool `json:"inverted_swipes"`
-	Onboarded      bool `json:"onboarded"`
-	// ShowTranscription mirrors the synced show_transcription setting.
+	RevealAtOnce      bool `json:"reveal_at_once"`
+	InvertedSwipes    bool `json:"inverted_swipes"`
+	Onboarded         bool `json:"onboarded"`
 	ShowTranscription bool `json:"-"`
 }
 

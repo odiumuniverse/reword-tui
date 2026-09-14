@@ -1,16 +1,5 @@
-//! The phone's scheduler, ported from ReWord 4.3.4 (p68 and the
-//! WordPresenter answer callables s32, t32, r32, l32, p32, k32) so a desktop
-//! session moves a word exactly like the app: same steps, easiness,
-//! intervals, side sync and LOG rows.
-//!
-//! The app writes every answer from the point of view of the card's own
-//! side; the other side follows only when the card mode carries it. The
-//! port keeps that shape: each rule is written for "own = recognition"
-//! and a reproduction card runs it on the flipped row.
 use crate::rules::{Rules, SideMode};
 
-/// Card side (lla): recognition shows the word and asks for the
-/// translation, reproduction the other way round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Rec,
@@ -32,7 +21,6 @@ impl Side {
         }
     }
 
-    /// d85.b/c: whether an answer on this side moves the other one too.
     fn carries(self, mode: SideMode) -> bool {
         match self {
             Self::Rec => mode.rec_carries(),
@@ -41,8 +29,6 @@ impl Side {
     }
 }
 
-/// WORD's scheduling columns (p68.a): queue, last review, interval,
-/// step, easiness and fails for each side.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Row {
     pub q_rec: i64,
@@ -92,7 +78,6 @@ impl Row {
     }
 }
 
-/// Runs a rule written for a recognition card on `side`.
 fn on_side<T>(side: Side, row: Row, rule: impl FnOnce(Row) -> T, back: impl FnOnce(T) -> T) -> T {
     match side {
         Side::Rec => rule(row),
@@ -104,16 +89,12 @@ fn clamp_ease(e: f32) -> f32 {
     1.25f32.max(4.25f32.min(e))
 }
 
-/// p68.b: the interval for `step`. The first four steps are fixed; later
-/// ones stretch the time actually elapsed by the easiness. From step 4 on
-/// the interval stops at `cap`, and snaps to it when within 8%.
 pub fn ladder(step: i64, elapsed: i64, cap: i64, ease: f32) -> i64 {
     let base = match step {
         1 => 1800,
         2 => 10800,
         3 => 86400,
         4 => 432000,
-        // Java promotes long * float to float, then truncates.
         _ => ((elapsed as f32) * ease) as i64,
     };
     if step < 4 {
@@ -127,8 +108,6 @@ pub fn ladder(step: i64, elapsed: i64, cap: i64, ease: f32) -> i64 {
     }
 }
 
-/// p68.c: the least gap kept between the two sides' due times in
-/// recognition_or_reproduction mode.
 pub fn gap(step: i64) -> i64 {
     match step {
         1 => 900,
@@ -139,7 +118,6 @@ pub fn gap(step: i64) -> i64 {
     }
 }
 
-/// s32 "Start learning": both sides enter learning, due in 30 s.
 pub fn start_learning(now: i64) -> Row {
     Row {
         q_rec: 1,
@@ -157,7 +135,6 @@ pub fn start_learning(now: i64) -> Row {
     }
 }
 
-/// t32 "I already know": both sides park as known.
 pub fn already_known(now: i64) -> Row {
     Row {
         q_rec: 3,
@@ -175,7 +152,6 @@ pub fn already_known(now: i64) -> Row {
     }
 }
 
-/// r32 "Keep showing": the card's side restarts learning, due in 30 s.
 pub fn keep_showing(now: i64, side: Side, learning: SideMode, row: Row) -> Row {
     let carry = side.carries(learning);
     on_side(
@@ -199,8 +175,6 @@ pub fn keep_showing(now: i64, side: Side, learning: SideMode, row: Row) -> Row {
     )
 }
 
-/// p68.a "I have memorized": the card's side graduates to review at step
-/// 1; the other side follows when the learning mode carries it.
 pub fn graduate(now: i64, side: Side, learning: SideMode, cap: i64, row: Row) -> Row {
     let carry = side.carries(learning);
     on_side(
@@ -227,8 +201,6 @@ pub fn graduate(now: i64, side: Side, learning: SideMode, cap: i64, row: Row) ->
     )
 }
 
-/// p68.d: after a graduation in recognition_or_reproduction mode, keeps
-/// the two sides from falling due together.
 pub fn respace_graduated(now: i64, side: Side, review: SideMode, row: Row) -> Row {
     if review.joint() {
         return row;
@@ -237,7 +209,8 @@ pub fn respace_graduated(now: i64, side: Side, review: SideMode, row: Row) -> Ro
         side,
         row,
         |r| {
-            let (Some(t_own), Some(t_oth), Some(mut io), Some(mut ix)) = (r.t_rec, r.t_rep, r.i_rec, r.i_rep)
+            let (Some(t_own), Some(t_oth), Some(mut io), Some(mut ix)) =
+                (r.t_rec, r.t_rep, r.i_rec, r.i_rep)
             else {
                 return r;
             };
@@ -265,9 +238,6 @@ pub fn respace_graduated(now: i64, side: Side, review: SideMode, row: Row) -> Ro
     )
 }
 
-/// p32 "Got it" on a due review card: the step climbs, easiness rises
-/// after a clean cycle, and a clean review past the cap retires the side.
-/// None when the card's side is not due, which leaves the word untouched.
 pub fn review_ok(now: i64, side: Side, review: SideMode, cap: i64, row: Row) -> Option<Row> {
     let carry = side.carries(review);
     let next = on_side(
@@ -317,8 +287,6 @@ pub fn review_ok(now: i64, side: Side, review: SideMode, cap: i64, row: Row) -> 
     Some(respace_ok(now, side, review, next))
 }
 
-/// The spacing p32 runs after "Got it": the other side is pushed past its
-/// own gap, then the card's side moves if the two still fall together.
 fn respace_ok(now: i64, side: Side, review: SideMode, row: Row) -> Row {
     if review.joint() {
         return row;
@@ -356,9 +324,6 @@ fn respace_ok(now: i64, side: Side, review: SideMode, row: Row) -> Row {
     )
 }
 
-/// k32 "Missed it" on a due review card: the side comes back in a minute,
-/// easiness drops once per cycle and the fail count grows; the step stays.
-/// None when the card's side is not due.
 pub fn review_fail(now: i64, side: Side, review: SideMode, row: Row) -> Option<Row> {
     let carry = side.carries(review);
     let next = on_side(
@@ -396,7 +361,6 @@ pub fn review_fail(now: i64, side: Side, review: SideMode, row: Row) -> Option<R
     Some(respace_fail(now, side, review, next))
 }
 
-/// The spacing k32 runs after "Missed it": here the other side gives way.
 fn respace_fail(now: i64, side: Side, review: SideMode, row: Row) -> Row {
     if review.joint() {
         return row;
@@ -405,7 +369,8 @@ fn respace_fail(now: i64, side: Side, review: SideMode, row: Row) -> Row {
         side,
         row,
         |r| {
-            let (Some(t_own), Some(t_oth), Some(io), Some(mut ix)) = (r.t_rec, r.t_rep, r.i_rec, r.i_rep)
+            let (Some(t_own), Some(t_oth), Some(io), Some(mut ix)) =
+                (r.t_rec, r.t_rep, r.i_rec, r.i_rep)
             else {
                 return r;
             };
@@ -420,13 +385,15 @@ fn respace_fail(now: i64, side: Side, review: SideMode, row: Row) -> Row {
             if ((t_own + io) - (t_oth + ix)).abs() < c_oth {
                 ix = (t_own + io + c_oth) - t_oth;
             }
-            Row { i_rep: Some(ix), ..r }
+            Row {
+                i_rep: Some(ix),
+                ..r
+            }
         },
         Row::flip,
     )
 }
 
-/// What a swipe does, by the queue of the card's side (WordPresenter.m).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     AlreadyKnown,
@@ -438,8 +405,6 @@ pub enum Action {
 }
 
 impl Action {
-    /// `positive` is the left answer before inverted_swipes. zna.a reads
-    /// any queue outside 0..4 as new.
     pub fn of(side_queue: i64, positive: bool) -> Self {
         match (side_queue, positive) {
             (1, true) => Self::Memorized,
@@ -463,8 +428,6 @@ impl Action {
     }
 }
 
-/// A LOG row the answer writes (re5): mode, queue and step before, queue
-/// after, flags (2 marks the copy for the side that followed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogRow {
     pub mode: i64,
@@ -474,8 +437,6 @@ pub struct LogRow {
     pub flags: i64,
 }
 
-/// The result of one answer: the new row (None leaves WORD untouched),
-/// LOG rows to append, and whether the word's live LOG is dropped.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Outcome {
     pub row: Option<Row>,
@@ -483,7 +444,6 @@ pub struct Outcome {
     pub clear_log: bool,
 }
 
-/// Applies one answer the way WordPresenter.m does.
 pub fn answer(now: i64, rules: &Rules, action: Action, side: Side, row: Row) -> Outcome {
     let logged = |next: &Row, joint: bool| {
         let first = LogRow {
@@ -609,8 +569,6 @@ mod tests {
         }
     }
 
-    /// Golden vectors printed by the app's own p68 (copied verbatim from the
-    /// 4.3.4 decompile into a Java harness): the port must agree on every one.
     mod golden {
         use super::*;
 
@@ -689,7 +647,10 @@ mod tests {
         #[test]
         fn matches_the_apps_own_p68() {
             let mut seen = [0; 4];
-            for (n, line) in include_str!("testdata/p68_vectors.jsonl").lines().enumerate() {
+            for (n, line) in include_str!("testdata/p68_vectors.jsonl")
+                .lines()
+                .enumerate()
+            {
                 match serde_json::from_str::<Vector>(line).unwrap() {
                     Vector::Ladder {
                         step,
@@ -713,7 +674,13 @@ mod tests {
                         input,
                         out,
                     } => {
-                        let got = graduate(now, side_of(side), SideMode::parse(&mode), cap, Row::from(&input));
+                        let got = graduate(
+                            now,
+                            side_of(side),
+                            SideMode::parse(&mode),
+                            cap,
+                            Row::from(&input),
+                        );
                         assert_eq!(got, Row::from(&out), "line {n}");
                         seen[2] += 1;
                     }
@@ -724,13 +691,21 @@ mod tests {
                         input,
                         out,
                     } => {
-                        let got = respace_graduated(now, side_of(side), SideMode::parse(&mode), Row::from(&input));
+                        let got = respace_graduated(
+                            now,
+                            side_of(side),
+                            SideMode::parse(&mode),
+                            Row::from(&input),
+                        );
                         assert_eq!(got, Row::from(&out), "line {n}");
                         seen[3] += 1;
                     }
                 }
             }
-            assert!(seen.iter().all(|&c| c > 0), "every p68 function must be covered: {seen:?}");
+            assert!(
+                seen.iter().all(|&c| c > 0),
+                "every p68 function must be covered: {seen:?}"
+            );
         }
     }
 
@@ -742,7 +717,6 @@ mod tests {
             [1800, 10800, 86400, 432000]
         );
         assert_eq!(ladder(5, 1_000_000, cap, 2.5), 2_500_000);
-        // Within 8% of the cap snaps to it; farther stays put.
         assert_eq!(ladder(5, 1_400_000, cap, 3.5), cap);
         assert_eq!(ladder(5, 1_300_000, cap, 3.5), 4_550_000);
         assert_eq!(ladder(6, 9_000_000, cap, 3.0), cap);
@@ -750,22 +724,25 @@ mod tests {
 
     #[test]
     fn memorized_on_reproduction_matches_the_users_backup() {
-        // The es backup: learning cards show the translation, review keeps
-        // the sides apart. Every graduated word there reads rec 2700 / rep
-        // 1800 at step 1, with a rep LOG row and a flagged rec copy.
         let r = rules(SideMode::Reproduction, SideMode::RecognitionOrReproduction);
         let out = answer(NOW, &r, Action::Memorized, Side::Rep, learning_row());
         let row = out.row.unwrap();
         assert_eq!((row.q_rec, row.q_rep, row.s_rec, row.s_rep), (2, 2, 1, 1));
         assert_eq!((row.t_rec, row.t_rep), (Some(NOW), Some(NOW)));
         assert_eq!((row.i_rec, row.i_rep), (Some(2700), Some(1800)));
-        assert_eq!((row.e_rec, row.e_rep, row.f_rec, row.f_rep), (2.5, 2.5, 0, 0));
+        assert_eq!(
+            (row.e_rec, row.e_rep, row.f_rec, row.f_rep),
+            (2.5, 2.5, 0, 0)
+        );
         assert_eq!(out.log, vec![log(2, 1, 1, 2, 0), log(1, 1, 1, 2, 2)]);
     }
 
     #[test]
     fn memorized_apart_leaves_the_other_side_learning() {
-        let r = rules(SideMode::RecognitionOrReproduction, SideMode::RecognitionOrReproduction);
+        let r = rules(
+            SideMode::RecognitionOrReproduction,
+            SideMode::RecognitionOrReproduction,
+        );
         let out = answer(NOW, &r, Action::Memorized, Side::Rec, learning_row());
         let row = out.row.unwrap();
         assert_eq!((row.q_rec, row.q_rep), (2, 1));
@@ -778,9 +755,15 @@ mod tests {
         let r = rules(SideMode::Reproduction, SideMode::RecognitionOrReproduction);
         let out = answer(NOW, &r, Action::ReviewOk, Side::Rep, review_row());
         let row = out.row.unwrap();
-        assert_eq!((row.q_rep, row.s_rep, row.i_rep, row.t_rep), (2, 2, Some(10800), Some(NOW)));
+        assert_eq!(
+            (row.q_rep, row.s_rep, row.i_rep, row.t_rep),
+            (2, 2, Some(10800), Some(NOW))
+        );
         assert_eq!((row.e_rep, row.f_rep), (2.75, 0));
-        assert_eq!((row.i_rec, row.t_rec, row.s_rec), (Some(1_000_000), Some(NOW - 100), 4));
+        assert_eq!(
+            (row.i_rec, row.t_rec, row.s_rec),
+            (Some(1_000_000), Some(NOW - 100), 4)
+        );
         assert_eq!(out.log, vec![log(2, 2, 1, 2, 0)]);
     }
 
@@ -794,7 +777,10 @@ mod tests {
             ..review_row()
         };
         let row = review_ok(NOW, Side::Rep, r.review, r.cap_secs, start).unwrap();
-        assert_eq!((row.i_rep, row.s_rep, row.e_rep, row.f_rep), (Some(432000), 6, 2.0, 0));
+        assert_eq!(
+            (row.i_rep, row.s_rep, row.e_rep, row.f_rep),
+            (Some(432000), 6, 2.0, 0)
+        );
     }
 
     #[test]
@@ -815,13 +801,20 @@ mod tests {
     #[test]
     fn review_answers_need_the_card_due() {
         let r = rules(SideMode::Reproduction, SideMode::RecognitionOrReproduction);
-        // "Got it" allows the last minute early, "Missed it" does not.
         let early = Row {
             t_rep: Some(NOW - 1800 + 60),
             ..review_row()
         };
-        assert!(answer(NOW, &r, Action::ReviewOk, Side::Rep, early).row.is_some());
-        assert!(answer(NOW, &r, Action::ReviewFail, Side::Rep, early).row.is_none());
+        assert!(
+            answer(NOW, &r, Action::ReviewOk, Side::Rep, early)
+                .row
+                .is_some()
+        );
+        assert!(
+            answer(NOW, &r, Action::ReviewFail, Side::Rep, early)
+                .row
+                .is_none()
+        );
         let too_early = Row {
             t_rep: Some(NOW - 1800 + 61),
             ..review_row()
@@ -833,7 +826,11 @@ mod tests {
             i_rep: Some(0),
             ..review_row()
         };
-        assert!(answer(NOW, &r, Action::ReviewFail, Side::Rep, same_second).row.is_none());
+        assert!(
+            answer(NOW, &r, Action::ReviewFail, Side::Rep, same_second)
+                .row
+                .is_none()
+        );
     }
 
     #[test]
@@ -842,9 +839,11 @@ mod tests {
         let out = answer(NOW, &r, Action::ReviewFail, Side::Rep, review_row());
         assert!(out.log.is_empty());
         let row = out.row.unwrap();
-        assert_eq!((row.q_rep, row.t_rep, row.i_rep), (2, Some(NOW - 2000), Some(2060)));
+        assert_eq!(
+            (row.q_rep, row.t_rep, row.i_rep),
+            (2, Some(NOW - 2000), Some(2060))
+        );
         assert_eq!((row.s_rep, row.e_rep, row.f_rep), (1, 2.0, 1));
-        // A second miss in the same cycle leaves the easiness alone.
         let again = Row {
             t_rep: Some(NOW - 3000),
             i_rep: Some(100),
@@ -883,7 +882,6 @@ mod tests {
             ..review_row()
         };
         let row = review_fail(NOW, Side::Rec, r.review, start).unwrap();
-        // Rec is due in a minute; rep gives way to a full 5400 s gap after it.
         assert_eq!(row.i_rec, Some(1060));
         assert_eq!(row.i_rep, Some(6460));
     }
@@ -898,9 +896,14 @@ mod tests {
         };
         let out = answer(NOW, &r, Action::KeepShowing, Side::Rep, start);
         let row = out.row.unwrap();
-        assert_eq!((row.q_rec, row.q_rep, row.t_rec, row.t_rep), (1, 1, Some(NOW), Some(NOW)));
-        assert_eq!((row.i_rec, row.i_rep, out.clear_log), (Some(30), Some(30), false));
-        // Pulling a reviewed side back into learning drops the live history.
+        assert_eq!(
+            (row.q_rec, row.q_rep, row.t_rec, row.t_rep),
+            (1, 1, Some(NOW), Some(NOW))
+        );
+        assert_eq!(
+            (row.i_rec, row.i_rep, out.clear_log),
+            (Some(30), Some(30), false)
+        );
         let r = rules(SideMode::Random, SideMode::RecognitionOrReproduction);
         let half = Row {
             q_rec: 2,
@@ -913,7 +916,13 @@ mod tests {
     #[test]
     fn new_word_answers() {
         let r = Rules::default();
-        let out = answer(NOW, &r, Action::StartLearning, Side::Rec, Row { ..already_known(0) });
+        let out = answer(
+            NOW,
+            &r,
+            Action::StartLearning,
+            Side::Rec,
+            Row { ..already_known(0) },
+        );
         assert_eq!(out.row, Some(start_learning(NOW)));
         assert!(out.log.is_empty());
         let fresh = Row {
@@ -932,7 +941,10 @@ mod tests {
         };
         let out = answer(NOW, &r, Action::AlreadyKnown, Side::Rep, fresh);
         let row = out.row.unwrap();
-        assert_eq!((row.q_rec, row.q_rep, row.i_rec, row.t_rep), (3, 3, None, Some(NOW)));
+        assert_eq!(
+            (row.q_rec, row.q_rep, row.i_rec, row.t_rep),
+            (3, 3, None, Some(NOW))
+        );
         assert_eq!(out.log, vec![log(1, 0, 0, 3, 0), log(2, 0, 0, 3, 0)]);
     }
 

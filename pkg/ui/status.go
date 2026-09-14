@@ -7,26 +7,20 @@ import (
 	"reword-tui/pkg/rwcore"
 )
 
-// goalScreen is true when the session has nothing to learn because the
-// day's goal is reached: the phone's goal reached screen.
 func (m Model) goalScreen() bool {
 	d := m.sess.day
 	return m.sess.cur == nil && !m.sess.dealing && m.sess.mode != modeReview && d.GoalReached && d.Goal != nil
 }
 
-// raiseStart is where the phone's "add more new words" dialog starts (zz1):
-// half the day's goal, plus what was learned past the raised goal.
 func (d day) raiseStart() int64 {
 	base, adj := d.base(), d.adjusted()
 	return max(base/2, base/2+(d.LearnedToday-adj))
 }
 
-// raiseMin keeps the raised goal above the words already learned.
 func (d day) raiseMin() int64 {
 	return max(1, d.LearnedToday-d.adjusted()+1)
 }
 
-// day is rwcore's day with the phone's goal defaults (5 when unset).
 type day rwcore.Day
 
 func (d day) base() int64 {
@@ -43,7 +37,6 @@ func (d day) adjusted() int64 {
 	return 5
 }
 
-// plural spells "%d unit" or "%d units".
 func plural(n int64, one, many string) string {
 	if n == 1 {
 		return fmt.Sprintf(one, n)
@@ -51,10 +44,6 @@ func plural(n int64, one, many string) string {
 	return fmt.Sprintf(many, n)
 }
 
-// wordStatus is a word's status line in a category, as the phone reads it
-// (v88.d): new, learning, already known, mastered, or when its review is
-// due. The due time follows the learning mode setting, as on the phone:
-// one side for recognition or reproduction, the sooner of the two else.
 func wordStatus(w rwcore.Word, learningMode string, now int64) string {
 	q1, q2 := w.Recognition.Level, w.Reproduction.Level
 	switch {
@@ -90,7 +79,6 @@ func wordStatus(w rwcore.Word, learningMode string, now int64) string {
 			at, ok = p, pok
 		}
 	default:
-		// d85.a reads anything else as recognition.
 		at, ok = due(w.Recognition)
 	}
 	if !ok {
@@ -110,8 +98,6 @@ func wordStatus(w rwcore.Word, learningMode string, now int64) string {
 	return "Review in 1 minute"
 }
 
-// showUpIn says when the next review comes, as the phone's empty review
-// screen does (wy5.d): whole days, whole hours, minutes rounded up, seconds.
 func showUpIn(secs int64) string {
 	secs = max(secs, 0)
 	switch {

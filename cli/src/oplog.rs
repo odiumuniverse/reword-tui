@@ -30,7 +30,6 @@ pub enum OpKind {
     Enrolled {
         id: i64,
     },
-    /// A learning card's answer on one side: "memorized" or "keep".
     Learned {
         id: i64,
         mode: i64,
@@ -62,20 +61,15 @@ pub enum OpKind {
         date: String,
         goal: i64,
     },
-    /// A learning setting written from the desktop.
     SettingSet {
         name: String,
         value: String,
     },
-    /// An answer taken back: the word's columns return to `row`, and the LOG
-    /// rows written at `at` go.
     Restored {
         id: i64,
         row: crate::sched::Row,
         at: i64,
     },
-    /// "Continue" on the goal reached screen: the day's adjusted goal, as
-    /// it came out, so a replay lands on the same number.
     GoalRaised {
         date: String,
         adjusted: i64,
@@ -321,8 +315,6 @@ pub fn replay_decision(conn: &rusqlite::Connection, app_id: &str, op: &Op) -> Re
             }
             let (qr, qp) = q_of(*id)?;
             let known = decision == "known";
-            // "learn" starts a new word; once the phone moved it on, a
-            // replay must not push it further.
             if known && qr >= 3 && qp >= 3 || !known && (qr != 0 || qp != 0) {
                 Ok(ReplayAction::Skip("Q already at target".to_string()))
             } else {
@@ -504,7 +496,11 @@ pub fn replay_decision(conn: &rusqlite::Connection, app_id: &str, op: &Op) -> Re
         }
         OpKind::GoalRaised { date, adjusted } => {
             let cur: Option<Option<i64>> = conn
-                .query_row("SELECT ADJUSTED_GOAL FROM DAILY_GOAL WHERE DATE = ?", [date], |r| r.get(0))
+                .query_row(
+                    "SELECT ADJUSTED_GOAL FROM DAILY_GOAL WHERE DATE = ?",
+                    [date],
+                    |r| r.get(0),
+                )
                 .optional()
                 .unwrap_or(None);
             if cur.flatten() == Some(*adjusted) {
@@ -575,7 +571,6 @@ pub enum ReplayAction {
         name: String,
         value: String,
     },
-    /// The snapshot and time stay in the op (Restored).
     ApplyRestore {
         id: WordId,
     },
