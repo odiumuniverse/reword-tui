@@ -1,8 +1,12 @@
 mod discover;
 mod interval;
+mod matcher;
 mod model;
 mod oplog;
 mod output;
+mod rules;
+mod sched;
+mod select;
 mod store;
 mod sync;
 use crate::model::Lang;
@@ -20,6 +24,149 @@ struct Receipt {
 fn now_local() -> (i64, String) {
     let now = chrono::Local::now();
     (now.timestamp(), now.format("%F").to_string())
+}
+/// When an intent happened: its own `ts` when the queue recorded one, so a
+/// later write to iCloud lands exactly as it did in the working copy.
+fn body_time(v: &serde_json::Value) -> Result<(i64, String)> {
+    match v["ts"].as_i64() {
+        Some(ts) => {
+            let date = chrono::DateTime::from_timestamp(ts, 0)
+                .context("bad .ts")?
+                .with_timezone(&chrono::Local)
+                .format("%F")
+                .to_string();
+            Ok((ts, date))
+        }
+        None => Ok(now_local()),
+    }
+}
+/// The database reads come from: the working copy under --db, else the
+/// app's backup.
+fn read_db(cli: &Cli, app: &discover::App) -> Result<rusqlite::Connection> {
+    store::open_ro(cli.db.as_deref().unwrap_or(&app.backup_path))
+}
+/// Applies one intent straight to a working copy: the same store rules as
+/// a write to iCloud, without the snapshot, the fingerprint gate or the op
+/// log.
+fn apply_local(
+    db: &std::path::Path,
+    v: &serde_json::Value,
+    ts: i64,
+    date: &str,
+) -> Result<serde_json::Value> {
+    use crate::sched::Action;
+    let mut conn =
+        rusqlite::Connection::open(db).with_context(|| format!("cannot open {}", db.display()))?;
+    let tx = conn.transaction()?;
+    let word = |tx: &rusqlite::Connection| -> Result<crate::model::Word> {
+        let q = v["word"].as_str().context("missing .word")?;
+        store::get_word(tx, q)?.with_context(|| format!("no word '{q}'"))
+    };
+    let op = v["op"].as_str().unwrap_or("");
+    let detail = match op {
+        "grade" => {
+            let mode = parse_mode(v["mode"].as_str().unwrap_or(""))?;
+            let ok = parse_result(v["result"].as_str().unwrap_or(""))?;
+            let w = word(&tx)?;
+            store::grade_review(&tx, w.id, mode, ok, ts, date)?;
+            serde_json::json!({ "word": w.id.0, "ok": ok })
+        }
+        "triage" | "enroll" => {
+            let known = match (op, v["decision"].as_str().unwrap_or("")) {
+                ("enroll", _) | (_, "learn") => false,
+                (_, "known") => true,
+                (_, x) => anyhow::bail!("bad decision '{x}'; want known|learn"),
+            };
+            let w = word(&tx)?;
+            if known {
+                store::triage_known(&tx, w.id, ts, date)?;
+            } else {
+                store::advance_learn(&tx, w.id, ts, date)?;
+            }
+            serde_json::json!({ "word": w.id.0, "known": known })
+        }
+        "answer" => {
+            let mode = parse_mode(v["mode"].as_str().unwrap_or(""))?;
+            let positive = v["positive"].as_bool().context("missing .positive")?;
+            let w = word(&tx)?;
+            let side = store::side_of(mode)?;
+            // The row before the answer is what an undo puts back.
+            let pre = store::sched_row(&tx, w.id)?;
+            let action = Action::of(pre.queue(side), positive);
+            store::answer(&tx, w.id, side, action, ts, date)?;
+            serde_json::json!({ "word": w.id.0, "action": action.name(), "pre": pre, "at": ts })
+        }
+        "setting" => {
+            let name = v["name"].as_str().context("missing .name")?;
+            let value = v["value"].as_str().context("missing .value")?;
+            store::set_setting(&tx, name, value)?;
+            serde_json::json!({ "name": name, "value": value })
+        }
+        "restore" => {
+            let w = word(&tx)?;
+            let row: crate::sched::Row = serde_json::from_value(v["row"].clone()).context("bad .row")?;
+            let at = v["at"].as_i64().context("missing .at")?;
+            store::restore_answer(&tx, w.id, &row, at)?;
+            serde_json::json!({ "word": w.id.0 })
+        }
+        "goal" => {
+            let goal = v["goal"].as_i64().context("missing .goal")?;
+            store::set_goal(&tx, date, goal)?;
+            serde_json::json!({ "goal": goal })
+        }
+        "raise_goal" => {
+            let by = v["by"].as_i64().context("missing .by")?;
+            let adjusted = store::raise_goal(&tx, date, by)?;
+            serde_json::json!({ "adjusted": adjusted })
+        }
+        "add" => {
+            let text = v["word"].as_str().context("missing .word")?;
+            if text.trim().is_empty() {
+                anyhow::bail!("missing .word");
+            }
+            let trs = v["tr"]
+                .as_array()
+                .context("missing .tr array")?
+                .iter()
+                .map(|t| t.as_str().unwrap_or("").to_string())
+                .collect::<Vec<_>>();
+            let tr = parse_tr(&trs)?;
+            if tr.is_empty() || tr.iter().any(|(_, t)| t.trim().is_empty()) {
+                anyhow::bail!("bad .tr entries; want LANG=TEXT with non-empty TEXT");
+            }
+            let id = store::add_word(&tx, text, v["transcription"].as_str(), &tr)?;
+            if v["enroll"].as_bool().unwrap_or(false) {
+                store::enroll_word(&tx, id, ts, date)?;
+            }
+            serde_json::json!({ "word": text, "id": id.0 })
+        }
+        "remove" => {
+            let w = word(&tx)?;
+            store::remove_word(&tx, w.id)?;
+            serde_json::json!({ "word": w.id.0 })
+        }
+        "reset" => {
+            let w = word(&tx)?;
+            store::reset_word(&tx, w.id)?;
+            serde_json::json!({ "word": w.id.0 })
+        }
+        "postpone" => {
+            let w = word(&tx)?;
+            store::postpone_word(&tx, w.id, ts)?;
+            serde_json::json!({ "word": w.id.0 })
+        }
+        "select" => {
+            let category = v["category"].as_str().context("missing .category")?;
+            let selected = v["selected"].as_bool().unwrap_or(false);
+            store::set_selected(&tx, category, selected)?;
+            serde_json::json!({ "category": category, "selected": selected })
+        }
+        _ => anyhow::bail!(
+            "bad .op '{op}'; want grade|triage|answer|add|enroll|remove|reset|postpone|select|setting|restore|goal|raise_goal"
+        ),
+    };
+    tx.commit()?;
+    Ok(detail)
 }
 fn shelve_missing(
     data: &std::path::Path,
@@ -43,13 +190,14 @@ fn do_grade(
     word_query: &str,
     mode: crate::model::CardMode,
     ok: bool,
+    at: (i64, &str),
 ) -> Result<Receipt> {
     let probe = store::open_ro(&app.backup_path)?;
     if store::get_word(&probe, word_query)?.is_none() {
         return shelve_missing(data, &app.id, "grade on missing word", word_query);
     }
     drop(probe);
-    let (ts, date) = now_local();
+    let (ts, date) = at;
     let snap = match store::modify(app, cache, data, Some(ts), |tx| {
         let w =
             store::get_word(tx, word_query)?.with_context(|| format!("no word '{word_query}'"))?;
@@ -84,13 +232,14 @@ fn do_triage(
     data: &std::path::Path,
     word_query: &str,
     known: bool,
+    at: (i64, &str),
 ) -> Result<Receipt> {
     let probe = store::open_ro(&app.backup_path)?;
     if store::get_word(&probe, word_query)?.is_none() {
         return shelve_missing(data, &app.id, "triage on missing word", word_query);
     }
     drop(probe);
-    let (ts, date) = now_local();
+    let (ts, date) = at;
     let snap = match store::modify(app, cache, data, Some(ts), |tx| {
         let w =
             store::get_word(tx, word_query)?.with_context(|| format!("no word '{word_query}'"))?;
@@ -122,6 +271,87 @@ fn do_triage(
         orphaned: false,
         snapshot: Some(snap),
         detail: serde_json::json!({ "word": word_query, "known": known }),
+    })
+}
+/// One swipe as the phone's WordPresenter reads it: the queue of the card's
+/// side picks the action (triage, learning or review), and the op log keeps
+/// that decision so a replay repeats it.
+fn do_answer(
+    app: &discover::App,
+    cache: &std::path::Path,
+    data: &std::path::Path,
+    word_query: &str,
+    mode: crate::model::CardMode,
+    positive: bool,
+    at: (i64, &str),
+) -> Result<Receipt> {
+    use crate::sched::Action;
+    let probe = store::open_ro(&app.backup_path)?;
+    if store::get_word(&probe, word_query)?.is_none() {
+        return shelve_missing(data, &app.id, "answer on missing word", word_query);
+    }
+    drop(probe);
+    let side = store::side_of(mode)?;
+    let (ts, date) = at;
+    let done = std::cell::Cell::new(None);
+    let snap = match store::modify(app, cache, data, Some(ts), |tx| {
+        let w =
+            store::get_word(tx, word_query)?.with_context(|| format!("no word '{word_query}'"))?;
+        let action = Action::of(store::sched_row(tx, w.id)?.queue(side), positive);
+        done.set(Some(action));
+        let op = match action {
+            Action::ReviewOk | Action::ReviewFail => {
+                let ok = action == Action::ReviewOk;
+                let (pre_e, pre_f) = store::grade_review(tx, w.id, mode, ok, ts, &date)?;
+                OpKind::Graded {
+                    id: w.id.0,
+                    mode: mode.value(),
+                    ok,
+                    pre_e,
+                    pre_f,
+                }
+            }
+            Action::AlreadyKnown | Action::StartLearning => {
+                let known = action == Action::AlreadyKnown;
+                if known {
+                    store::triage_known(tx, w.id, ts, &date)?;
+                } else {
+                    store::start_learning(tx, w.id, ts, &date)?;
+                }
+                OpKind::Triaged {
+                    id: w.id.0,
+                    decision: if known { "known" } else { "learn" }.to_string(),
+                }
+            }
+            Action::Memorized | Action::KeepShowing => {
+                store::answer(tx, w.id, side, action, ts, &date)?;
+                OpKind::Learned {
+                    id: w.id.0,
+                    mode: mode.value(),
+                    decision: if action == Action::Memorized { "memorized" } else { "keep" }
+                        .to_string(),
+                }
+            }
+        };
+        Ok(vec![op])
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            let probe2 = store::open_ro(&app.backup_path)?;
+            if store::get_word(&probe2, word_query)?.is_none() {
+                return shelve_missing(data, &app.id, "answer on missing word", word_query);
+            }
+            return Err(e);
+        }
+    };
+    Ok(Receipt {
+        applied: true,
+        orphaned: false,
+        snapshot: Some(snap),
+        detail: serde_json::json!({
+            "word": word_query,
+            "action": done.get().map(Action::name),
+        }),
     })
 }
 fn do_remove(
@@ -199,6 +429,11 @@ struct Cli {
     format: Format,
     #[arg(long, global = true)]
     app: Option<String>,
+    /// Work on this SQLite file instead of the app's iCloud backup: reads
+    /// come from it and `apply` writes straight into it (no snapshot, no op
+    /// log). The desktop session keeps its working copy this way.
+    #[arg(long, global = true)]
+    db: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -325,6 +560,49 @@ enum Cmd {
         yes: bool,
     },
     Snapshot,
+    /// The next card as the phone would deal it, with the day's counters.
+    Next {
+        #[arg(long, default_value = "smart")]
+        session: String,
+        /// The card just answered, kept out of this draw.
+        #[arg(long)]
+        exclude: Option<i64>,
+        #[arg(long)]
+        seed: Option<u64>,
+    },
+    /// Copy the app's backup to OUT as a fresh working copy.
+    Work {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// The settings shared with the phone through SETTINGS, as it reads them.
+    Settings,
+    /// One word's card again, as the phone shows it after an undo.
+    Card {
+        #[arg(long)]
+        word: i64,
+        /// 1 recognition, 2 reproduction.
+        #[arg(long)]
+        side: i64,
+        /// The choose-from-4 it showed, in order.
+        #[arg(long, value_delimiter = ',')]
+        variants: Vec<i64>,
+    },
+    /// Grade a typed answer as the phone's keyboard block does: against a
+    /// word's side (--word, --side rec|rep) or a given --expected/--lang.
+    Check {
+        #[arg(long)]
+        typed: String,
+        #[arg(long)]
+        word: Option<i64>,
+        #[arg(long)]
+        side: Option<String>,
+        #[arg(long)]
+        expected: Option<String>,
+        /// Three-letter language code (rus, eng, spa…).
+        #[arg(long)]
+        lang: Option<String>,
+    },
     Oplog {
         #[arg(long, default_value = "50")]
         limit: usize,
@@ -451,13 +729,22 @@ fn replay_run(
                 if known {
                     store::triage_known(tx, id, o.ts, &date)?;
                 } else {
-                    store::advance_learn(tx, id, o.ts, &date)?;
+                    store::start_learning(tx, id, o.ts, &date)?;
                 }
                 outcomes.push((o.seq, "apply-triage".to_string(), String::new()));
             }
             crate::oplog::ReplayAction::ApplyEnroll { id } => {
                 store::enroll_word(tx, id, o.ts, &date)?;
                 outcomes.push((o.seq, "apply-enroll".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplyLearned { id, mode, keep } => {
+                let action = if keep {
+                    crate::sched::Action::KeepShowing
+                } else {
+                    crate::sched::Action::Memorized
+                };
+                store::answer(tx, id, store::side_of(mode)?, action, o.ts, &date)?;
+                outcomes.push((o.seq, "apply-learn".to_string(), String::new()));
             }
             crate::oplog::ReplayAction::ApplySelect { category, selected } => {
                 store::set_selected(tx, &category, selected)?;
@@ -482,6 +769,20 @@ fn replay_run(
             crate::oplog::ReplayAction::ApplyGoal { date, goal } => {
                 store::set_goal(tx, &date, goal)?;
                 outcomes.push((o.seq, "apply-goal".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplySetting { name, value } => {
+                store::set_setting(tx, &name, &value)?;
+                outcomes.push((o.seq, "apply-setting".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplyRestore { id } => {
+                if let crate::oplog::OpKind::Restored { row, at, .. } = &o.kind {
+                    store::restore_answer(tx, id, row, *at)?;
+                }
+                outcomes.push((o.seq, "apply-restore".to_string(), String::new()));
+            }
+            crate::oplog::ReplayAction::ApplyGoalRaise { date, adjusted } => {
+                store::set_adjusted_goal(tx, &date, adjusted)?;
+                outcomes.push((o.seq, "apply-goal-raise".to_string(), String::new()));
             }
             crate::oplog::ReplayAction::ApplyCategoryAdmin { category, action } => {
                 match action.as_str() {
@@ -530,7 +831,7 @@ fn main() -> Result<()> {
         Cmd::Stats => {
             let root = icloud_root(&cli)?;
             let app = resolve_app(&cli, &root)?;
-            let conn = store::open_ro(&app.backup_path)?;
+            let conn = read_db(&cli, &app)?;
             output::stats(&app.id, &store::stats(&conn)?, cli.format)?;
         }
         Cmd::Words {
@@ -540,7 +841,7 @@ fn main() -> Result<()> {
         } => {
             let root = icloud_root(&cli)?;
             let app = resolve_app(&cli, &root)?;
-            let conn = store::open_ro(&app.backup_path)?;
+            let conn = read_db(&cli, &app)?;
             let list = store::list_words(
                 &conn,
                 &store::WordFilter {
@@ -554,7 +855,7 @@ fn main() -> Result<()> {
         Cmd::Show { query } => {
             let root = icloud_root(&cli)?;
             let app = resolve_app(&cli, &root)?;
-            let conn = store::open_ro(&app.backup_path)?;
+            let conn = read_db(&cli, &app)?;
             match store::get_word(&conn, query)? {
                 Some(w) => output::word(&w, cli.format)?,
                 None => anyhow::bail!("no word '{query}'"),
@@ -563,7 +864,7 @@ fn main() -> Result<()> {
         Cmd::Log { word, limit } => {
             let root = icloud_root(&cli)?;
             let app = resolve_app(&cli, &root)?;
-            let conn = store::open_ro(&app.backup_path)?;
+            let conn = read_db(&cli, &app)?;
             let w = store::get_word(&conn, word)?.with_context(|| format!("no word '{word}'"))?;
             let entries = store::log_entries(&conn, w.id, *limit)?;
             output::log_entries(&entries, cli.format)?;
@@ -571,7 +872,7 @@ fn main() -> Result<()> {
         Cmd::Due { limit } => {
             let root = icloud_root(&cli)?;
             let app = resolve_app(&cli, &root)?;
-            let conn = store::open_ro(&app.backup_path)?;
+            let conn = read_db(&cli, &app)?;
             let now = now_epoch()?;
             let mut due = store::due_words(&conn, now)?;
             due.truncate(*limit);
@@ -592,7 +893,8 @@ fn main() -> Result<()> {
             let cache = cache_dir(&cli)?;
             let app = resolve_app(&cli, &root)?;
             let data = data_dir(&cli)?;
-            let r = do_grade(&app, &cache, &data, word, mode, ok)?;
+            let (ts, date) = now_local();
+            let r = do_grade(&app, &cache, &data, word, mode, ok, (ts, &date))?;
             print_receipt("graded", &r, cli.format);
         }
         Cmd::Triage {
@@ -612,25 +914,26 @@ fn main() -> Result<()> {
             let cache = cache_dir(&cli)?;
             let app = resolve_app(&cli, &root)?;
             let data = data_dir(&cli)?;
-            let r = do_triage(&app, &cache, &data, word, known)?;
+            let (ts, date) = now_local();
+            let r = do_triage(&app, &cache, &data, word, known, (ts, &date))?;
             print_receipt("triaged", &r, cli.format);
         }
         Cmd::Categories => {
             let root = icloud_root(&cli)?;
             let app = resolve_app(&cli, &root)?;
-            let conn = store::open_ro(&app.backup_path)?;
+            let conn = read_db(&cli, &app)?;
             output::categories(&store::categories(&conn)?, cli.format)?;
         }
         Cmd::Catstats => {
             let root = icloud_root(&cli)?;
             let app = resolve_app(&cli, &root)?;
-            let conn = store::open_ro(&app.backup_path)?;
+            let conn = read_db(&cli, &app)?;
             output::category_stats(&store::category_stats(&conn)?, cli.format)?;
         }
         Cmd::Today => {
             let root = icloud_root(&cli)?;
             let app = resolve_app(&cli, &root)?;
-            let conn = store::open_ro(&app.backup_path)?;
+            let conn = read_db(&cli, &app)?;
             let today = chrono::Local::now().format("%F").to_string();
             output::today(&store::today(&conn, &today)?, cli.format)?;
         }
@@ -957,8 +1260,9 @@ fn main() -> Result<()> {
         Cmd::Goal { set } => {
             let root = icloud_root(&cli)?;
             let app = resolve_app(&cli, &root)?;
-            let conn = store::open_ro(&app.backup_path)?;
-            let key = chrono::Local::now().format("%Y%m%d").to_string();
+            let conn = read_db(&cli, &app)?;
+            // DAILY_GOAL keys a day as YYYY-MM-DD (a42.k's date format).
+            let key = chrono::Local::now().format("%F").to_string();
             if let Some(g) = set {
                 let cache = cache_dir(&cli)?;
                 let data = data_dir(&cli)?;
@@ -1213,7 +1517,7 @@ fn main() -> Result<()> {
             for (seq, action, reason) in &outcomes {
                 match action.as_str() {
                     "apply-add" | "apply-grade" | "apply-triage" | "apply-enroll"
-                    | "apply-select" | "apply-category" | "apply-remove" | "apply-reset"
+                    | "apply-learn" | "apply-select" | "apply-category" | "apply-remove" | "apply-reset"
                     | "apply-catadmin" | "apply-postpone" | "apply-goal" => applied += 1,
                     "orphan" => {}
                     _ => skipped += 1,
@@ -1243,12 +1547,24 @@ fn main() -> Result<()> {
             let app = resolve_app(&cli, &root)?;
             let data = data_dir(&cli)?;
             let op = v["op"].as_str().unwrap_or("");
+            let (ts, date) = body_time(&v)?;
+            if let Some(db) = &cli.db {
+                let detail = apply_local(db, &v, ts, &date)?;
+                let r = Receipt {
+                    applied: true,
+                    orphaned: false,
+                    snapshot: None,
+                    detail,
+                };
+                print_receipt("applied", &r, cli.format);
+                return Ok(());
+            }
             let r = match op {
                 "grade" => {
                     let mode = parse_mode(v["mode"].as_str().unwrap_or(""))?;
                     let ok = parse_result(v["result"].as_str().unwrap_or(""))?;
                     let word = v["word"].as_str().context("missing .word")?;
-                    do_grade(&app, &cache, &data, word, mode, ok)?
+                    do_grade(&app, &cache, &data, word, mode, ok, (ts, &date))?
                 }
                 "triage" => {
                     let known = match v["decision"].as_str().unwrap_or("") {
@@ -1257,7 +1573,13 @@ fn main() -> Result<()> {
                         x => anyhow::bail!("bad decision '{x}'; want known|learn"),
                     };
                     let word = v["word"].as_str().context("missing .word")?;
-                    do_triage(&app, &cache, &data, word, known)?
+                    do_triage(&app, &cache, &data, word, known, (ts, &date))?
+                }
+                "answer" => {
+                    let mode = parse_mode(v["mode"].as_str().unwrap_or(""))?;
+                    let positive = v["positive"].as_bool().context("missing .positive")?;
+                    let word = v["word"].as_str().context("missing .word")?;
+                    do_answer(&app, &cache, &data, word, mode, positive, (ts, &date))?
                 }
                 "add" => {
                     let word = v["word"].as_str().context("missing .word")?;
@@ -1276,7 +1598,7 @@ fn main() -> Result<()> {
                     }
                     let transcription = v["transcription"].as_str();
                     let enroll = v["enroll"].as_bool().unwrap_or(false);
-                    let snap = store::modify(&app, &cache, &data, Some(now_local().0), |tx| {
+                    let snap = store::modify(&app, &cache, &data, Some(ts), |tx| {
                         let id = store::add_word(tx, word, transcription, &tr)?;
                         let cat = store::custom_category(tx)?;
                         let mut ops = vec![OpKind::Added {
@@ -1291,7 +1613,6 @@ fn main() -> Result<()> {
                             category: cat,
                         }];
                         if enroll {
-                            let (ts, date) = now_local();
                             store::enroll_word(tx, id, ts, &date)?;
                             ops.push(OpKind::Enrolled { id: id.0 });
                         }
@@ -1306,7 +1627,7 @@ fn main() -> Result<()> {
                 }
                 "enroll" => {
                     let word = v["word"].as_str().context("missing .word")?;
-                    do_triage(&app, &cache, &data, word, false)?
+                    do_triage(&app, &cache, &data, word, false, (ts, &date))?
                 }
                 "remove" => {
                     let word = v["word"].as_str().context("missing .word")?;
@@ -1314,7 +1635,7 @@ fn main() -> Result<()> {
                 }
                 "reset" => {
                     let word = v["word"].as_str().context("missing .word")?;
-                    match store::modify(&app, &cache, &data, Some(now_local().0), |tx| {
+                    match store::modify(&app, &cache, &data, Some(ts), |tx| {
                         let w = store::get_word(tx, word)?
                             .with_context(|| format!("no word '{word}'"))?;
                         store::reset_word(tx, w.id)?;
@@ -1340,7 +1661,6 @@ fn main() -> Result<()> {
                 }
                 "postpone" => {
                     let word = v["word"].as_str().context("missing .word")?;
-                    let (ts, _) = now_local();
                     match store::modify(&app, &cache, &data, Some(ts), |tx| {
                         let w = store::get_word(tx, word)?
                             .with_context(|| format!("no word '{word}'"))?;
@@ -1369,11 +1689,274 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                "setting" => {
+                    let name = v["name"].as_str().context("missing .name")?;
+                    let value = v["value"].as_str().context("missing .value")?;
+                    let snap = store::modify(&app, &cache, &data, Some(ts), |tx| {
+                        store::set_setting(tx, name, value)?;
+                        Ok(vec![OpKind::SettingSet {
+                            name: name.to_string(),
+                            value: value.to_string(),
+                        }])
+                    })?;
+                    Receipt {
+                        applied: true,
+                        orphaned: false,
+                        snapshot: Some(snap),
+                        detail: serde_json::json!({ "name": name, "value": value }),
+                    }
+                }
+                "restore" => {
+                    let word = v["word"].as_str().context("missing .word")?;
+                    let row: crate::sched::Row =
+                        serde_json::from_value(v["row"].clone()).context("bad .row")?;
+                    let at = v["at"].as_i64().context("missing .at")?;
+                    match store::modify(&app, &cache, &data, Some(ts), |tx| {
+                        let w = store::get_word(tx, word)?
+                            .with_context(|| format!("no word '{word}'"))?;
+                        store::restore_answer(tx, w.id, &row, at)?;
+                        Ok(vec![OpKind::Restored { id: w.id.0, row, at }])
+                    }) {
+                        Ok(snap) => Receipt {
+                            applied: true,
+                            orphaned: false,
+                            snapshot: Some(snap),
+                            detail: serde_json::json!({ "word": word }),
+                        },
+                        Err(e) => {
+                            let probe = store::open_ro(&app.backup_path)?;
+                            if store::get_word(&probe, word)?.is_none() {
+                                let r = shelve_missing(
+                                    &data,
+                                    &app.id,
+                                    "restore on missing word",
+                                    word,
+                                )?;
+                                print_receipt("applied", &r, cli.format);
+                                return Ok(());
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                "goal" => {
+                    let goal = v["goal"].as_i64().context("missing .goal")?;
+                    let snap = store::modify(&app, &cache, &data, Some(ts), |tx| {
+                        store::set_goal(tx, &date, goal)?;
+                        Ok(vec![OpKind::GoalSet {
+                            date: date.clone(),
+                            goal,
+                        }])
+                    })?;
+                    Receipt {
+                        applied: true,
+                        orphaned: false,
+                        snapshot: Some(snap),
+                        detail: serde_json::json!({ "goal": goal }),
+                    }
+                }
+                "raise_goal" => {
+                    let by = v["by"].as_i64().context("missing .by")?;
+                    let snap = store::modify(&app, &cache, &data, Some(ts), |tx| {
+                        let adjusted = store::raise_goal(tx, &date, by)?;
+                        Ok(vec![OpKind::GoalRaised {
+                            date: date.clone(),
+                            adjusted,
+                        }])
+                    })?;
+                    Receipt {
+                        applied: true,
+                        orphaned: false,
+                        snapshot: Some(snap),
+                        detail: serde_json::json!({ "by": by }),
+                    }
+                }
                 _ => anyhow::bail!(
-                    "bad .op '{op}'; want grade|triage|add|enroll|remove|reset|postpone"
+                    "bad .op '{op}'; want grade|triage|answer|add|enroll|remove|reset|postpone|setting|restore|goal|raise_goal"
                 ),
             };
             print_receipt("applied", &r, cli.format);
+        }
+        Cmd::Next {
+            session,
+            exclude,
+            seed,
+        } => {
+            let root = icloud_root(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let conn = read_db(&cli, &app)?;
+            let session = select::Session::parse(session)?;
+            let rules = store::rules(&conn)?;
+            let scope = select::Scope::load(&conn)?;
+            let now = chrono::Local::now();
+            let ts = now.timestamp();
+            let today = now.format("%F").to_string();
+            let tomorrow = (now.date_naive() + chrono::Days::new(1))
+                .format("%F")
+                .to_string();
+            let day = select::day(&conn, &rules, &scope, ts, &today, &tomorrow)?;
+            let seed = seed.unwrap_or_else(|| now.timestamp_nanos_opt().unwrap_or(ts) as u64);
+            let mut rng = select::Rng::new(seed);
+            let prev = exclude.map(crate::model::WordId);
+            let card = select::next(&conn, &rules, &scope, session, ts, &day, prev, &mut rng)?
+                .map(|p| select::card(&conn, &rules, &scope, p, &mut rng))
+                .transpose()?;
+            match cli.format {
+                Format::Json => println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "card": card,
+                        "day": day,
+                        "now": ts,
+                    }))?
+                ),
+                Format::Table => match &card {
+                    Some(c) => println!("{} side={} source={:?}", c.word.text, c.side, c.source),
+                    None => println!("no card; next review {:?}", day.next_review),
+                },
+            }
+        }
+        Cmd::Settings => {
+            let root = icloud_root(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let conn = read_db(&cli, &app)?;
+            let s = store::synced_settings(&conn)?;
+            match cli.format {
+                Format::Json => println!("{}", serde_json::to_string(&s)?),
+                Format::Table => {
+                    for (k, v) in s.as_object().into_iter().flatten() {
+                        println!("{k}: {v}");
+                    }
+                }
+            }
+        }
+        Cmd::Card {
+            word,
+            side,
+            variants,
+        } => {
+            let root = icloud_root(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let conn = read_db(&cli, &app)?;
+            let rules = store::rules(&conn)?;
+            let scope = select::Scope::load(&conn)?;
+            let now = chrono::Local::now();
+            let ts = now.timestamp();
+            let today = now.format("%F").to_string();
+            let tomorrow = (now.date_naive() + chrono::Days::new(1))
+                .format("%F")
+                .to_string();
+            let day = select::day(&conn, &rules, &scope, ts, &today, &tomorrow)?;
+            let side = match *side {
+                1 => sched::Side::Rec,
+                2 => sched::Side::Rep,
+                x => anyhow::bail!("--side must be 1 or 2, got {x}"),
+            };
+            let id = crate::model::WordId(*word);
+            let source = match store::sched_row(&conn, id)?.queue(side) {
+                0 => select::Source::New,
+                1 => select::Source::Learning,
+                _ => select::Source::Review,
+            };
+            let shown: Vec<crate::model::WordId> =
+                variants.iter().copied().map(crate::model::WordId).collect();
+            let mut rng = select::Rng::new(now.timestamp_nanos_opt().unwrap_or(ts) as u64);
+            let card = select::card_with(
+                &conn,
+                &rules,
+                &scope,
+                select::Picked {
+                    word: id,
+                    side,
+                    source,
+                },
+                &shown,
+                &mut rng,
+            )?;
+            match cli.format {
+                Format::Json => println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "card": card,
+                        "day": day,
+                        "now": ts,
+                    }))?
+                ),
+                Format::Table => println!("{} side={}", card.word.text, card.side),
+            }
+        }
+        Cmd::Work { out } => {
+            let root = icloud_root(&cli)?;
+            let cache = cache_dir(&cli)?;
+            let app = resolve_app(&cli, &root)?;
+            let snap = store::snapshot(&app, &cache)?;
+            if let Some(dir) = out.parent() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("cannot create {}", dir.display()))?;
+            }
+            let tmp = out.with_extension("tmp");
+            std::fs::copy(&snap, &tmp)
+                .with_context(|| format!("cannot copy {} to {}", snap.display(), tmp.display()))?;
+            std::fs::rename(&tmp, out)
+                .with_context(|| format!("cannot move {} to {}", tmp.display(), out.display()))?;
+            match cli.format {
+                Format::Json => output::ok_json(
+                    "working copy ready",
+                    serde_json::json!({ "path": out, "from": snap }),
+                ),
+                Format::Table => println!("{}", out.display()),
+            }
+        }
+        Cmd::Check {
+            typed,
+            word,
+            side,
+            expected,
+            lang,
+        } => {
+            // ma3.d: a recognition card wants the whole native translation in
+            // the native language, a reproduction card the word in the course
+            // language.
+            let (expected, lang) = match (word, expected) {
+                (Some(id), None) => {
+                    let root = icloud_root(&cli)?;
+                    let app = resolve_app(&cli, &root)?;
+                    let conn = read_db(&cli, &app)?;
+                    let (text, _, tr, _) = store::word_payload(&conn, crate::model::WordId(*id))?;
+                    match side.as_deref() {
+                        Some("rec") => {
+                            let scope = select::Scope::load(&conn)?;
+                            let t = tr
+                                .into_iter()
+                                .find(|(l, _)| *l == scope.native)
+                                .map(|(_, t)| t)
+                                .unwrap_or_default();
+                            (t, scope.native.to_lowercase())
+                        }
+                        Some("rep") => {
+                            let lang = matcher::course_lang(&app.id)
+                                .with_context(|| format!("no course language for app {}", app.id))?;
+                            (text, lang.to_string())
+                        }
+                        _ => anyhow::bail!("--word needs --side rec or rep"),
+                    }
+                }
+                (None, Some(e)) => (e.clone(), lang.clone().context("--expected needs --lang")?),
+                _ => anyhow::bail!("give --word with --side, or --expected with --lang"),
+            };
+            let verdict = matcher::check(typed, &expected, &lang)?;
+            match cli.format {
+                Format::Json => println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "verdict": verdict.name(),
+                        "accepted": verdict.accepted(),
+                        "expected": expected,
+                        "lang": lang,
+                    }))?
+                ),
+                Format::Table => println!("{}", verdict.name()),
+            }
         }
         Cmd::Snapshot => {
             let root = icloud_root(&cli)?;

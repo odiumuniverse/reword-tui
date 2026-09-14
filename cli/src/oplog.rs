@@ -30,6 +30,12 @@ pub enum OpKind {
     Enrolled {
         id: i64,
     },
+    /// A learning card's answer on one side: "memorized" or "keep".
+    Learned {
+        id: i64,
+        mode: i64,
+        decision: String,
+    },
     Selected {
         category: String,
         selected: bool,
@@ -55,6 +61,24 @@ pub enum OpKind {
     GoalSet {
         date: String,
         goal: i64,
+    },
+    /// A learning setting written from the desktop.
+    SettingSet {
+        name: String,
+        value: String,
+    },
+    /// An answer taken back: the word's columns return to `row`, and the LOG
+    /// rows written at `at` go.
+    Restored {
+        id: i64,
+        row: crate::sched::Row,
+        at: i64,
+    },
+    /// "Continue" on the goal reached screen: the day's adjusted goal, as
+    /// it came out, so a replay lands on the same number.
+    GoalRaised {
+        date: String,
+        adjusted: i64,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,13 +320,15 @@ pub fn replay_decision(conn: &rusqlite::Connection, app_id: &str, op: &Op) -> Re
                 return Ok(ReplayAction::Orphan("word missing".to_string()));
             }
             let (qr, qp) = q_of(*id)?;
-            let target = if decision == "known" { 3 } else { 2 };
-            if qr >= target && qp >= target {
+            let known = decision == "known";
+            // "learn" starts a new word; once the phone moved it on, a
+            // replay must not push it further.
+            if known && qr >= 3 && qp >= 3 || !known && (qr != 0 || qp != 0) {
                 Ok(ReplayAction::Skip("Q already at target".to_string()))
             } else {
                 Ok(ReplayAction::ApplyTriage {
                     id: WordId(*id),
-                    known: decision == "known",
+                    known,
                 })
             }
         }
@@ -311,11 +337,37 @@ pub fn replay_decision(conn: &rusqlite::Connection, app_id: &str, op: &Op) -> Re
                 return Ok(ReplayAction::Orphan("word missing".to_string()));
             }
             let (qr, qp) = q_of(*id)?;
-            if qr >= 2 && qp >= 2 {
-                Ok(ReplayAction::Skip("already enrolled".to_string()))
+            if qr != 0 || qp != 0 {
+                Ok(ReplayAction::Skip("already started".to_string()))
             } else {
                 Ok(ReplayAction::ApplyEnroll { id: WordId(*id) })
             }
+        }
+        OpKind::Learned { id, mode, decision } => {
+            if !exists(*id)? {
+                return Ok(ReplayAction::Orphan("word missing".to_string()));
+            }
+            let (qr, qp) = q_of(*id)?;
+            if (if *mode == 1 { qr } else { qp }) != 1 {
+                return Ok(ReplayAction::Skip("side no longer learning".to_string()));
+            }
+            let keep = decision == "keep";
+            if keep {
+                let sfx = if *mode == 1 { "REC" } else { "REP" };
+                let t: Option<i64> = conn.query_row(
+                    &format!("SELECT T_{sfx} FROM WORD WHERE ID=?"),
+                    [*id],
+                    |r| r.get(0),
+                )?;
+                if t.is_some_and(|t| t >= op.ts) {
+                    return Ok(ReplayAction::Skip("kept again later".to_string()));
+                }
+            }
+            Ok(ReplayAction::ApplyLearned {
+                id: WordId(*id),
+                mode: CardMode::from_i64(*mode),
+                keep,
+            })
         }
         OpKind::Selected { category, selected } => {
             let cur: Option<i64> = conn
@@ -431,6 +483,39 @@ pub fn replay_decision(conn: &rusqlite::Connection, app_id: &str, op: &Op) -> Re
             date: date.clone(),
             goal: *goal,
         }),
+        OpKind::SettingSet { name, value } => {
+            if crate::store::get_setting(conn, name)?.as_deref() == Some(value.as_str()) {
+                Ok(ReplayAction::Skip("already at target".to_string()))
+            } else {
+                Ok(ReplayAction::ApplySetting {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+            }
+        }
+        OpKind::Restored { id, .. } => {
+            let have: Option<i64> = conn
+                .query_row("SELECT ID FROM WORD WHERE ID = ?", [*id], |r| r.get(0))
+                .optional()?;
+            match have {
+                None => Ok(ReplayAction::Orphan("word missing".to_string())),
+                Some(_) => Ok(ReplayAction::ApplyRestore { id: WordId(*id) }),
+            }
+        }
+        OpKind::GoalRaised { date, adjusted } => {
+            let cur: Option<Option<i64>> = conn
+                .query_row("SELECT ADJUSTED_GOAL FROM DAILY_GOAL WHERE DATE = ?", [date], |r| r.get(0))
+                .optional()
+                .unwrap_or(None);
+            if cur.flatten() == Some(*adjusted) {
+                Ok(ReplayAction::Skip("already at target".to_string()))
+            } else {
+                Ok(ReplayAction::ApplyGoalRaise {
+                    date: date.clone(),
+                    adjusted: *adjusted,
+                })
+            }
+        }
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,6 +541,11 @@ pub enum ReplayAction {
     ApplyEnroll {
         id: WordId,
     },
+    ApplyLearned {
+        id: WordId,
+        mode: CardMode,
+        keep: bool,
+    },
     ApplySelect {
         category: String,
         selected: bool,
@@ -480,6 +570,18 @@ pub enum ReplayAction {
     ApplyGoal {
         date: String,
         goal: i64,
+    },
+    ApplySetting {
+        name: String,
+        value: String,
+    },
+    /// The snapshot and time stay in the op (Restored).
+    ApplyRestore {
+        id: WordId,
+    },
+    ApplyGoalRaise {
+        date: String,
+        adjusted: i64,
     },
 }
 #[cfg(test)]
