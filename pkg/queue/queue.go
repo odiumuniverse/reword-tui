@@ -5,11 +5,16 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 )
 
 type Intent struct {
-	Op            string   `json:"op"`
+	Op string `json:"op"`
+	// App is the app the change was made in; its backup is the only one
+	// it may reach.
+	App           string   `json:"app,omitempty"`
 	Word          string   `json:"word,omitempty"`
 	ID            int64    `json:"id,omitzero"`
 	Mode          string   `json:"mode,omitempty"`
@@ -20,11 +25,47 @@ type Intent struct {
 	Enroll        bool     `json:"enroll,omitempty"`
 	Category      string   `json:"category,omitempty"`
 	Selected      bool     `json:"selected,omitempty"`
+	// Positive is the left answer of an "answer" swipe.
+	Positive bool `json:"positive,omitempty"`
+	// TS is when the intent happened, so a later write lands exactly as
+	// the working copy took it.
+	TS int64 `json:"ts,omitzero"`
+	// Name and Value are a synced setting ("setting").
+	Name  string `json:"name,omitempty"`
+	Value string `json:"value,omitempty"`
+	// Row and At take an answer back ("restore"): the word's scheduling
+	// columns before it, and when it was given.
+	Row json.RawMessage `json:"row,omitempty"`
+	At  int64           `json:"at,omitzero"`
+	// Goal sets the daily goal ("goal"); By raises today's ("raise_goal").
+	Goal int64 `json:"goal,omitzero"`
+	By   int64 `json:"by,omitzero"`
 }
 
 func (it Intent) ApplyBody() map[string]any {
 	m := map[string]any{"op": it.Op}
+	if it.TS != 0 {
+		m["ts"] = it.TS
+	}
 	switch it.Op {
+	case "answer":
+		m["word"] = it.ref()
+		m["mode"] = it.Mode
+		m["positive"] = it.Positive
+	case "select":
+		m["category"] = it.Category
+		m["selected"] = it.Selected
+	case "setting":
+		m["name"] = it.Name
+		m["value"] = it.Value
+	case "restore":
+		m["word"] = it.ref()
+		m["row"] = it.Row
+		m["at"] = it.At
+	case "goal":
+		m["goal"] = it.Goal
+	case "raise_goal":
+		m["by"] = it.By
 	case "grade":
 		m["word"] = it.ref()
 		m["mode"] = it.Mode
@@ -58,6 +99,12 @@ func (it Intent) ref() string {
 
 func (it Intent) Label() string {
 	switch it.Op {
+	case "answer":
+		side := "right"
+		if it.Positive {
+			side = "left"
+		}
+		return "answer " + it.Word + " " + it.Mode + "/" + side
 	case "grade":
 		return "grade " + it.Word + " " + it.Mode + "/" + it.Result
 	case "triage":
@@ -77,13 +124,74 @@ func (it Intent) Label() string {
 		return "reset " + it.Word
 	case "postpone":
 		return "postpone " + it.Word
+	case "setting":
+		return "setting " + it.Name + " = " + it.Value
+	case "restore":
+		return "undo " + it.Word
+	case "goal":
+		return "daily goal " + strconv.FormatInt(it.Goal, 10)
+	case "raise_goal":
+		return "today's goal +" + strconv.FormatInt(it.By, 10)
 	}
 	return it.Op
+}
+
+// PathFor is an app's own queue next to the base queue file:
+// queue.jsonl → queue-es.jsonl.
+func PathFor(base, app string) string {
+	ext := filepath.Ext(base)
+	return strings.TrimSuffix(base, ext) + "-" + app + ext
+}
+
+// Split hands each intent to the app owner names, in order, marking it with
+// that app; the ones owner leaves ("") come back as rest.
+func Split(items []Intent, owner func(Intent) string) (map[string][]Intent, []Intent) {
+	byApp := map[string][]Intent{}
+	var rest []Intent
+	for _, it := range items {
+		app := owner(it)
+		if app == "" {
+			rest = append(rest, it)
+			continue
+		}
+		it.App = app
+		byApp[app] = append(byApp[app], it)
+	}
+	return byApp, rest
 }
 
 type Store struct {
 	Path  string
 	Items []Intent
+}
+
+// Rewrite replaces the queue with items in one rename; no items removes
+// the file. Unparseable lines do not survive it.
+func (s *Store) Rewrite(items []Intent) error {
+	if len(items) == 0 {
+		return s.Clear()
+	}
+	var buf bytes.Buffer
+	for _, it := range items {
+		line, err := json.Marshal(it)
+		if err != nil {
+			return err
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	if err := os.MkdirAll(filepath.Dir(s.Path), 0o755); err != nil {
+		return err
+	}
+	tmp := s.Path + ".tmp"
+	if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.Path); err != nil {
+		return err
+	}
+	s.Items = slices.Clone(items)
+	return nil
 }
 
 func Load(path string) Store {
