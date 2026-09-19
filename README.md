@@ -21,6 +21,17 @@ Mac. This tool edits the local copy only — after a session you **must** tap
 `Restore` on the phone, or progress is lost. Every write goes through a
 snapshot gate and is logged to a local op-log (`pull` → `replay`).
 
+## Install
+
+```sh
+brew tap odiumuniverse/tap
+brew trust odiumuniverse/tap
+brew install reword-tui
+```
+
+Homebrew builds both the Rust `rwcore` backend and the Go TUI; `rwcore` stays
+in the formula's `libexec`, not on `PATH`.
+
 ## Run
 
 ```sh
