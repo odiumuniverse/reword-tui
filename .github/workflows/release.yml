@@ -9,30 +9,54 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the universal tarball
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p build/arm64 build/amd64 dist
+          cargo build --release --locked --manifest-path cli/Cargo.toml --target aarch64-apple-darwin
+          cargo build --release --locked --manifest-path cli/Cargo.toml --target x86_64-apple-darwin
+          GOOS=darwin GOARCH=arm64 go build -o build/arm64/reword-tui ./cmd/reword-tui
+          GOOS=darwin GOARCH=amd64 go build -o build/amd64/reword-tui ./cmd/reword-tui
+          lipo -create -output dist/reword-tui build/arm64/reword-tui build/amd64/reword-tui
+          lipo -create -output dist/rwcore cli/target/aarch64-apple-darwin/release/rwcore cli/target/x86_64-apple-darwin/release/rwcore
+          tar -czf "dist/reword-tui-${version}-darwin-universal.tar.gz" -C dist reword-tui rwcore
 
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          version="${GITHUB_REF_NAME#v}"
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" "dist/reword-tui-${version}-darwin-universal.tar.gz" --clobber
 
       - name: Bump the formula in homebrew-tap
         env:
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          url="https://github.com/odiumuniverse/reword-tui/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
-          sha="$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)"
+          url="https://github.com/odiumuniverse/reword-tui/releases/download/${GITHUB_REF_NAME}/reword-tui-${version}-darwin-universal.tar.gz"
+          sha="$(shasum -a 256 "dist/reword-tui-${version}-darwin-universal.tar.gz" | cut -d' ' -f1)"
           git clone -q "https://x-access-token:${TAP_TOKEN}@github.com/odiumuniverse/homebrew-tap.git" tap
           cd tap
           ruby - "$url" "$sha" <<'RB'
           path = "Formula/reword-tui.rb"
           src = File.read(path)
-          src = src.sub(%r{url "https://github\.com/odiumuniverse/reword-tui/archive[^"]*"}, "url \"#{ARGV[0]}\"")
+          src = src.sub(%r{url "https://github\.com/odiumuniverse/reword-tui/[^"]*"}, "url \"#{ARGV[0]}\"")
           src = src.sub(/sha256 ".*"/, "sha256 \"#{ARGV[1]}\"")
           File.write(path, src)
           RB
